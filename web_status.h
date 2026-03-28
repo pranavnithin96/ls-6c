@@ -27,15 +27,17 @@ void _handleStatus() {
     json += ",\"queue\":" + String(getQueueSize());
     json += ",\"sent\":" + String(getTotalSent());
     json += ",\"failed\":" + String(getTotalFailed());
+    json += ",\"calibrated\":" + String(isCTCalibrated() ? "true" : "false");
     json += ",\"readings\":{";
     for (int i = 0; i < NUM_CT_CHANNELS; i++) {
         if (i > 0) json += ",";
         json += "\"ct_" + String(i + 1) + "\":{";
-        json += "\"amps\":" + String(_lastReadings.ct[i].rms_current_a, 3);
-        json += ",\"watts\":" + String(_lastReadings.ct[i].rms_power_w, 1);
+        json += "\"amps\":" + String(_lastReadings.ct[i].amps, 3);
+        json += ",\"watts\":" + String(_lastReadings.ct[i].watts, 1);
+        json += ",\"mv\":" + String(_lastReadings.ct[i].avg_mv);
         json += "}";
     }
-    json += "},\"total_watts\":" + String(_lastReadings.total_power_w, 1);
+    json += "},\"total_watts\":" + String(_lastReadings.total_watts, 1);
     json += "}";
 
     _statusServer.sendHeader("Access-Control-Allow-Origin", "*");
@@ -63,6 +65,7 @@ canvas{width:100%;border-radius:8px;background:#0f172a}
 .ct .ch{font-size:11px;color:#666;margin-bottom:2px}
 .ct .amp{font-size:20px;font-weight:700;color:#4fc3f7}
 .ct .watt{font-size:13px;color:#e94560;margin-top:2px}
+.ct .raw{font-size:10px;color:#475569;margin-top:2px}
 .stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px}
 .stat{background:#0f172a;border-radius:8px;padding:8px;text-align:center}
 .stat .lbl{font-size:10px;color:#666;text-transform:uppercase}
@@ -107,7 +110,6 @@ const MAX_PTS=120;
 let history=[[],[],[],[],[],[]];
 let labels=[];
 
-// Build legend
 let leg=document.getElementById('legend');
 for(let i=0;i<6;i++){
   leg.innerHTML+='<span><i style="background:'+COLORS[i]+'"></i>CT'+(i+1)+'</span>';
@@ -121,10 +123,8 @@ function drawChart(){
   c.height=200*dpr;
   ctx.scale(dpr,dpr);
   let W=c.offsetWidth,H=200;
-
   ctx.clearRect(0,0,W,H);
 
-  // Find max
   let maxW=1;
   for(let ch=0;ch<6;ch++){
     for(let j=0;j<history[ch].length;j++){
@@ -138,37 +138,28 @@ function drawChart(){
   let gW=W-pad.l-pad.r;
   let gH=H-pad.t-pad.b;
 
-  // Grid lines
-  ctx.strokeStyle='#1e293b';
-  ctx.lineWidth=1;
-  ctx.font='10px sans-serif';
-  ctx.fillStyle='#475569';
-  ctx.textAlign='right';
+  ctx.strokeStyle='#1e293b';ctx.lineWidth=1;
+  ctx.font='10px sans-serif';ctx.fillStyle='#475569';ctx.textAlign='right';
   for(let i=0;i<=4;i++){
     let y=pad.t+gH-(gH*i/4);
     ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();
     ctx.fillText((maxW*i/4).toFixed(0)+'W',pad.l-5,y+3);
   }
 
-  // Time labels
-  ctx.textAlign='center';
-  ctx.fillStyle='#475569';
+  ctx.textAlign='center';ctx.fillStyle='#475569';
   let n=labels.length;
   if(n>1){
     let step=Math.max(1,Math.floor(n/5));
     for(let i=0;i<n;i+=step){
       let x=pad.l+(i/(n-1))*gW;
-      let t=labels[i];
-      ctx.fillText(t,x,H-5);
+      ctx.fillText(labels[i],x,H-5);
     }
   }
 
-  // Lines
   for(let ch=0;ch<6;ch++){
     let pts=history[ch];
     if(pts.length<2) continue;
-    ctx.strokeStyle=COLORS[ch];
-    ctx.lineWidth=2;
+    ctx.strokeStyle=COLORS[ch];ctx.lineWidth=2;
     ctx.beginPath();
     for(let j=0;j<pts.length;j++){
       let x=pad.l+(j/(pts.length-1))*gW;
@@ -185,7 +176,6 @@ function update(){
   fetch('/api/status').then(r=>r.json()).then(d=>{
     document.getElementById('info').textContent=d.device_id+' | '+d.location+' | '+d.ip+' | '+d.timestamp;
 
-    // Update history
     let now=new Date(d.timestamp);
     let tStr=now.getUTCHours().toString().padStart(2,'0')+':'+now.getUTCMinutes().toString().padStart(2,'0')+':'+now.getUTCSeconds().toString().padStart(2,'0');
     labels.push(tStr);
@@ -198,11 +188,10 @@ function update(){
     }
     drawChart();
 
-    // CT cards
     let ct='';
     for(let i=1;i<=6;i++){
       let c=d.readings['ct_'+i];
-      ct+='<div class="ct"><div class="ch">CT'+i+'</div><div class="amp">'+c.amps.toFixed(3)+'A</div><div class="watt">'+c.watts.toFixed(1)+'W</div></div>';
+      ct+='<div class="ct"><div class="ch">CT'+i+'</div><div class="amp">'+c.amps.toFixed(3)+'A</div><div class="watt">'+c.watts.toFixed(1)+'W</div><div class="raw">'+c.mv+'mV</div></div>';
     }
     document.getElementById('cts').innerHTML=ct;
 

@@ -2,11 +2,11 @@
  * LineSights LS-6C-IOT_V1.0 Power Monitor Firmware
  * ESP32-WROOM-32E | 6-channel CT current sensing
  *
- * Reads CT sensors, calculates RMS power, sends to server via HTTPS.
- * Features: WiFi AP setup portal, OTA updates, buffered sending, watchdog.
+ * Features: eFuse-calibrated ADC, auto-zero calibration, buffered HTTP,
+ * WiFi AP setup portal, OTA updates, web dashboard, watchdog.
  */
 
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.1.0"
 
 #include <Preferences.h>
 #include "led_status.h"
@@ -19,8 +19,32 @@
 
 static unsigned long lastReadingTime = 0;
 static unsigned long bootButtonPressStart = 0;
+static AllCTReadings lastReadings = {};
 #define BOOT_BUTTON_PIN 0
 #define FACTORY_RESET_HOLD_MS 5000
+
+void printStatus() {
+    Serial.println("\n=== Device Status ===");
+    Serial.printf("  Firmware:   v%s\n", FIRMWARE_VERSION);
+    Serial.printf("  Device ID:  %s\n", getDeviceId().c_str());
+    Serial.printf("  Location:   %s\n", getLocationName().c_str());
+    Serial.printf("  WiFi:       %s (RSSI: %d dBm)\n",
+        WiFi.status() == WL_CONNECTED ? "connected" : "disconnected", WiFi.RSSI());
+    Serial.printf("  IP:         %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("  Server:     %s\n", getServerUrl().c_str());
+    Serial.printf("  Uptime:     %lus\n", getUptimeSeconds());
+    Serial.printf("  Free heap:  %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("  Queue:      %d | Sent: %d | Failed: %d | Dropped: %d\n",
+        getQueueSize(), getTotalSent(), getTotalFailed(), getTotalDropped());
+    Serial.printf("  CT cal:     %s\n", isCTCalibrated() ? "yes" : "no");
+    Serial.println("  --- CT Readings ---");
+    for (int i = 0; i < NUM_CT_CHANNELS; i++) {
+        Serial.printf("  CT%d: %.3fA | %.1fW | %dmV\n",
+            i + 1, lastReadings.ct[i].amps, lastReadings.ct[i].watts, lastReadings.ct[i].avg_mv);
+    }
+    Serial.printf("  Total: %.1fW\n", lastReadings.total_watts);
+    Serial.println("=====================\n");
+}
 
 void setup() {
     Serial.begin(115200);
@@ -55,7 +79,7 @@ void setup() {
         Serial.println("Connect to WiFi: LineSights-Setup");
         Serial.println("Open browser: http://192.168.4.1");
         Serial.println("******************");
-        return;  // Stay in AP mode, loop() will handle it
+        return;
     }
 
     // 4. If WiFi connected, init networking
@@ -66,7 +90,7 @@ void setup() {
         initStatusServer();
     }
 
-    // 5. CT sensors
+    // 5. CT sensors (auto-zero happens on first read if uncalibrated)
     initCTSensors();
 
     // 6. Ready
@@ -78,28 +102,32 @@ void setup() {
     Serial.printf("  Location:   %s\n", getLocationName().c_str());
     Serial.printf("  Server:     %s\n", getServerUrl().c_str());
     Serial.printf("  Voltage:    %.0fV\n", getGridVoltage());
-    Serial.printf("  CT Ratings: %dA/%dA/%dA/%dA/%dA/%dA\n",
-        getCtRating(0), getCtRating(1), getCtRating(2),
-        getCtRating(3), getCtRating(4), getCtRating(5));
     Serial.printf("  Interval:   %ds\n", getSendInterval());
     Serial.printf("  Timezone:   %s\n", getTimezone().c_str());
     Serial.println("---------------------");
-    Serial.println("Monitoring started...");
-    Serial.println();
+    Serial.println("Commands: status | calibrate | debug | reset | update");
+    Serial.println("Monitoring started...\n");
 }
 
 void loop() {
     unsigned long loopStart = millis();
 
-    // Always: watchdog + LED
     feedWatchdog();
     updateLED();
 
-    // Serial command: type "reset" to factory reset
+    // Serial commands
     if (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim();
-        if (cmd == "update") {
+        if (cmd == "status") {
+            printStatus();
+        } else if (cmd == "calibrate") {
+            Serial.println("[CMD] Re-running CT zero calibration...");
+            calibrateCTZero();
+        } else if (cmd == "debug") {
+            setHTTPDebug(!getHTTPDebug());
+            Serial.printf("[CMD] HTTP debug: %s\n", getHTTPDebug() ? "ON" : "OFF");
+        } else if (cmd == "update") {
             Serial.println("[OTA] Forcing update check...");
             checkForUpdate();
         } else if (cmd == "reset") {
@@ -119,7 +147,6 @@ void loop() {
             bootButtonPressStart = millis();
         } else if (millis() - bootButtonPressStart >= FACTORY_RESET_HOLD_MS) {
             Serial.println("\n[RESET] Factory reset triggered!");
-            Serial.println("[RESET] Clearing config and rebooting to AP mode...");
             Preferences resetPrefs;
             resetPrefs.begin("lscfg", false);
             resetPrefs.clear();
@@ -133,7 +160,7 @@ void loop() {
 
     // AP mode: only serve config page
     if (isAPMode()) {
-        isWiFiConnected();  // This handles AP server
+        isWiFiConnected();
         delay(10);
         return;
     }
@@ -146,7 +173,6 @@ void loop() {
         }
     } else if (getLEDState() == LED_WIFI_DISCONNECTED) {
         setLEDState(LED_RUNNING);
-        // Re-init services after reconnect
         syncNTP();
     }
 
@@ -157,46 +183,46 @@ void loop() {
     if (now - lastReadingTime >= (unsigned long)intervalMs) {
         lastReadingTime = now;
 
-        AllCTReadings readings = readAllCT(getGridVoltage());
-        updateLastReadings(readings);
+        lastReadings = readAllCT(getGridVoltage());
+        updateLastReadings(lastReadings);
 
-        // Log summary with enhanced metrics
+        // Log active channels
         bool anyActive = false;
         for (int i = 0; i < NUM_CT_CHANNELS; i++) {
-            if (readings.ct[i].rms_power_w > 0) {
+            if (lastReadings.ct[i].amps > 0) {
                 anyActive = true;
-                Serial.printf("  CT%d: %.1fW | %.3fA rms | %.3fA peak | CF:%.2f | %.1fHz\n",
+                Serial.printf("  CT%d: %.3fA | %.1fW | %dmV\n",
                     i + 1,
-                    readings.ct[i].rms_power_w,
-                    readings.ct[i].rms_current_a,
-                    readings.ct[i].peak_current_a,
-                    readings.ct[i].crest_factor,
-                    readings.ct[i].frequency_hz);
+                    lastReadings.ct[i].amps,
+                    lastReadings.ct[i].watts,
+                    lastReadings.ct[i].avg_mv);
             }
         }
 
         if (anyActive) {
-            Serial.printf("[%s] Total:%.1fW | Sampled:%lums | Queue:%d\n",
+            Serial.printf("[%s] Total:%.1fW | %lums | Q:%d | S:%d\n",
                 getUTCTimestamp().c_str(),
-                readings.total_power_w,
-                readings.sample_duration_ms,
-                getQueueSize());
+                lastReadings.total_watts,
+                lastReadings.sample_duration_ms,
+                getQueueSize(),
+                getTotalSent());
         } else {
-            Serial.printf("[%s] No active loads | Queue:%d\n",
+            Serial.printf("[%s] Idle | Q:%d | S:%d\n",
                 getUTCTimestamp().c_str(),
-                getQueueSize());
+                getQueueSize(),
+                getTotalSent());
         }
 
         // Queue for sending
         if (isWiFiConnected()) {
             String ts = getUTCTimestamp();
             queueReading(getDeviceId(), getLocationName(), getTimezone(),
-                         getGridVoltage(), readings.ct, ts);
+                         getGridVoltage(), lastReadings.ct, ts);
             setLEDState(LED_SENDING);
         }
     }
 
-    // Process send queue (non-blocking, sends one per loop)
+    // Process send queue
     if (isWiFiConnected()) {
         processSendQueue();
         if (getQueueSize() == 0 && getLEDState() == LED_SENDING) {
@@ -204,7 +230,7 @@ void loop() {
         }
     }
 
-    // OTA check (periodic, non-blocking)
+    // OTA check
     if (isWiFiConnected()) {
         otaLoop();
     }
@@ -215,7 +241,6 @@ void loop() {
     // Diagnostics
     diagnosticsLoop();
 
-    // Record loop timing
     unsigned long loopTime = millis() - loopStart;
     recordLoopTime(loopTime);
 }
