@@ -34,7 +34,9 @@ void _handleStatus() {
         json += "\"ct_" + String(i + 1) + "\":{";
         json += "\"amps\":" + String(_lastReadings.ct[i].amps, 3);
         json += ",\"watts\":" + String(_lastReadings.ct[i].watts, 1);
+        json += ",\"pf\":" + String(_lastReadings.ct[i].pf, 1);
         json += ",\"mv\":" + String(_lastReadings.ct[i].avg_mv);
+        json += ",\"var\":" + String(_lastReadings.ct[i].variation);
         json += "}";
     }
     json += "},\"total_watts\":" + String(_lastReadings.total_watts, 1);

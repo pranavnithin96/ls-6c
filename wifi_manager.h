@@ -59,20 +59,33 @@ static const char SAVED_HTML[] PROGMEM = R"rawliteral(
 void _handleRoot() { _apServer.send(200, "text/html", CONFIG_HTML); }
 
 void _handleSave() {
+    // Validate inputs (matches piimage_3 validation)
+    float volt = _apServer.arg("volt").toFloat();
+    if (volt < 100 || volt > 250) volt = 230.0f;
+
+    int interval = _apServer.arg("int").toInt();
+    if (interval < 1 || interval > 60) interval = 1;
+
+    String url = _apServer.arg("url");
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+        url = DEFAULT_SERVER_URL;
+    }
+
     _prefs.begin("lscfg", false);
     _prefs.putString("ssid", _apServer.arg("ssid"));
     _prefs.putString("pass", _apServer.arg("pass"));
     _prefs.putString("devid", _apServer.arg("devid"));
     _prefs.putString("loc", _apServer.arg("loc"));
-    _prefs.putString("url", _apServer.arg("url"));
-    _prefs.putFloat("volt", _apServer.arg("volt").toFloat());
-    _prefs.putInt("ct1", _apServer.arg("ct1").toInt());
-    _prefs.putInt("ct2", _apServer.arg("ct2").toInt());
-    _prefs.putInt("ct3", _apServer.arg("ct3").toInt());
-    _prefs.putInt("ct4", _apServer.arg("ct4").toInt());
-    _prefs.putInt("ct5", _apServer.arg("ct5").toInt());
-    _prefs.putInt("ct6", _apServer.arg("ct6").toInt());
-    _prefs.putInt("interval", _apServer.arg("int").toInt());
+    _prefs.putString("url", url);
+    _prefs.putFloat("volt", volt);
+    for (int i = 0; i < 6; i++) {
+        char name[4];
+        snprintf(name, sizeof(name), "ct%d", i + 1);
+        int rating = _apServer.arg(name).toInt();
+        if (rating != 50 && rating != 100 && rating != 150) rating = 50;
+        _prefs.putInt(name, rating);
+    }
+    _prefs.putInt("interval", interval);
     _prefs.putString("tz", _apServer.arg("tz"));
     _prefs.end();
 

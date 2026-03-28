@@ -15,18 +15,23 @@
 // amps_per_mV = 0.0123 / 0.806 = 0.01526
 #define CALIBRATION_AMPS_PER_MV 0.01526f
 
-// Below this millivolt delta (after zero subtraction) is noise
-#define NOISE_FLOOR_MV 5.0f
+// Power factor (assumed — no phase measurement possible with rectified DC)
+#define DEFAULT_PF 0.9f
+
+// Noise threshold in watts (matches piimage_3)
+#define NOISE_THRESHOLD_W 5.0f
 
 static const uint8_t CT_PINS[NUM_CT_CHANNELS] = {
     36, 39, 34, 35, 32, 33
 };
 
 struct CTReading {
-    float amps;
-    float watts;       // apparent power = V * A
+    float amps;          // RMS current
+    float watts;         // real power estimate (V * A * PF)
+    float pf;            // power factor (assumed)
     float voltage;
-    int avg_mv;        // millivolts above zero baseline
+    int avg_mv;          // raw average millivolts
+    int variation;       // max - min (signal spread)
     int samples;
     bool valid;
 };
@@ -63,8 +68,8 @@ void initCTSensors() {
     Serial.printf("[CT] 6-channel sensors initialized\n");
     Serial.printf("[CT] ADC: analogReadMilliVolts, %d samples / %dms per channel\n",
         ADC_SAMPLES, (ADC_SAMPLES * SAMPLE_INTERVAL_US) / 1000);
-    Serial.printf("[CT] Scale: %.5f A/mV, noise floor: %.0f mV\n",
-        CALIBRATION_AMPS_PER_MV, NOISE_FLOOR_MV);
+    Serial.printf("[CT] Scale: %.5f A/mV, PF: %.1f, noise: %.0fW\n",
+        CALIBRATION_AMPS_PER_MV, DEFAULT_PF, NOISE_THRESHOLD_W);
 
     for (int i = 0; i < NUM_CT_CHANNELS; i++) {
         Serial.printf("[CT] CH%d zero: %.1f mV\n", i + 1, _zeroMv[i]);
@@ -110,26 +115,71 @@ void calibrateCTZero() {
     Serial.println("[CT] ========================");
 }
 
-// Read a single CT channel
-static float readCTMillivolts(uint8_t pin, int channel) {
-    uint32_t sum = 0;
+// Read a single CT channel using RMS calculation (variance method from piimage_3)
+// RMS = sqrt(mean(x^2) - mean(x)^2) — correct for AC signals with DC offset
+static CTReading readCTChannel(uint8_t pin, int channel, float grid_voltage) {
+    CTReading r = {};
+    r.voltage = grid_voltage;
+    r.samples = ADC_SAMPLES;
 
+    // Collect all samples
+    int16_t rawSamples[ADC_SAMPLES];
     unsigned long t0 = micros();
     for (int i = 0; i < ADC_SAMPLES; i++) {
-        sum += analogReadMilliVolts(pin);
+        rawSamples[i] = (int16_t)analogReadMilliVolts(pin);
         unsigned long target = t0 + (unsigned long)((i + 1) * SAMPLE_INTERVAL_US);
         while (micros() < target) {}
     }
 
-    float avgMv = (float)sum / ADC_SAMPLES;
+    // RMS via variance method (same as piimage_3)
+    // This correctly extracts the AC component from a signal with DC offset
+    double sumValues = 0;
+    double sumSquares = 0;
+    int16_t minVal = 32767, maxVal = -32768;
 
-    // Subtract per-channel zero offset
-    float corrected = avgMv - _zeroMv[channel];
-    if (corrected < NOISE_FLOOR_MV) {
-        corrected = 0.0f;
+    for (int i = 0; i < ADC_SAMPLES; i++) {
+        double v = (double)rawSamples[i];
+        sumValues += v;
+        sumSquares += v * v;
+        if (rawSamples[i] < minVal) minVal = rawSamples[i];
+        if (rawSamples[i] > maxVal) maxVal = rawSamples[i];
     }
 
-    return corrected;
+    double avgRaw = sumValues / ADC_SAMPLES;
+    double meanSquare = sumSquares / ADC_SAMPLES;
+    double variance = meanSquare - (avgRaw * avgRaw);
+    if (variance < 0) variance = 0;
+    double rmsMv = sqrt(variance);
+
+    // Also compute the DC average above zero baseline (manufacturer's method)
+    float dcMv = (float)avgRaw - _zeroMv[channel];
+    if (dcMv < 0) dcMv = 0;
+
+    // For this rectified-DC CT board, the DC average is the primary signal.
+    // The RMS of variation captures any AC ripple on top of it.
+    // Use whichever gives the larger reading (DC average for steady loads,
+    // RMS variance for pulsating/switching loads).
+    float effectiveMv = max(dcMv, (float)rmsMv);
+
+    float amps = effectiveMv * CALIBRATION_AMPS_PER_MV;
+    float power = grid_voltage * amps * DEFAULT_PF;
+
+    r.variation = maxVal - minVal;
+    r.avg_mv = (int)dcMv;
+
+    // Noise floor (matches piimage_3: 5W threshold)
+    if (power < NOISE_THRESHOLD_W) {
+        r.amps = 0.0f;
+        r.watts = 0.0f;
+        r.pf = 0.0f;
+    } else {
+        r.amps = amps;
+        r.watts = power;
+        r.pf = DEFAULT_PF;
+    }
+
+    r.valid = true;
+    return r;
 }
 
 // Read all 6 channels
@@ -145,20 +195,8 @@ AllCTReadings readAllCT(float grid_voltage) {
     unsigned long t0 = millis();
 
     for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
-        CTReading r = {};
-        r.voltage = grid_voltage;
-        r.samples = ADC_SAMPLES;
-
-        float mv = readCTMillivolts(CT_PINS[ch], ch);
-        float amps = mv * CALIBRATION_AMPS_PER_MV;
-
-        r.avg_mv = (int)mv;
-        r.amps = amps;
-        r.watts = grid_voltage * amps;
-        r.valid = true;
-
-        all.ct[ch] = r;
-        all.total_watts += r.watts;
+        all.ct[ch] = readCTChannel(CT_PINS[ch], ch, grid_voltage);
+        all.total_watts += all.ct[ch].watts;
     }
 
     all.sample_duration_ms = millis() - t0;

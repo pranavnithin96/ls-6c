@@ -6,7 +6,7 @@
  * WiFi AP setup portal, OTA updates, web dashboard, watchdog.
  */
 
-#define FIRMWARE_VERSION "1.1.0"
+#define FIRMWARE_VERSION "1.2.0"
 
 #include <Preferences.h>
 #include "led_status.h"
@@ -39,8 +39,9 @@ void printStatus() {
     Serial.printf("  CT cal:     %s\n", isCTCalibrated() ? "yes" : "no");
     Serial.println("  --- CT Readings ---");
     for (int i = 0; i < NUM_CT_CHANNELS; i++) {
-        Serial.printf("  CT%d: %.3fA | %.1fW | %dmV\n",
-            i + 1, lastReadings.ct[i].amps, lastReadings.ct[i].watts, lastReadings.ct[i].avg_mv);
+        Serial.printf("  CT%d: %.3fA | %.1fW | PF:%.1f | %dmV | var:%d\n",
+            i + 1, lastReadings.ct[i].amps, lastReadings.ct[i].watts,
+            lastReadings.ct[i].pf, lastReadings.ct[i].avg_mv, lastReadings.ct[i].variation);
     }
     Serial.printf("  Total: %.1fW\n", lastReadings.total_watts);
     Serial.println("=====================\n");
@@ -191,11 +192,12 @@ void loop() {
         for (int i = 0; i < NUM_CT_CHANNELS; i++) {
             if (lastReadings.ct[i].amps > 0) {
                 anyActive = true;
-                Serial.printf("  CT%d: %.3fA | %.1fW | %dmV\n",
+                Serial.printf("  CT%d: %.3fA | %.1fW | %dmV | var:%d\n",
                     i + 1,
                     lastReadings.ct[i].amps,
                     lastReadings.ct[i].watts,
-                    lastReadings.ct[i].avg_mv);
+                    lastReadings.ct[i].avg_mv,
+                    lastReadings.ct[i].variation);
             }
         }
 
