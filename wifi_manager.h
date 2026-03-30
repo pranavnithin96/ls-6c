@@ -4,14 +4,24 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+#include <DNSServer.h>
 #include <time.h>
 
 static Preferences _prefs;
 static WebServer _apServer(80);
+static DNSServer _dnsServer;
 static bool _apMode = false;
 static unsigned long _lastReconnectAttempt = 0;
 static int _reconnectBackoff = 1000;
 static bool _mdnsStarted = false;
+
+// RSSI tracking
+#define RSSI_HISTORY_SIZE 60  // 1 minute at 1s intervals
+static int _rssiHistory[RSSI_HISTORY_SIZE] = {0};
+static int _rssiIdx = 0;
+static int _rssiCount = 0;
+static int _rssiMin = 0;
+static int _rssiAvg = 0;
 
 // Default config
 #define DEFAULT_SERVER_URL "http://77.42.75.92/api/data"
@@ -160,10 +170,23 @@ void _startAPMode() {
     WiFi.mode(WIFI_AP_STA);  // AP + STA so we can scan while in AP mode
     WiFi.softAP(AP_SSID);
     _scanNetworks();  // Initial scan
+
+    // Captive portal: redirect all DNS to our IP
+    _dnsServer.start(53, "*", WiFi.softAPIP());
+
     Serial.printf("[WiFi] AP mode started: %s at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+    Serial.println("[WiFi] Captive portal active — auto-opens on phone connect");
+
+    // Captive portal detection endpoints (Android/iOS/Windows)
     _apServer.on("/", _handleRoot);
     _apServer.on("/scan", _handleScan);
     _apServer.on("/save", HTTP_POST, _handleSave);
+    _apServer.on("/generate_204", [](){ _apServer.sendHeader("Location", "/"); _apServer.send(302); });  // Android
+    _apServer.on("/fwlink", [](){ _apServer.sendHeader("Location", "/"); _apServer.send(302); });        // Windows
+    _apServer.on("/hotspot-detect.html", [](){ _apServer.sendHeader("Location", "/"); _apServer.send(302); }); // Apple
+    _apServer.on("/library/test/success.html", [](){ _apServer.sendHeader("Location", "/"); _apServer.send(302); }); // Apple
+    _apServer.on("/connecttest.txt", [](){ _apServer.sendHeader("Location", "/"); _apServer.send(302); }); // Windows
+    _apServer.onNotFound([](){ _apServer.sendHeader("Location", "/"); _apServer.send(302); }); // Catch-all
     _apServer.begin();
 }
 
@@ -205,8 +228,34 @@ void initWiFiManager() {
     }
 }
 
+// Track RSSI over time
+void updateRSSI() {
+    int rssi = WiFi.RSSI();
+    _rssiHistory[_rssiIdx] = rssi;
+    _rssiIdx = (_rssiIdx + 1) % RSSI_HISTORY_SIZE;
+    if (_rssiCount < RSSI_HISTORY_SIZE) _rssiCount++;
+
+    // Calculate min and average
+    int sum = 0;
+    _rssiMin = 0;
+    for (int i = 0; i < _rssiCount; i++) {
+        sum += _rssiHistory[i];
+        if (_rssiHistory[i] < _rssiMin) _rssiMin = _rssiHistory[i];
+    }
+    _rssiAvg = sum / _rssiCount;
+
+    // Log warning if signal is degrading
+    if (rssi < -75 && _rssiCount > 10 && _rssiAvg > rssi + 10) {
+        Serial.printf("[WiFi] Signal degrading: %d dBm (avg: %d dBm)\n", rssi, _rssiAvg);
+    }
+}
+
+int getRSSIMin() { return _rssiMin; }
+int getRSSIAvg() { return _rssiAvg; }
+
 bool isWiFiConnected() {
     if (_apMode) {
+        _dnsServer.processNextRequest();  // Captive portal DNS
         _apServer.handleClient();
         return false;
     }
@@ -225,6 +274,7 @@ bool isWiFiConnected() {
 
     _reconnectBackoff = 1000;
     if (!_mdnsStarted) startMDNS();
+    updateRSSI();
     return true;
 }
 

@@ -2,10 +2,13 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <Preferences.h>
 #include <ArduinoJson.h>
+#include <esp_ota_ops.h>
 #include "led_status.h"
 
 #define OTA_CHECK_INTERVAL_MS 3600000  // 1 hour
+#define MAX_CRASH_COUNT 3              // Rollback after this many consecutive crashes
 // FIRMWARE_VERSION is defined in Line_Sight.ino / main.cpp
 
 static String _otaDeviceId;
@@ -13,9 +16,61 @@ static String _otaBaseUrl;
 static unsigned long _lastOTACheck = 0;
 static bool _otaInProgress = false;
 
+// Forward declaration
+void logError(const String& message);
+
+// Check if we should rollback (called early in setup)
+void checkFirmwareRollback() {
+    Preferences otaPrefs;
+    otaPrefs.begin("otastate", false);
+
+    int crashCount = otaPrefs.getInt("crashes", 0);
+    bool justUpdated = otaPrefs.getBool("updated", false);
+
+    esp_reset_reason_t reason = esp_reset_reason();
+    bool wasCrash = (reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT ||
+                     reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT);
+
+    if (wasCrash && justUpdated) {
+        crashCount++;
+        otaPrefs.putInt("crashes", crashCount);
+        Serial.printf("[OTA] Post-update crash #%d/%d\n", crashCount, MAX_CRASH_COUNT);
+
+        if (crashCount >= MAX_CRASH_COUNT) {
+            Serial.println("[OTA] Too many crashes — rolling back to previous firmware!");
+            otaPrefs.putBool("updated", false);
+            otaPrefs.putInt("crashes", 0);
+            otaPrefs.end();
+
+            // Rollback to previous OTA partition
+            const esp_partition_t* prev = esp_ota_get_last_invalid_partition();
+            if (prev != NULL) {
+                esp_ota_set_boot_partition(prev);
+                Serial.println("[OTA] Rollback set. Rebooting...");
+                delay(1000);
+                ESP.restart();
+            } else {
+                Serial.println("[OTA] No previous partition to rollback to");
+            }
+            return;
+        }
+    } else if (!wasCrash) {
+        // Stable boot — clear crash counter and mark firmware as good
+        if (justUpdated) {
+            Serial.println("[OTA] Firmware stable after update — marking as good");
+            otaPrefs.putBool("updated", false);
+            otaPrefs.putInt("crashes", 0);
+
+            // Mark current partition as valid (prevents automatic rollback)
+            esp_ota_mark_app_valid_cancel_rollback();
+        }
+    }
+
+    otaPrefs.end();
+}
+
 void initOTAUpdater(const String& deviceId, const String& serverBaseUrl) {
     _otaDeviceId = deviceId;
-    // Use main server for firmware updates (HTTP — HTTPS needs too much RAM)
     String baseUrl = serverBaseUrl;
     int apiIdx = baseUrl.indexOf("/api/");
     if (apiIdx >= 0) {
@@ -23,7 +78,6 @@ void initOTAUpdater(const String& deviceId, const String& serverBaseUrl) {
     } else {
         _otaBaseUrl = "http://77.42.75.92/api/firmware/";
     }
-    // OTA URL derived from data server URL
     Serial.printf("[OTA] Updater initialized, version: %s\n", FIRMWARE_VERSION);
 }
 
@@ -34,7 +88,7 @@ void checkForUpdate() {
     if (_otaInProgress) return;
 
     String checkUrl = _otaBaseUrl + "check?device_id=" + _otaDeviceId + "&current_version=" + FIRMWARE_VERSION;
-    Serial.printf("[OTA] Checking for updates: %s\n", checkUrl.c_str());
+    Serial.printf("[OTA] Checking: %s\n", checkUrl.c_str());
 
     HTTPClient http;
     http.begin(checkUrl);
@@ -47,19 +101,30 @@ void checkForUpdate() {
         return;
     }
 
+    int contentLen = http.getSize();
     String payload = http.getString();
     http.end();
+
+    Serial.printf("[OTA] Response: HTTP %d, len=%d, body=%d bytes\n", httpCode, contentLen, payload.length());
+    if (payload.length() < 500) {
+        Serial.printf("[OTA] Body: %s\n", payload.c_str());
+    }
+
+    if (payload.length() == 0) {
+        Serial.println("[OTA] Empty response body — server may be using chunked encoding");
+        return;
+    }
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err) {
-        Serial.printf("[OTA] JSON parse error: %s\n", err.c_str());
+        Serial.printf("[OTA] JSON error: %s\n", err.c_str());
         return;
     }
 
     bool updateAvailable = doc["update_available"] | false;
     if (!updateAvailable) {
-        Serial.println("[OTA] Firmware is up to date");
+        Serial.println("[OTA] Up to date");
         return;
     }
 
@@ -67,18 +132,17 @@ void checkForUpdate() {
     String downloadUrl = doc["url"] | "";
     String releaseNotes = doc["release_notes"] | "";
 
-    Serial.printf("[OTA] Update available: %s -> %s\n", FIRMWARE_VERSION, newVersion.c_str());
+    Serial.printf("[OTA] Update: %s -> %s\n", FIRMWARE_VERSION, newVersion.c_str());
     if (releaseNotes.length() > 0) Serial.printf("[OTA] Notes: %s\n", releaseNotes.c_str());
 
     if (downloadUrl.length() == 0) {
-        Serial.println("[OTA] No download URL provided");
+        Serial.println("[OTA] No download URL");
         return;
     }
 
-    // Start update
     _otaInProgress = true;
     setLEDState(LED_OTA_UPDATING);
-    Serial.printf("[OTA] Downloading firmware from: %s\n", downloadUrl.c_str());
+    Serial.printf("[OTA] Downloading: %s\n", downloadUrl.c_str());
 
     HTTPClient dlHttp;
     dlHttp.begin(downloadUrl);
@@ -102,10 +166,10 @@ void checkForUpdate() {
         return;
     }
 
-    Serial.printf("[OTA] Firmware size: %d bytes\n", contentLength);
+    Serial.printf("[OTA] Size: %d bytes\n", contentLength);
 
     if (!Update.begin(contentLength)) {
-        Serial.printf("[OTA] Not enough space: %s\n", Update.errorString());
+        Serial.printf("[OTA] No space: %s\n", Update.errorString());
         _otaInProgress = false;
         setLEDState(LED_ERROR);
         dlHttp.end();
@@ -117,7 +181,7 @@ void checkForUpdate() {
     Serial.printf("[OTA] Written: %d / %d bytes\n", written, contentLength);
 
     if (!Update.end()) {
-        Serial.printf("[OTA] Update failed: %s\n", Update.errorString());
+        Serial.printf("[OTA] Failed: %s\n", Update.errorString());
         _otaInProgress = false;
         setLEDState(LED_ERROR);
         dlHttp.end();
@@ -127,11 +191,18 @@ void checkForUpdate() {
     dlHttp.end();
 
     if (Update.isFinished()) {
-        Serial.printf("[OTA] Update successful! Rebooting to %s...\n", newVersion.c_str());
+        // Mark that we just updated — crash counter will track stability
+        Preferences otaPrefs;
+        otaPrefs.begin("otastate", false);
+        otaPrefs.putBool("updated", true);
+        otaPrefs.putInt("crashes", 0);
+        otaPrefs.end();
+
+        Serial.printf("[OTA] Success! Rebooting to %s...\n", newVersion.c_str());
         delay(1000);
         ESP.restart();
     } else {
-        Serial.println("[OTA] Update not finished");
+        Serial.println("[OTA] Not finished");
         _otaInProgress = false;
         setLEDState(LED_ERROR);
     }

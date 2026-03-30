@@ -7,7 +7,7 @@
  *   Core 0 (network task): HTTP POST, heartbeat, OTA, SPIFFS, web server
  */
 
-#define FIRMWARE_VERSION "1.4.0"
+#define FIRMWARE_VERSION "1.5.0"
 
 #include <Preferences.h>
 #include "led_status.h"
@@ -125,6 +125,9 @@ void setup() {
     Serial.println("  LS-6C-IOT_V1.0 | ESP32-WROOM-32E");
     Serial.println("  Dual-core: CT on Core 1, HTTP on Core 0");
     Serial.println("========================================");
+
+    // Check firmware rollback (before anything else)
+    checkFirmwareRollback();
 
     pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
