@@ -5,10 +5,10 @@
 // CT pin mapping (LS-6C-IOT_V1.0 schematic — all ADC1)
 #define NUM_CT_CHANNELS 6
 
-// Sampling: interleaved across all 6 channels for ~800ms
+// Sampling: interleaved across all 6 channels for ~500ms
 // At each time step, read all 6 channels (~700μs), then wait for next ms
-// ~800 samples per channel across 40 full 50Hz cycles
-#define ADC_SAMPLES_PER_CH 800
+// 500 samples per channel across 25 full 50Hz cycles — leaves 500ms for HTTP
+#define ADC_SAMPLES_PER_CH 500
 #define SAMPLE_INTERVAL_US 1000  // 1ms between sample sets
 
 // Calibration: derived from manufacturer's formula
