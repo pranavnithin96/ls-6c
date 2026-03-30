@@ -15,9 +15,15 @@ static bool _otaInProgress = false;
 
 void initOTAUpdater(const String& deviceId, const String& serverBaseUrl) {
     _otaDeviceId = deviceId;
-    // Use test server for firmware updates
-    _otaBaseUrl = "https://test.linesights.com/api/firmware/";
-    (void)serverBaseUrl;  // OTA uses dedicated endpoint
+    // Use main server for firmware updates (HTTP — HTTPS needs too much RAM)
+    String baseUrl = serverBaseUrl;
+    int apiIdx = baseUrl.indexOf("/api/");
+    if (apiIdx >= 0) {
+        _otaBaseUrl = baseUrl.substring(0, apiIdx) + "/api/firmware/";
+    } else {
+        _otaBaseUrl = "http://77.42.75.92/api/firmware/";
+    }
+    // OTA URL derived from data server URL
     Serial.printf("[OTA] Updater initialized, version: %s\n", FIRMWARE_VERSION);
 }
 
