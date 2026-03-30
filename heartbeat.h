@@ -14,6 +14,11 @@
 #define ERROR_LOG_FILE "/errors.json"
 #define ERROR_SAVE_INTERVAL_MS 300000 // Save errors to SPIFFS every 5 min
 
+// Forward declarations for command handlers
+void logError(const String& message);
+void calibrateCTZero();
+void setHTTPDebug(bool on);
+
 struct ErrorEntry {
     String timestamp;
     String message;
@@ -123,6 +128,93 @@ void initHeartbeat(const String& serverUrl) {
     }
 }
 
+// Process commands from server response
+void processCommands(const String& responseBody) {
+    if (responseBody.length() == 0) return;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, responseBody);
+    if (err) return;  // No commands or invalid JSON — that's fine
+
+    JsonArray commands = doc["commands"];
+    if (commands.isNull() || commands.size() == 0) return;
+
+    Serial.printf("[CMD] Server sent %d command(s)\n", commands.size());
+
+    for (JsonObject cmd : commands) {
+        String action = cmd["action"] | "";
+        if (action.length() == 0) continue;
+
+        Serial.printf("[CMD] -> %s\n", action.c_str());
+
+        if (action == "set_interval") {
+            int val = cmd["value"] | -1;
+            if (val >= 1 && val <= 60) {
+                Preferences p;
+                p.begin("lscfg", false);
+                p.putInt("interval", val);
+                p.end();
+                Serial.printf("[CMD] Interval set to %ds (takes effect after reboot)\n", val);
+            }
+
+        } else if (action == "set_voltage") {
+            float val = cmd["value"] | -1.0f;
+            if (val >= 100 && val <= 250) {
+                Preferences p;
+                p.begin("lscfg", false);
+                p.putFloat("volt", val);
+                p.end();
+                Serial.printf("[CMD] Voltage set to %.0fV (takes effect after reboot)\n", val);
+            }
+
+        } else if (action == "set_noise_threshold") {
+            // This would require a dynamic variable — for now log it
+            float val = cmd["value"] | -1.0f;
+            Serial.printf("[CMD] Noise threshold: %.1fW (not yet dynamic)\n", val);
+
+        } else if (action == "recalibrate") {
+            Serial.println("[CMD] Recalibrating CT zero...");
+            calibrateCTZero();
+
+        } else if (action == "reboot") {
+            Serial.println("[CMD] Reboot requested by server");
+            delay(500);
+            ESP.restart();
+
+        } else if (action == "debug_on") {
+            setHTTPDebug(true);
+            Serial.println("[CMD] HTTP debug ON");
+
+        } else if (action == "debug_off") {
+            setHTTPDebug(false);
+            Serial.println("[CMD] HTTP debug OFF");
+
+        } else if (action == "get_errors") {
+            // Errors are already included in the heartbeat payload
+            // This forces an immediate heartbeat with full error log
+            Serial.println("[CMD] Error log requested — included in this heartbeat");
+
+        } else if (action == "factory_reset") {
+            Serial.println("[CMD] Factory reset requested by server!");
+            Preferences p;
+            p.begin("lscfg", false);
+            p.clear();
+            p.end();
+            delay(500);
+            ESP.restart();
+
+        } else if (action == "update_firmware") {
+            Serial.println("[CMD] Firmware update check requested");
+            // Set last OTA check to 0 so it checks on next loop
+            extern unsigned long _lastOTACheck;
+            _lastOTACheck = 0;
+
+        } else {
+            Serial.printf("[CMD] Unknown action: %s\n", action.c_str());
+        }
+    }
+}
+
 void sendHeartbeat() {
     if (_heartbeatUrl.length() == 0) return;
 
@@ -176,11 +268,14 @@ void sendHeartbeat() {
     int httpCode = http.POST(json);
 
     if (httpCode == 200) {
+        String response = http.getString();
         Serial.printf("[HB] OK | heap:%u | RSSI:%d | Q:%d | S:%d | E:%d\n",
             ESP.getFreeHeap(), WiFi.RSSI(), getQueueSize(), getTotalSent(), _errorCount);
+
+        // Parse server commands from response
+        processCommands(response);
     } else if (httpCode > 0) {
-        // Don't log as error — endpoint might not exist yet
-        Serial.printf("[HB] HTTP %d (endpoint may not exist yet)\n", httpCode);
+        Serial.printf("[HB] HTTP %d\n", httpCode);
     } else {
         logError("Heartbeat failed: " + http.errorToString(httpCode));
     }
