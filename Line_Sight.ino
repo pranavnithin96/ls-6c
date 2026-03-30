@@ -180,12 +180,17 @@ void loop() {
         syncNTP();
     }
 
-    // Read CT sensors at configured interval
+    // Read CT sensors — sampling takes ~800ms, remaining time used for HTTP/overhead
+    // Together this targets 1 reading per second
     unsigned long now = millis();
     int intervalMs = getSendInterval() * 1000;
+    unsigned long elapsed = now - lastReadingTime;
 
-    if (now - lastReadingTime >= (unsigned long)intervalMs) {
-        lastReadingTime = now;
+    if (elapsed >= (unsigned long)intervalMs) {
+        lastReadingTime += intervalMs;  // fixed-rate: prevents drift
+        if (now - lastReadingTime > (unsigned long)intervalMs) {
+            lastReadingTime = now;  // catch up if we fell behind
+        }
 
         lastReadings = readAllCT(getGridVoltage());
         updateLastReadings(lastReadings);

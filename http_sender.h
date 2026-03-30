@@ -158,64 +158,75 @@ void queueReading(const String& deviceId, const String& location, const String& 
     _bufferCount++;
 }
 
+// Send up to MAX_SENDS_PER_LOOP readings per call to drain backlog faster
+#define MAX_SENDS_PER_LOOP 5
+
 void processSendQueue() {
     if (_bufferCount == 0) return;
 
     unsigned long now = millis();
     if (_consecutiveFailures > 0 && (now - _lastSendAttempt) < (unsigned long)_backoffMs) return;
 
-    if (!_sendBuffer[_bufferTail].used) return;
+    int sent_this_loop = 0;
 
-    String& json = _sendBuffer[_bufferTail].json;
+    while (_bufferCount > 0 && sent_this_loop < MAX_SENDS_PER_LOOP) {
+        if (!_sendBuffer[_bufferTail].used) break;
 
-    if (_httpDebug) {
-        Serial.printf("[HTTP] POST %s\n", _httpServerUrl.c_str());
-        Serial.printf("[HTTP] Body: %s\n", json.c_str());
-    }
+        String& json = _sendBuffer[_bufferTail].json;
 
-    HTTPClient http;
-    http.begin(_httpServerUrl);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(HTTP_TIMEOUT_MS);
-
-    int httpCode = http.POST(json);
-    _lastSendAttempt = now;
-
-    if (httpCode == 200) {
-        _totalSent++;
-        _consecutiveFailures = 0;
-        _backoffMs = 1000;
-        _sendBuffer[_bufferTail].used = false;
-        _sendBuffer[_bufferTail].json = String();
-        _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
-        _bufferCount--;
-    } else {
-        _totalFailed++;
-        _consecutiveFailures++;
-        _backoffMs = min(_backoffMs * 2, MAX_BACKOFF_MS);
-
-        if (httpCode > 0) {
-            String errMsg = "HTTP " + String(httpCode) + ": " + http.getString();
-            Serial.printf("[HTTP] %s\n", errMsg.c_str());
-            if (_consecutiveFailures == 1) logError(errMsg);  // log first failure
-        } else {
-            String errMsg = "HTTP error: " + http.errorToString(httpCode);
-            Serial.printf("[HTTP] %s\n", errMsg.c_str());
-            if (_consecutiveFailures == 1) logError(errMsg);
+        if (_httpDebug) {
+            Serial.printf("[HTTP] POST %s\n", _httpServerUrl.c_str());
+            Serial.printf("[HTTP] Body: %s\n", json.c_str());
         }
 
-        if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-            _totalDropped++;
+        HTTPClient http;
+        http.begin(_httpServerUrl);
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(HTTP_TIMEOUT_MS);
+
+        int httpCode = http.POST(json);
+        _lastSendAttempt = millis();
+
+        if (httpCode == 200) {
+            _totalSent++;
+            _consecutiveFailures = 0;
+            _backoffMs = 1000;
             _sendBuffer[_bufferTail].used = false;
             _sendBuffer[_bufferTail].json = String();
             _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
             _bufferCount--;
-            _consecutiveFailures = 0;
-            logError("Dropped reading after " + String(MAX_CONSECUTIVE_FAILURES) + " retries");
-        }
-    }
+            sent_this_loop++;
+        } else {
+            _totalFailed++;
+            _consecutiveFailures++;
+            _backoffMs = min(_backoffMs * 2, MAX_BACKOFF_MS);
 
-    http.end();
+            if (httpCode > 0) {
+                String errMsg = "HTTP " + String(httpCode) + ": " + http.getString();
+                Serial.printf("[HTTP] %s\n", errMsg.c_str());
+                if (_consecutiveFailures == 1) logError(errMsg);
+            } else {
+                String errMsg = "HTTP error: " + http.errorToString(httpCode);
+                Serial.printf("[HTTP] %s\n", errMsg.c_str());
+                if (_consecutiveFailures == 1) logError(errMsg);
+            }
+
+            if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                _totalDropped++;
+                _sendBuffer[_bufferTail].used = false;
+                _sendBuffer[_bufferTail].json = String();
+                _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
+                _bufferCount--;
+                _consecutiveFailures = 0;
+                logError("Dropped reading after " + String(MAX_CONSECUTIVE_FAILURES) + " retries");
+            }
+
+            http.end();
+            break;  // Stop sending on failure, wait for backoff
+        }
+
+        http.end();
+    }
 
     // Periodic buffer save to flash (every 5 minutes)
     if (_spiffsReady && (now - _lastBufferSave >= BUFFER_SAVE_INTERVAL_MS)) {
