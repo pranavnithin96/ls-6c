@@ -7,7 +7,7 @@
  *   Core 0 (network task): HTTP POST, heartbeat, OTA, SPIFFS, web server
  */
 
-#define FIRMWARE_VERSION "1.3.0"
+#define FIRMWARE_VERSION "1.4.0"
 
 #include <Preferences.h>
 #include "led_status.h"
@@ -43,7 +43,11 @@ struct QueuedReading {
 void networkTask(void* param) {
     Serial.println("[NET] Network task started on Core 0");
 
+    // Add Core 0 to watchdog (120s timeout matches Core 1)
+    esp_task_wdt_add(NULL);
+
     for (;;) {
+        esp_task_wdt_reset();  // Feed Core 0 watchdog
         // Send queued CT readings
         QueuedReading qr;
         while (xQueueReceive(readingQueue, &qr, 0) == pdTRUE) {
@@ -96,7 +100,8 @@ void printStatus() {
     Serial.printf("  Free heap:  %u bytes\n", ESP.getFreeHeap());
     Serial.printf("  Queue:      %d | Sent: %d | Failed: %d | Dropped: %d\n",
         getQueueSize(), getTotalSent(), getTotalFailed(), getTotalDropped());
-    Serial.printf("  CT cal:     %s\n", isCTCalibrated() ? "yes" : "no");
+    Serial.printf("  CT cal:     %s | Multi-point: %s\n",
+        isCTCalibrated() ? "yes" : "no", isMultiCalLoaded() ? "yes" : "no");
     Serial.println("  --- CT Readings ---");
     for (int i = 0; i < NUM_CT_CHANNELS; i++) {
         Serial.printf("  CT%d: %.3fA | %.1fW | PF:%.1f | %dmV | var:%d\n",
@@ -183,7 +188,7 @@ void setup() {
     Serial.printf("  Interval:   %ds\n", getSendInterval());
     Serial.printf("  Timezone:   %s\n", getTimezone().c_str());
     Serial.println("---------------------");
-    Serial.println("Commands: status | calibrate | debug | reset | update");
+    Serial.println("Commands: status | calibrate | calpoint | debug | reset | update");
     Serial.println("Monitoring started...\n");
 }
 
@@ -211,6 +216,22 @@ void loop() {
         } else if (cmd == "update") {
             Serial.println("[OTA] Forcing update check...");
             checkForUpdate();
+        } else if (cmd.startsWith("calpoint ")) {
+            // Usage: calpoint <ch 1-6> <point 0-2> <known_amps>
+            // Example: calpoint 1 0 0.5   (CH1, low point, 0.5A actual)
+            //          calpoint 1 1 5.0   (CH1, mid point, 5.0A actual)
+            //          calpoint 1 2 25.0  (CH1, high point, 25.0A actual)
+            int ch = 0, pt = 0;
+            float amps = 0;
+            if (sscanf(cmd.c_str(), "calpoint %d %d %f", &ch, &pt, &amps) == 3) {
+                Serial.printf("[CMD] Setting cal: CH%d point %d = %.3fA\n", ch, pt, amps);
+                setCalPoint(ch - 1, pt, amps);  // ch is 1-based from user
+            } else {
+                Serial.println("[CMD] Usage: calpoint <ch 1-6> <point 0-2> <amps>");
+                Serial.println("  Example: calpoint 1 0 0.5  (low)");
+                Serial.println("           calpoint 1 1 5.0  (mid)");
+                Serial.println("           calpoint 1 2 25.0 (high)");
+            }
         } else if (cmd == "reset") {
             Serial.println("\n[RESET] Factory reset via serial command!");
             Preferences resetPrefs;
