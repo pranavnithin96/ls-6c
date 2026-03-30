@@ -2,8 +2,9 @@
  * LineSights LS-6C-IOT_V1.0 Power Monitor Firmware
  * ESP32-WROOM-32E | 6-channel CT current sensing
  *
- * Features: eFuse-calibrated ADC, auto-zero calibration, buffered HTTP,
- * WiFi AP setup portal, OTA updates, web dashboard, watchdog.
+ * Dual-core architecture:
+ *   Core 1 (main loop): CT sampling, LED, serial commands, watchdog
+ *   Core 0 (network task): HTTP POST, heartbeat, OTA, SPIFFS, web server
  */
 
 #define FIRMWARE_VERSION "1.3.0"
@@ -21,12 +22,70 @@
 static unsigned long lastReadingTime = 0;
 static unsigned long bootButtonPressStart = 0;
 static AllCTReadings lastReadings = {};
+static volatile bool networkReady = false;
+
 #define BOOT_BUTTON_PIN 0
 #define FACTORY_RESET_HOLD_MS 5000
+#define NETWORK_TASK_STACK 8192
 
+// Shared queue: main loop writes readings, network task sends them
+#define READING_QUEUE_SIZE 10
+static QueueHandle_t readingQueue = NULL;
+
+struct QueuedReading {
+    AllCTReadings readings;
+    char timestamp[32];
+};
+
+// =============================================
+// Network Task — runs on Core 0
+// =============================================
+void networkTask(void* param) {
+    Serial.println("[NET] Network task started on Core 0");
+
+    for (;;) {
+        // Send queued CT readings
+        QueuedReading qr;
+        while (xQueueReceive(readingQueue, &qr, 0) == pdTRUE) {
+            if (isWiFiConnected()) {
+                String ts = String(qr.timestamp);
+                queueReading(getDeviceId(), getLocationName(), getTimezone(),
+                             getGridVoltage(), qr.readings.ct, ts);
+            }
+        }
+
+        // Process HTTP send queue (up to 5 per iteration)
+        if (isWiFiConnected()) {
+            processSendQueue();
+        }
+
+        // Heartbeat
+        if (isWiFiConnected()) {
+            heartbeatLoop();
+        }
+
+        // OTA
+        if (isWiFiConnected()) {
+            otaLoop();
+        }
+
+        // Web status server
+        handleStatusServer();
+
+        // Diagnostics health report
+        diagnosticsLoop();
+
+        // Small yield to prevent watchdog on Core 0
+        vTaskDelay(1);
+    }
+}
+
+// =============================================
+// Status Print
+// =============================================
 void printStatus() {
     Serial.println("\n=== Device Status ===");
-    Serial.printf("  Firmware:   v%s\n", FIRMWARE_VERSION);
+    Serial.printf("  Firmware:   v%s (dual-core)\n", FIRMWARE_VERSION);
     Serial.printf("  Device ID:  %s\n", getDeviceId().c_str());
     Serial.printf("  Location:   %s\n", getLocationName().c_str());
     Serial.printf("  WiFi:       %s (RSSI: %d dBm)\n",
@@ -48,6 +107,9 @@ void printStatus() {
     Serial.println("=====================\n");
 }
 
+// =============================================
+// Setup — runs on Core 1
+// =============================================
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -56,19 +118,16 @@ void setup() {
     Serial.println("========================================");
     Serial.printf("  LineSights Power Monitor v%s\n", FIRMWARE_VERSION);
     Serial.println("  LS-6C-IOT_V1.0 | ESP32-WROOM-32E");
+    Serial.println("  Dual-core: CT on Core 1, HTTP on Core 0");
     Serial.println("========================================");
 
-    // 0. Boot button for factory reset
     pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
-    // 1. LED
     initLED();
     setLEDState(LED_BOOTING);
 
-    // 2. Diagnostics & watchdog
     initDiagnostics();
 
-    // 3. WiFi & config (may enter AP mode)
     feedWatchdog();
     setLEDState(LED_WIFI_CONNECTING);
     initWiFiManager();
@@ -84,19 +143,35 @@ void setup() {
         return;
     }
 
-    // 4. If WiFi connected, init networking
+    // Init networking
     if (isWiFiConnected()) {
         syncNTP();
         initHTTPSender(getServerUrl());
         initOTAUpdater(getDeviceId(), getServerUrl());
         initHeartbeat(getServerUrl());
         initStatusServer();
+        networkReady = true;
     }
 
-    // 5. CT sensors (auto-zero happens on first read if uncalibrated)
+    // CT sensors
     initCTSensors();
 
-    // 6. Ready
+    // Create reading queue
+    readingQueue = xQueueCreate(READING_QUEUE_SIZE, sizeof(QueuedReading));
+
+    // Launch network task on Core 0
+    if (networkReady) {
+        xTaskCreatePinnedToCore(
+            networkTask,          // function
+            "NetworkTask",        // name
+            NETWORK_TASK_STACK,   // stack size
+            NULL,                 // parameter
+            1,                    // priority
+            NULL,                 // handle
+            0                     // Core 0
+        );
+    }
+
     setLEDState(LED_RUNNING);
 
     Serial.println();
@@ -112,6 +187,9 @@ void setup() {
     Serial.println("Monitoring started...\n");
 }
 
+// =============================================
+// Main Loop — runs on Core 1 (CT sampling only)
+// =============================================
 void loop() {
     unsigned long loopStart = millis();
 
@@ -144,7 +222,7 @@ void loop() {
         }
     }
 
-    // Factory reset: hold BOOT button for 5 seconds
+    // Factory reset button
     if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
         if (bootButtonPressStart == 0) {
             bootButtonPressStart = millis();
@@ -161,14 +239,14 @@ void loop() {
         bootButtonPressStart = 0;
     }
 
-    // AP mode: only serve config page
+    // AP mode
     if (isAPMode()) {
         isWiFiConnected();
         delay(10);
         return;
     }
 
-    // Check WiFi
+    // WiFi reconnect
     if (!isWiFiConnected()) {
         if (getLEDState() != LED_WIFI_DISCONNECTED) {
             setLEDState(LED_WIFI_DISCONNECTED);
@@ -180,22 +258,21 @@ void loop() {
         syncNTP();
     }
 
-    // Read CT sensors — sampling takes ~800ms, remaining time used for HTTP/overhead
-    // Together this targets 1 reading per second
+    // ===== CT SAMPLING (this is all Core 1 does in the timed section) =====
     unsigned long now = millis();
     int intervalMs = getSendInterval() * 1000;
-    unsigned long elapsed = now - lastReadingTime;
 
-    if (elapsed >= (unsigned long)intervalMs) {
-        lastReadingTime += intervalMs;  // fixed-rate: prevents drift
+    if (now - lastReadingTime >= (unsigned long)intervalMs) {
+        lastReadingTime += intervalMs;
         if (now - lastReadingTime > (unsigned long)intervalMs) {
-            lastReadingTime = now;  // catch up if we fell behind
+            lastReadingTime = now;
         }
 
+        // Sample all 6 CT channels (~500ms interleaved)
         lastReadings = readAllCT(getGridVoltage());
         updateLastReadings(lastReadings);
 
-        // Log active channels
+        // Log
         bool anyActive = false;
         for (int i = 0; i < NUM_CT_CHANNELS; i++) {
             if (lastReadings.ct[i].amps > 0) {
@@ -223,39 +300,21 @@ void loop() {
                 getTotalSent());
         }
 
-        // Queue for sending
-        if (isWiFiConnected()) {
+        // Push to network task queue (non-blocking)
+        if (networkReady && readingQueue != NULL) {
+            QueuedReading qr;
+            qr.readings = lastReadings;
             String ts = getUTCTimestamp();
-            queueReading(getDeviceId(), getLocationName(), getTimezone(),
-                         getGridVoltage(), lastReadings.ct, ts);
+            strncpy(qr.timestamp, ts.c_str(), sizeof(qr.timestamp) - 1);
+            qr.timestamp[sizeof(qr.timestamp) - 1] = '\0';
+            if (xQueueSend(readingQueue, &qr, 0) != pdTRUE) {
+                Serial.println("[WARN] Reading queue full, network task lagging");
+            }
             setLEDState(LED_SENDING);
         }
     }
 
-    // Process send queue
-    if (isWiFiConnected()) {
-        processSendQueue();
-        if (getQueueSize() == 0 && getLEDState() == LED_SENDING) {
-            setLEDState(LED_RUNNING);
-        }
-    }
-
-    // OTA check
-    if (isWiFiConnected()) {
-        otaLoop();
-    }
-
-    // Heartbeat (every 1 min)
-    if (isWiFiConnected()) {
-        heartbeatLoop();
-    }
-
-    // Web status server
-    handleStatusServer();
-
-    // Diagnostics
-    diagnosticsLoop();
-
+    // Record loop timing
     unsigned long loopTime = millis() - loopStart;
     recordLoopTime(loopTime);
 }
