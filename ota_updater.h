@@ -15,6 +15,9 @@ static String _otaDeviceId;
 static String _otaBaseUrl;
 static unsigned long _lastOTACheck = 0;
 static bool _otaInProgress = false;
+static bool _otaForceCheck = false;
+
+void forceOTACheck() { _otaForceCheck = true; }
 
 // Forward declaration
 void logError(const String& message);
@@ -101,17 +104,24 @@ void checkForUpdate() {
         return;
     }
 
-    int contentLen = http.getSize();
-    String payload = http.getString();
+    // Read response — handle both chunked and content-length responses
+    String payload = "";
+    WiFiClient* checkStream = http.getStreamPtr();
+    if (checkStream && checkStream->available()) {
+        payload = checkStream->readString();
+    }
+    if (payload.length() == 0) {
+        payload = http.getString();
+    }
     http.end();
 
-    Serial.printf("[OTA] Response: HTTP %d, len=%d, body=%d bytes\n", httpCode, contentLen, payload.length());
-    if (payload.length() < 500) {
+    Serial.printf("[OTA] Response: HTTP %d, body=%d bytes\n", httpCode, payload.length());
+    if (payload.length() > 0 && payload.length() < 500) {
         Serial.printf("[OTA] Body: %s\n", payload.c_str());
     }
 
     if (payload.length() == 0) {
-        Serial.println("[OTA] Empty response body — server may be using chunked encoding");
+        Serial.println("[OTA] Empty response — check server");
         return;
     }
 
@@ -212,8 +222,9 @@ void otaLoop() {
     if (_otaInProgress) return;
 
     unsigned long now = millis();
-    if (now - _lastOTACheck >= OTA_CHECK_INTERVAL_MS) {
+    if (_otaForceCheck || (now - _lastOTACheck >= OTA_CHECK_INTERVAL_MS)) {
         _lastOTACheck = now;
+        _otaForceCheck = false;
         checkForUpdate();
     }
 }

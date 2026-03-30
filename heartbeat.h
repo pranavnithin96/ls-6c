@@ -18,6 +18,7 @@
 void logError(const String& message);
 void calibrateCTZero();
 void setHTTPDebug(bool on);
+void forceOTACheck();
 
 struct ErrorEntry {
     String timestamp;
@@ -205,9 +206,7 @@ void processCommands(const String& responseBody) {
 
         } else if (action == "update_firmware") {
             Serial.println("[CMD] Firmware update check requested");
-            // Set last OTA check to 0 so it checks on next loop
-            extern unsigned long _lastOTACheck;
-            _lastOTACheck = 0;
+            forceOTACheck();
 
         } else {
             Serial.printf("[CMD] Unknown action: %s\n", action.c_str());
