@@ -7,6 +7,9 @@
 #include "diagnostics.h"
 #include "wifi_manager.h"
 
+// Forward declaration
+int getErrorCount();
+
 static WebServer _statusServer(80);
 static bool _statusServerRunning = false;
 static AllCTReadings _lastReadings = {};
@@ -28,6 +31,7 @@ void _handleStatus() {
     json += ",\"sent\":" + String(getTotalSent());
     json += ",\"failed\":" + String(getTotalFailed());
     json += ",\"calibrated\":" + String(isCTCalibrated() ? "true" : "false");
+    json += ",\"errors\":" + String(getErrorCount());
     json += ",\"readings\":{";
     for (int i = 0; i < NUM_CT_CHANNELS; i++) {
         if (i > 0) json += ",";

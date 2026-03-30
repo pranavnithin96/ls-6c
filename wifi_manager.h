@@ -193,6 +193,7 @@ void syncNTP() {
         Serial.printf("[NTP] Time synced: %s\n", buf);
     } else {
         Serial.println("[NTP] Time sync failed, will retry later");
+        // logError called from heartbeat.h if included
     }
 }
 

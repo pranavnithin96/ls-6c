@@ -6,7 +6,7 @@
  * WiFi AP setup portal, OTA updates, web dashboard, watchdog.
  */
 
-#define FIRMWARE_VERSION "1.2.0"
+#define FIRMWARE_VERSION "1.3.0"
 
 #include <Preferences.h>
 #include "led_status.h"
@@ -16,6 +16,7 @@
 #include "http_sender.h"
 #include "ota_updater.h"
 #include "web_status.h"
+#include "heartbeat.h"
 
 static unsigned long lastReadingTime = 0;
 static unsigned long bootButtonPressStart = 0;
@@ -88,6 +89,7 @@ void setup() {
         syncNTP();
         initHTTPSender(getServerUrl());
         initOTAUpdater(getDeviceId(), getServerUrl());
+        initHeartbeat(getServerUrl());
         initStatusServer();
     }
 
@@ -171,6 +173,7 @@ void loop() {
         if (getLEDState() != LED_WIFI_DISCONNECTED) {
             setLEDState(LED_WIFI_DISCONNECTED);
             recordWiFiReconnect();
+            logError("WiFi disconnected, reconnecting");
         }
     } else if (getLEDState() == LED_WIFI_DISCONNECTED) {
         setLEDState(LED_RUNNING);
@@ -235,6 +238,11 @@ void loop() {
     // OTA check
     if (isWiFiConnected()) {
         otaLoop();
+    }
+
+    // Heartbeat (every 1 min)
+    if (isWiFiConnected()) {
+        heartbeatLoop();
     }
 
     // Web status server

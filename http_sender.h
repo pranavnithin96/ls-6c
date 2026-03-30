@@ -5,6 +5,9 @@
 #include <SPIFFS.h>
 #include "ct_sensor.h"
 
+// Forward declaration — defined in heartbeat.h
+void logError(const String& message);
+
 #define MAX_BUFFER_SIZE 300
 #define HTTP_TIMEOUT_MS 5000
 #define MAX_CONSECUTIVE_FAILURES 10
@@ -192,9 +195,13 @@ void processSendQueue() {
         _backoffMs = min(_backoffMs * 2, MAX_BACKOFF_MS);
 
         if (httpCode > 0) {
-            Serial.printf("[HTTP] Error %d: %s\n", httpCode, http.getString().c_str());
+            String errMsg = "HTTP " + String(httpCode) + ": " + http.getString();
+            Serial.printf("[HTTP] %s\n", errMsg.c_str());
+            if (_consecutiveFailures == 1) logError(errMsg);  // log first failure
         } else {
-            Serial.printf("[HTTP] Error: %s\n", http.errorToString(httpCode).c_str());
+            String errMsg = "HTTP error: " + http.errorToString(httpCode);
+            Serial.printf("[HTTP] %s\n", errMsg.c_str());
+            if (_consecutiveFailures == 1) logError(errMsg);
         }
 
         if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -204,7 +211,7 @@ void processSendQueue() {
             _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
             _bufferCount--;
             _consecutiveFailures = 0;
-            Serial.println("[HTTP] Dropped after max retries");
+            logError("Dropped reading after " + String(MAX_CONSECUTIVE_FAILURES) + " retries");
         }
     }
 

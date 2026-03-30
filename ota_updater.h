@@ -6,7 +6,7 @@
 #include "led_status.h"
 
 #define OTA_CHECK_INTERVAL_MS 3600000  // 1 hour
-#define FIRMWARE_VERSION "1.0.0"
+// FIRMWARE_VERSION is defined in Line_Sight.ino / main.cpp
 
 static String _otaDeviceId;
 static String _otaBaseUrl;
