@@ -32,18 +32,6 @@ static int _rssiAvg = 0;
 #define AP_SSID "LineSights-Setup"
 #define MDNS_HOSTNAME "linesights"
 
-// Security: API key for authenticating device-to-server communication
-// This gets sent as X-API-Key header on all HTTP requests
-// Configurable via AP setup or NVS
-static String _apiKey = "";
-
-// Input limits
-#define MAX_SSID_LEN 32
-#define MAX_PASS_LEN 63
-#define MAX_DEVID_LEN 50
-#define MAX_URL_LEN 128
-#define MAX_LOC_LEN 64
-
 static String _deviceId, _locationName, _cfgServerUrl, _cfgTimezone, _wifiSSID, _wifiPassword;
 static float _gridVoltage;
 static int _ctRatings[6];
@@ -104,7 +92,6 @@ button:hover{background:#0D47A1}label{font-weight:bold;font-size:14px}
 <label>CT6 Rating (A)</label><select name="ct6"><option>50</option><option>100</option><option>150</option></select>
 <label>Send Interval (s)</label><input name="int" type="number" value="1" min="1" max="60">
 <label>Timezone</label><input name="tz" value="Asia/Kolkata">
-<label>API Key (optional)</label><input name="apikey" placeholder="your-api-key">
 <button type="submit">Save & Connect</button></form></body></html>
 )rawliteral";
 
@@ -124,38 +111,24 @@ static const char SAVED_HTML[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 void _handleSave() {
-    // Validate and sanitize inputs
-    String ssid = _apServer.arg("ssid");
-    String pass = _apServer.arg("pass");
-    String devid = _apServer.arg("devid");
-    String loc = _apServer.arg("loc");
-    String url = _apServer.arg("url");
-    String apikey = _apServer.arg("apikey");
-
-    // Length limits
-    if (ssid.length() > MAX_SSID_LEN) ssid = ssid.substring(0, MAX_SSID_LEN);
-    if (pass.length() > MAX_PASS_LEN) pass = pass.substring(0, MAX_PASS_LEN);
-    if (devid.length() > MAX_DEVID_LEN) devid = devid.substring(0, MAX_DEVID_LEN);
-    if (loc.length() > MAX_LOC_LEN) loc = loc.substring(0, MAX_LOC_LEN);
-    if (url.length() > MAX_URL_LEN) url = url.substring(0, MAX_URL_LEN);
-
+    // Validate inputs
     float volt = _apServer.arg("volt").toFloat();
     if (volt < 100 || volt > 250) volt = 230.0f;
 
     int interval = _apServer.arg("int").toInt();
     if (interval < 1 || interval > 60) interval = 1;
 
+    String url = _apServer.arg("url");
     if (!url.startsWith("http://") && !url.startsWith("https://")) {
         url = DEFAULT_SERVER_URL;
     }
 
     _prefs.begin("lscfg", false);
-    _prefs.putString("ssid", ssid);
-    _prefs.putString("pass", pass);
-    _prefs.putString("devid", devid);
-    _prefs.putString("loc", loc);
+    _prefs.putString("ssid", _apServer.arg("ssid"));
+    _prefs.putString("pass", _apServer.arg("pass"));
+    _prefs.putString("devid", _apServer.arg("devid"));
+    _prefs.putString("loc", _apServer.arg("loc"));
     _prefs.putString("url", url);
-    _prefs.putString("apikey", apikey);
     _prefs.putFloat("volt", volt);
     for (int i = 0; i < 6; i++) {
         char name[4];
@@ -188,7 +161,6 @@ bool _loadConfig() {
     }
     _sendInterval = _prefs.getInt("interval", DEFAULT_SEND_INTERVAL);
     _cfgTimezone = _prefs.getString("tz", DEFAULT_TIMEZONE);
-    _apiKey = _prefs.getString("apikey", "");
     _prefs.end();
     return _wifiSSID.length() > 0;
 }
@@ -310,7 +282,6 @@ bool isAPMode() { return _apMode; }
 String getDeviceId() { return _deviceId; }
 String getLocationName() { return _locationName; }
 String getServerUrl() { return _cfgServerUrl; }
-String getApiKey() { return _apiKey; }
 float getGridVoltage() { return _gridVoltage; }
 int getCtRating(int channel = 0) { return _ctRatings[channel < 6 ? channel : 0]; }
 int getSendInterval() { return _sendInterval; }

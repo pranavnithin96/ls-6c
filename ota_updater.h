@@ -96,10 +96,6 @@ void checkForUpdate() {
     HTTPClient http;
     http.begin(checkUrl);
     http.setTimeout(10000);
-    String apiKey = getApiKey();
-    if (apiKey.length() > 0) {
-        http.addHeader("X-API-Key", apiKey);
-    }
     int httpCode = http.GET();
 
     if (httpCode != 200) {
@@ -145,7 +141,6 @@ void checkForUpdate() {
     String newVersion = doc["version"] | "unknown";
     String downloadUrl = doc["url"] | "";
     String releaseNotes = doc["release_notes"] | "";
-    String expectedHash = doc["sha256"] | "";  // Optional SHA256 hash for verification
 
     Serial.printf("[OTA] Update: %s -> %s\n", FIRMWARE_VERSION, newVersion.c_str());
     if (releaseNotes.length() > 0) Serial.printf("[OTA] Notes: %s\n", releaseNotes.c_str());
@@ -198,12 +193,6 @@ void checkForUpdate() {
     WiFiClient* stream = dlHttp.getStreamPtr();
     size_t written = Update.writeStream(*stream);
     Serial.printf("[OTA] Written: %d / %d bytes\n", written, contentLength);
-
-    // Verify hash if server provided one
-    if (expectedHash.length() > 0) {
-        Update.setMD5(expectedHash.c_str());  // ESP32 Update lib uses this for verification
-        Serial.printf("[OTA] Hash verification: %s\n", expectedHash.c_str());
-    }
 
     if (!Update.end()) {
         Serial.printf("[OTA] Failed: %s\n", Update.errorString());
