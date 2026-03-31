@@ -262,12 +262,28 @@ void sendHeartbeat() {
     HTTPClient http;
     http.begin(_heartbeatUrl);
     http.addHeader("Content-Type", "application/json");
+    String apiKey = getApiKey();
+    if (apiKey.length() > 0) {
+        http.addHeader("X-API-Key", apiKey);
+    }
     http.setTimeout(HEARTBEAT_TIMEOUT_MS);
 
     int httpCode = http.POST(json);
 
     if (httpCode == 200) {
-        String response = http.getString();
+        // Cap response size to prevent memory exhaustion attack
+        String response = "";
+        int respLen = http.getSize();
+        if (respLen > 0 && respLen < 4096) {
+            response = http.getString();
+        } else if (respLen < 0) {
+            // Chunked — read with limit
+            WiFiClient* s = http.getStreamPtr();
+            if (s) {
+                response = s->readString();
+                if (response.length() > 4096) response = "";
+            }
+        }
         Serial.printf("[HB] OK | heap:%u | RSSI:%d | Q:%d | S:%d | E:%d\n",
             ESP.getFreeHeap(), WiFi.RSSI(), getQueueSize(), getTotalSent(), _errorCount);
 

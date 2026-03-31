@@ -46,7 +46,7 @@ void _handleStatus() {
     json += "},\"total_watts\":" + String(_lastReadings.total_watts, 1);
     json += "}";
 
-    _statusServer.sendHeader("Access-Control-Allow-Origin", "*");
+    // Only allow same-origin requests (no wildcard CORS)
     _statusServer.send(200, "application/json", json);
 }
 

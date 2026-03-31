@@ -186,6 +186,10 @@ void processSendQueue() {
     if (!_httpConnected) {
         _persistentHttp.begin(_httpServerUrl);
         _persistentHttp.addHeader("Content-Type", "application/json");
+        String apiKey = getApiKey();
+        if (apiKey.length() > 0) {
+            _persistentHttp.addHeader("X-API-Key", apiKey);
+        }
         _persistentHttp.setReuse(true);  // Keep-alive: reuse TCP/SSL connection
         _persistentHttp.setTimeout(HTTP_TIMEOUT_MS);
         _httpConnected = true;
