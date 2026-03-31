@@ -152,6 +152,10 @@ void checkForUpdate() {
 
     _otaInProgress = true;
     setLEDState(LED_OTA_UPDATING);
+
+    // Free persistent HTTP connection to reclaim ~40KB RAM for OTA download
+    disconnectHTTP();
+    Serial.printf("[OTA] Free heap before download: %u bytes\n", ESP.getFreeHeap());
     Serial.printf("[OTA] Downloading: %s\n", downloadUrl.c_str());
 
     HTTPClient dlHttp;
