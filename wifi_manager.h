@@ -24,7 +24,7 @@ static int _rssiMin = 0;
 static int _rssiAvg = 0;
 
 // Default config
-#define DEFAULT_SERVER_URL "https://linesights.com/api/data"
+#define DEFAULT_SERVER_URL "http://linesights.com/api/data"
 #define DEFAULT_GRID_VOLTAGE 230.0f
 #define DEFAULT_CT_RATING 30
 #define DEFAULT_SEND_INTERVAL 1
@@ -82,7 +82,7 @@ button:hover{background:#0D47A1}label{font-weight:bold;font-size:14px}
 <label>WiFi Password</label><input name="pass" type="password" required>
 <label>Device ID</label><input name="devid" placeholder="powermon_001" required>
 <label>Location</label><input name="loc" placeholder="Factory Floor" required>
-<label>Server URL</label><input name="url" value="https://linesights.com/api/data">
+<label>Server URL</label><input name="url" value="http://linesights.com/api/data">
 <label>Grid Voltage</label><input name="volt" type="number" value="230">
 <label>CT1 Rating (A)</label><select name="ct1"><option>50</option><option>100</option><option>150</option></select>
 <label>CT2 Rating (A)</label><select name="ct2"><option>50</option><option>100</option><option>150</option></select>

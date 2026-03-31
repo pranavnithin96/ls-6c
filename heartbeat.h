@@ -100,11 +100,14 @@ void logError(const String& message) {
 void initHeartbeat(const String& serverUrl) {
     // Derive heartbeat URL from data URL
     // e.g., "http://77.42.75.92/api/data" -> "http://77.42.75.92/api/firmware/heartbeat"
-    int apiIdx = serverUrl.indexOf("/api/");
+    // Force HTTP — server configured to serve ESP32 endpoints without HTTPS redirect
+    String baseUrl = serverUrl;
+    baseUrl.replace("https://", "http://");
+    int apiIdx = baseUrl.indexOf("/api/");
     if (apiIdx >= 0) {
-        _heartbeatUrl = serverUrl.substring(0, apiIdx) + "/api/firmware/heartbeat";
+        _heartbeatUrl = baseUrl.substring(0, apiIdx) + "/api/firmware/heartbeat";
     } else {
-        _heartbeatUrl = serverUrl + "/firmware/heartbeat";
+        _heartbeatUrl = baseUrl + "/firmware/heartbeat";
     }
 
     // Capture boot reason

@@ -116,7 +116,9 @@ void saveBufferToFlash() {
 }
 
 void initHTTPSender(const String& serverUrl) {
+    // Force HTTP — ESP32 doesn't have enough RAM for persistent HTTPS
     _httpServerUrl = serverUrl;
+    _httpServerUrl.replace("https://", "http://");
     for (int i = 0; i < MAX_BUFFER_SIZE; i++) _sendBuffer[i].used = false;
     _bufferCount = 0;
     _bufferHead = 0;
