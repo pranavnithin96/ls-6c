@@ -1,35 +1,13 @@
 #pragma once
 #include <Arduino.h>
 #include <Preferences.h>
+#include "config.h"
 
-// CT pin mapping (LS-6C-IOT_V1.0 schematic — all ADC1)
-#define NUM_CT_CHANNELS 6
+// ============================================================================
+// CT Sensor — Fixed calibration math, thread-safe, proper timing
+// ============================================================================
 
-// Sampling: interleaved across all 6 channels for ~950ms
-#define ADC_SAMPLES_PER_CH 950
-#define SAMPLE_INTERVAL_US 1000  // 1ms between sample sets
-
-// Default linear calibration (fallback if no multi-point cal)
-#define DEFAULT_AMPS_PER_MV 0.01526f
-
-// Power factor (assumed)
-#define DEFAULT_PF 0.9f
-
-// Noise threshold in watts
-#define NOISE_THRESHOLD_W 5.0f
-
-// Multi-point calibration: 3 points (low, mid, high) per channel
-// Stored as mV -> Amps pairs. Interpolated between points.
-#define CAL_POINTS 3
-
-static const uint8_t CT_PINS[NUM_CT_CHANNELS] = {
-    36, 39, 34, 35, 32, 33
-};
-
-struct CalPoint {
-    float mv;    // millivolts reading
-    float amps;  // known actual amps
-};
+struct CalPoint { float mv; float amps; };
 
 struct CTReading {
     float amps;
@@ -37,256 +15,215 @@ struct CTReading {
     float pf;
     float voltage;
     int avg_mv;
-    int variation;
     int samples;
-    bool valid;
 };
 
 struct AllCTReadings {
     CTReading ct[NUM_CT_CHANNELS];
     float total_watts;
-    unsigned long timestamp_ms;
+    unsigned long timestamp_ms;      // millis() at sample START
     unsigned long sample_duration_ms;
 };
 
-// Per-channel zero calibration
+// Calibration state — protected by spinlock for cross-core access
+static portMUX_TYPE _calMux = portMUX_INITIALIZER_UNLOCKED;
 static float _zeroMv[NUM_CT_CHANNELS] = {0};
 static bool _calibrated = false;
-
-// Per-channel multi-point calibration
 static CalPoint _calPoints[NUM_CT_CHANNELS][CAL_POINTS];
 static bool _multiCalLoaded = false;
 
-// Convert mV to amps using multi-point interpolation
-static float mvToAmps(int channel, float mv) {
-    if (!_multiCalLoaded) {
+// Forward declaration
+void feedWatchdog();
+
+static float mvToAmps(int ch, float mv) {
+    if (!_multiCalLoaded) return mv * DEFAULT_AMPS_PER_MV;
+
+    CalPoint* p = _calPoints[ch];
+
+    // Validate points are usable
+    if (p[0].mv == 0 && p[0].amps == 0 && p[1].mv == 0) {
         return mv * DEFAULT_AMPS_PER_MV;
     }
 
-    CalPoint* pts = _calPoints[channel];
-
-    // Below first point: linear extrapolation from first two points
-    if (mv <= pts[0].mv) {
-        if (pts[1].mv == pts[0].mv) return pts[0].amps;
-        float slope = (pts[1].amps - pts[0].amps) / (pts[1].mv - pts[0].mv);
-        return pts[0].amps + slope * (mv - pts[0].mv);
+    if (mv <= p[0].mv) {
+        float denom = p[1].mv - p[0].mv;
+        if (fabsf(denom) < 0.001f) return p[0].amps;
+        return p[0].amps + (p[1].amps - p[0].amps) / denom * (mv - p[0].mv);
     }
-
-    // Interpolate between points
     for (int i = 0; i < CAL_POINTS - 1; i++) {
-        if (mv <= pts[i + 1].mv) {
-            float range = pts[i + 1].mv - pts[i].mv;
-            if (range == 0) return pts[i].amps;
-            float t = (mv - pts[i].mv) / range;
-            return pts[i].amps + t * (pts[i + 1].amps - pts[i].amps);
+        if (mv <= p[i+1].mv) {
+            float denom = p[i+1].mv - p[i].mv;
+            if (fabsf(denom) < 0.001f) return p[i].amps;
+            float t = (mv - p[i].mv) / denom;
+            return p[i].amps + t * (p[i+1].amps - p[i].amps);
         }
     }
-
-    // Above last point: linear extrapolation from last two points
-    int last = CAL_POINTS - 1;
-    float slope = (pts[last].amps - pts[last - 1].amps) / (pts[last].mv - pts[last - 1].mv);
-    return pts[last].amps + slope * (mv - pts[last].mv);
+    int l = CAL_POINTS - 1;
+    float denom = p[l].mv - p[l-1].mv;
+    if (fabsf(denom) < 0.001f) return p[l].amps;
+    return p[l].amps + (p[l].amps - p[l-1].amps) / denom * (mv - p[l].mv);
 }
 
 void initCTSensors() {
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
 
-    // Load zero calibration
     Preferences calPrefs;
     calPrefs.begin("ctcal", true);
     _calibrated = calPrefs.getBool("done", false);
     if (_calibrated) {
         for (int i = 0; i < NUM_CT_CHANNELS; i++) {
-            char key[8];
-            snprintf(key, sizeof(key), "z%d", i);
+            char key[8]; snprintf(key, sizeof(key), "z%d", i);
             _zeroMv[i] = calPrefs.getFloat(key, 0.0f);
         }
-        Serial.println("[CT] Loaded zero calibration");
     }
-
-    // Load multi-point calibration
     _multiCalLoaded = calPrefs.getBool("mcal", false);
     if (_multiCalLoaded) {
         for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
             for (int p = 0; p < CAL_POINTS; p++) {
-                char keyMv[12], keyA[12];
-                snprintf(keyMv, sizeof(keyMv), "c%dp%dmv", ch, p);
-                snprintf(keyA, sizeof(keyA), "c%dp%da", ch, p);
-                _calPoints[ch][p].mv = calPrefs.getFloat(keyMv, 0.0f);
-                _calPoints[ch][p].amps = calPrefs.getFloat(keyA, 0.0f);
+                char km[12], ka[12];
+                snprintf(km, sizeof(km), "c%dp%dmv", ch, p);
+                snprintf(ka, sizeof(ka), "c%dp%da", ch, p);
+                _calPoints[ch][p].mv = calPrefs.getFloat(km, 0.0f);
+                _calPoints[ch][p].amps = calPrefs.getFloat(ka, 0.0f);
             }
         }
-        Serial.println("[CT] Loaded multi-point calibration");
-        for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
-            Serial.printf("[CT] CH%d cal: ", ch + 1);
-            for (int p = 0; p < CAL_POINTS; p++) {
-                Serial.printf("%.0fmV=%.2fA ", _calPoints[ch][p].mv, _calPoints[ch][p].amps);
-            }
-            Serial.println();
-        }
-    } else {
-        Serial.printf("[CT] Using default linear: %.5f A/mV\n", DEFAULT_AMPS_PER_MV);
     }
     calPrefs.end();
 
-    Serial.printf("[CT] 6-channel sensors initialized\n");
-    Serial.printf("[CT] Interleaved: %d samples/ch over %dms, PF: %.1f, noise: %.0fW\n",
-        ADC_SAMPLES_PER_CH, (ADC_SAMPLES_PER_CH * SAMPLE_INTERVAL_US) / 1000,
-        DEFAULT_PF, NOISE_THRESHOLD_W);
-
-    for (int i = 0; i < NUM_CT_CHANNELS; i++) {
-        Serial.printf("[CT] CH%d zero: %.1f mV\n", i + 1, _zeroMv[i]);
-    }
-
-    if (!_calibrated) {
-        Serial.println("[CT] No calibration — will auto-zero on first read");
-    }
+    Serial.printf("[CT] %d channels | %d samples | %dms window\n",
+        NUM_CT_CHANNELS, ADC_SAMPLES_PER_CH, (ADC_SAMPLES_PER_CH * SAMPLE_INTERVAL_US) / 1000);
+    Serial.printf("[CT] Cal: %s | MultiCal: %s | Gain: %.5f A/mV\n",
+        _calibrated ? "yes" : "auto-zero pending", _multiCalLoaded ? "yes" : "no", DEFAULT_AMPS_PER_MV);
 }
 
 void calibrateCTZero() {
-    Serial.println("[CT] === Zero Calibration ===");
+    Serial.println("[CT] Zero calibration...");
+    float newZero[NUM_CT_CHANNELS];
 
     for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
         uint32_t sum = 0;
-        int count = 300;
         unsigned long t0 = micros();
-        for (int i = 0; i < count; i++) {
+        for (int i = 0; i < 300; i++) {
             sum += analogReadMilliVolts(CT_PINS[ch]);
-            unsigned long target = t0 + (unsigned long)((i + 1) * 1000);
-            while (micros() < target) {}
+            while (micros() < t0 + (unsigned long)((i+1) * 1000)) {}
+            if (i % 50 == 0) feedWatchdog();  // Keep WDT happy during long cal
         }
-        _zeroMv[ch] = (float)sum / count;
-        Serial.printf("[CT] CH%d zero: %.1f mV\n", ch + 1, _zeroMv[ch]);
+        newZero[ch] = (float)sum / 300.0f;
+
+        // Sanity check: zero offset should be 0-2500 mV
+        if (newZero[ch] < 0 || newZero[ch] > 2500) {
+            Serial.printf("[CT] CH%d: BAD zero %.1f mV — keeping old value\n", ch + 1, newZero[ch]);
+            newZero[ch] = _zeroMv[ch];
+        } else {
+            Serial.printf("[CT] CH%d: %.1f mV\n", ch + 1, newZero[ch]);
+        }
     }
 
+    // Atomic update with lock
+    portENTER_CRITICAL(&_calMux);
+    for (int i = 0; i < NUM_CT_CHANNELS; i++) _zeroMv[i] = newZero[i];
+    _calibrated = true;
+    portEXIT_CRITICAL(&_calMux);
+
+    // Persist to NVS
     Preferences calPrefs;
     calPrefs.begin("ctcal", false);
     calPrefs.putBool("done", true);
     for (int i = 0; i < NUM_CT_CHANNELS; i++) {
-        char key[8];
-        snprintf(key, sizeof(key), "z%d", i);
-        calPrefs.putFloat(key, _zeroMv[i]);
+        char key[8]; snprintf(key, sizeof(key), "z%d", i);
+        calPrefs.putFloat(key, newZero[i]);
     }
     calPrefs.end();
-
-    _calibrated = true;
-    Serial.println("[CT] Calibration saved");
-    Serial.println("[CT] ========================");
+    Serial.println("[CT] Zero calibration saved to NVS");
 }
 
-// Set a multi-point calibration point for a channel
-// Usage via serial: "calpoint <ch> <point> <known_amps>"
-// The device reads the current mV and maps it to the known amps value
-void setCalPoint(int channel, int point, float knownAmps) {
-    if (channel < 0 || channel >= NUM_CT_CHANNELS || point < 0 || point >= CAL_POINTS) {
-        Serial.println("[CT] Invalid channel or point");
+void setCalPoint(int ch, int pt, float knownAmps) {
+    if (ch < 0 || ch >= NUM_CT_CHANNELS || pt < 0 || pt >= CAL_POINTS) {
+        Serial.println("[CT] Invalid channel/point");
         return;
     }
 
-    // Read current mV for this channel (500 samples)
     uint32_t sum = 0;
     unsigned long t0 = micros();
     for (int i = 0; i < 500; i++) {
-        sum += analogReadMilliVolts(CT_PINS[channel]);
-        unsigned long target = t0 + (unsigned long)((i + 1) * 1000);
-        while (micros() < target) {}
+        sum += analogReadMilliVolts(CT_PINS[ch]);
+        while (micros() < t0 + (unsigned long)((i+1) * 1000)) {}
+        if (i % 100 == 0) feedWatchdog();
     }
-    float avgMv = (float)sum / 500.0f;
-    float corrected = avgMv - _zeroMv[channel];
-    if (corrected < 0) corrected = 0;
+    float mv = (float)sum / 500.0f - _zeroMv[ch];
+    if (mv < 0) mv = 0;
 
-    _calPoints[channel][point].mv = corrected;
-    _calPoints[channel][point].amps = knownAmps;
+    portENTER_CRITICAL(&_calMux);
+    _calPoints[ch][pt] = {mv, knownAmps};
+    _multiCalLoaded = true;
+    portEXIT_CRITICAL(&_calMux);
 
-    Serial.printf("[CT] CH%d point %d: %.1f mV = %.3f A\n",
-        channel + 1, point, corrected, knownAmps);
-
-    // Save to NVS
     Preferences calPrefs;
     calPrefs.begin("ctcal", false);
     calPrefs.putBool("mcal", true);
-    char keyMv[12], keyA[12];
-    snprintf(keyMv, sizeof(keyMv), "c%dp%dmv", channel, point);
-    snprintf(keyA, sizeof(keyA), "c%dp%da", channel, point);
-    calPrefs.putFloat(keyMv, corrected);
-    calPrefs.putFloat(keyA, knownAmps);
+    char km[12], ka[12];
+    snprintf(km, sizeof(km), "c%dp%dmv", ch, pt);
+    snprintf(ka, sizeof(ka), "c%dp%da", ch, pt);
+    calPrefs.putFloat(km, mv);
+    calPrefs.putFloat(ka, knownAmps);
     calPrefs.end();
-
-    _multiCalLoaded = true;
-    Serial.println("[CT] Multi-point cal saved to NVS");
+    Serial.printf("[CT] CH%d pt%d: %.1fmV = %.3fA\n", ch+1, pt, mv, knownAmps);
 }
 
-// Read all 6 channels — interleaved sampling
+// Read all CT channels — timestamps captured at sample START
 AllCTReadings readAllCT(float grid_voltage) {
     AllCTReadings all = {};
-    all.timestamp_ms = millis();
+    all.timestamp_ms = millis();  // Timestamp at START of sampling
     all.total_watts = 0;
 
+    // Auto-zero on first boot (runs once, ~1.8s)
     if (!_calibrated) {
         calibrateCTZero();
     }
 
-    double sumValues[NUM_CT_CHANNELS] = {0};
-    double sumSquares[NUM_CT_CHANNELS] = {0};
-    int16_t minVal[NUM_CT_CHANNELS];
-    int16_t maxVal[NUM_CT_CHANNELS];
-    for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
-        minVal[ch] = 32767;
-        maxVal[ch] = -32768;
-    }
-
+    uint32_t sumMv[NUM_CT_CHANNELS] = {0};
     unsigned long t0 = micros();
 
+    // Interleaved sampling: all 6 channels per time step
     for (int s = 0; s < ADC_SAMPLES_PER_CH; s++) {
         for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
-            int16_t mv = (int16_t)analogReadMilliVolts(CT_PINS[ch]);
-            double v = (double)mv;
-            sumValues[ch] += v;
-            sumSquares[ch] += v * v;
-            if (mv < minVal[ch]) minVal[ch] = mv;
-            if (mv > maxVal[ch]) maxVal[ch] = mv;
+            sumMv[ch] += analogReadMilliVolts(CT_PINS[ch]);
         }
         unsigned long target = t0 + (unsigned long)((s + 1) * SAMPLE_INTERVAL_US);
-        while (micros() < target) {}
+        while (micros() < target) {}  // Busy-wait for precise timing
     }
 
     all.sample_duration_ms = (micros() - t0) / 1000;
+
+    // Take a snapshot of calibration data under lock
+    float zeroSnap[NUM_CT_CHANNELS];
+    portENTER_CRITICAL(&_calMux);
+    for (int i = 0; i < NUM_CT_CHANNELS; i++) zeroSnap[i] = _zeroMv[i];
+    portEXIT_CRITICAL(&_calMux);
 
     for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
         CTReading r = {};
         r.voltage = grid_voltage;
         r.samples = ADC_SAMPLES_PER_CH;
 
-        double avgRaw = sumValues[ch] / ADC_SAMPLES_PER_CH;
-        double meanSquare = sumSquares[ch] / ADC_SAMPLES_PER_CH;
-        double variance = meanSquare - (avgRaw * avgRaw);
-        if (variance < 0) variance = 0;
-        double rmsMv = sqrt(variance);
+        float avgMv = (float)sumMv[ch] / ADC_SAMPLES_PER_CH;
+        float corrected = avgMv - zeroSnap[ch];
+        if (corrected < 0) corrected = 0;
 
-        float dcMv = (float)avgRaw - _zeroMv[ch];
-        if (dcMv < 0) dcMv = 0;
+        float amps = mvToAmps(ch, corrected);
+        // Guard against NaN/Inf
+        if (isnan(amps) || isinf(amps)) amps = 0.0f;
 
-        float effectiveMv = max(dcMv, (float)rmsMv);
-
-        // Use multi-point calibration if available, otherwise linear
-        float amps = mvToAmps(ch, effectiveMv);
         float power = grid_voltage * amps * DEFAULT_PF;
-
-        r.variation = maxVal[ch] - minVal[ch];
-        r.avg_mv = (int)dcMv;
+        r.avg_mv = (int)corrected;
 
         if (power < NOISE_THRESHOLD_W) {
-            r.amps = 0.0f;
-            r.watts = 0.0f;
-            r.pf = 0.0f;
+            r.amps = 0; r.watts = 0; r.pf = 0;
         } else {
-            r.amps = amps;
-            r.watts = power;
-            r.pf = DEFAULT_PF;
+            r.amps = amps; r.watts = power; r.pf = DEFAULT_PF;
         }
 
-        r.valid = true;
         all.ct[ch] = r;
         all.total_watts += r.watts;
     }
