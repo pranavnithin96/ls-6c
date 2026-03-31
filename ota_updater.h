@@ -79,7 +79,7 @@ void initOTAUpdater(const String& deviceId, const String& serverBaseUrl) {
     if (apiIdx >= 0) {
         _otaBaseUrl = baseUrl.substring(0, apiIdx) + "/api/firmware/";
     } else {
-        _otaBaseUrl = "http://77.42.75.92/api/firmware/";
+        _otaBaseUrl = "https://linesights.com/api/firmware/";
     }
     Serial.printf("[OTA] Updater initialized, version: %s\n", FIRMWARE_VERSION);
 }

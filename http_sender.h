@@ -35,6 +35,10 @@ static bool _httpDebug = false;
 static unsigned long _lastBufferSave = 0;
 static bool _spiffsReady = false;
 
+// Persistent HTTP client — reuses TCP/SSL connection
+static HTTPClient _persistentHttp;
+static bool _httpConnected = false;
+
 void setHTTPDebug(bool on) { _httpDebug = on; }
 bool getHTTPDebug() { return _httpDebug; }
 
@@ -169,6 +173,15 @@ void processSendQueue() {
 
     int sent_this_loop = 0;
 
+    // Establish persistent connection if not connected
+    if (!_httpConnected) {
+        _persistentHttp.begin(_httpServerUrl);
+        _persistentHttp.addHeader("Content-Type", "application/json");
+        _persistentHttp.setReuse(true);  // Keep-alive: reuse TCP/SSL connection
+        _persistentHttp.setTimeout(HTTP_TIMEOUT_MS);
+        _httpConnected = true;
+    }
+
     while (_bufferCount > 0 && sent_this_loop < MAX_SENDS_PER_LOOP) {
         if (!_sendBuffer[_bufferTail].used) break;
 
@@ -179,12 +192,7 @@ void processSendQueue() {
             Serial.printf("[HTTP] Body: %s\n", json.c_str());
         }
 
-        HTTPClient http;
-        http.begin(_httpServerUrl);
-        http.addHeader("Content-Type", "application/json");
-        http.setTimeout(HTTP_TIMEOUT_MS);
-
-        int httpCode = http.POST(json);
+        int httpCode = _persistentHttp.POST(json);
         _lastSendAttempt = millis();
 
         if (httpCode == 200) {
@@ -202,13 +210,16 @@ void processSendQueue() {
             _backoffMs = min(_backoffMs * 2, MAX_BACKOFF_MS);
 
             if (httpCode > 0) {
-                String errMsg = "HTTP " + String(httpCode) + ": " + http.getString();
+                String errMsg = "HTTP " + String(httpCode);
                 Serial.printf("[HTTP] %s\n", errMsg.c_str());
                 if (_consecutiveFailures == 1) logError(errMsg);
             } else {
-                String errMsg = "HTTP error: " + http.errorToString(httpCode);
+                String errMsg = "HTTP error: " + _persistentHttp.errorToString(httpCode);
                 Serial.printf("[HTTP] %s\n", errMsg.c_str());
                 if (_consecutiveFailures == 1) logError(errMsg);
+                // Connection lost — reconnect on next attempt
+                _persistentHttp.end();
+                _httpConnected = false;
             }
 
             if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -221,11 +232,8 @@ void processSendQueue() {
                 logError("Dropped reading after " + String(MAX_CONSECUTIVE_FAILURES) + " retries");
             }
 
-            http.end();
             break;  // Stop sending on failure, wait for backoff
         }
-
-        http.end();
     }
 
     // Periodic buffer save to flash (every 5 minutes)
