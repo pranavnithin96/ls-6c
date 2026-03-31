@@ -42,12 +42,10 @@ static bool _httpConnected = false;
 void setHTTPDebug(bool on) { _httpDebug = on; }
 bool getHTTPDebug() { return _httpDebug; }
 
-// Free persistent connection (call before OTA to reclaim ~40KB RAM)
 void disconnectHTTP() {
     if (_httpConnected) {
         _persistentHttp.end();
         _httpConnected = false;
-        Serial.println("[HTTP] Persistent connection closed (freeing RAM)");
     }
 }
 
