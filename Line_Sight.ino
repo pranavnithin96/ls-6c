@@ -7,7 +7,7 @@
  *   Core 0 (network task): HTTP POST, heartbeat, OTA, SPIFFS, web server
  */
 
-#define FIRMWARE_VERSION "1.7.1"
+#define FIRMWARE_VERSION "1.7.2"
 
 #include <Preferences.h>
 #include "led_status.h"
