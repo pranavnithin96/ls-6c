@@ -16,7 +16,10 @@ static String _otaDeviceId;
 static String _otaBaseUrl;
 static unsigned long _lastOTACheck = 0;
 static volatile bool _otaInProgress = false;
-static bool _otaForceCheck = false;
+static volatile bool _otaForceCheck = false;
+static int _otaRetryCount = 0;
+static unsigned long _otaRetryAt = 0;
+static bool _otaDownloadFailed = false;
 
 void forceOTACheck() { _otaForceCheck = true; }
 
@@ -162,6 +165,7 @@ void checkForUpdate() {
     if (dlCode != 200) {
         Serial.printf("[OTA] Download HTTP %d\n", dlCode);
         _otaInProgress = false;
+        _otaDownloadFailed = true;
         setLEDState(LED_ERROR);
         dlHttp.end();
         return;
@@ -202,6 +206,7 @@ void checkForUpdate() {
             Serial.println("[OTA] Download timeout!");
             Update.abort();
             _otaInProgress = false;
+            _otaDownloadFailed = true;
             setLEDState(LED_ERROR);
             dlHttp.end();
             return;
@@ -217,7 +222,16 @@ void checkForUpdate() {
         int toRead = min(available, (int)sizeof(buf));
         int bytesRead = stream->readBytes(buf, toRead);
         if (bytesRead > 0) {
-            Update.write(buf, bytesRead);
+            size_t w = Update.write(buf, bytesRead);
+            if (w != (size_t)bytesRead) {
+                Serial.printf("[OTA] Flash write error: wrote %u of %d\n", w, bytesRead);
+                Update.abort();
+                _otaInProgress = false;
+                _otaDownloadFailed = true;
+                setLEDState(LED_ERROR);
+                dlHttp.end();
+                return;
+            }
             written += bytesRead;
         }
     }
@@ -231,6 +245,7 @@ void checkForUpdate() {
         Serial.println("[OTA] Incomplete download — aborting");
         Update.abort();
         _otaInProgress = false;
+        _otaDownloadFailed = true;
         setLEDState(LED_ERROR);
         return;
     }
@@ -259,14 +274,38 @@ void checkForUpdate() {
     }
 }
 
-// OTA runs on Core 0 (blocks data POST during download — acceptable for yearly updates)
+// OTA runs on Core 0, retries up to 3 times on download failure
 void otaLoop() {
     if (_otaInProgress) return;
 
     unsigned long now = millis();
+
+    // Retry after download failure
+    if (_otaDownloadFailed && _otaRetryCount < OTA_MAX_RETRIES && now >= _otaRetryAt) {
+        _otaRetryCount++;
+        _otaDownloadFailed = false;
+        Serial.printf("[OTA] Retry %d/%d\n", _otaRetryCount, OTA_MAX_RETRIES);
+        checkForUpdate();
+        if (_otaDownloadFailed) {
+            _otaRetryAt = millis() + OTA_RETRY_DELAY_MS;
+        }
+        if (_otaRetryCount >= OTA_MAX_RETRIES && _otaDownloadFailed) {
+            Serial.println("[OTA] All retries exhausted — next attempt in 1 hour");
+            _otaDownloadFailed = false;
+            _otaRetryCount = 0;
+        }
+        return;
+    }
+
+    // Normal hourly check or forced check
     if (_otaForceCheck || (now - _lastOTACheck >= OTA_CHECK_INTERVAL_MS)) {
         _lastOTACheck = now;
         _otaForceCheck = false;
+        _otaRetryCount = 0;
+        _otaDownloadFailed = false;
         checkForUpdate();
+        if (_otaDownloadFailed) {
+            _otaRetryAt = millis() + OTA_RETRY_DELAY_MS;
+        }
     }
 }

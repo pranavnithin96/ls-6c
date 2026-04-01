@@ -311,19 +311,20 @@ int getCtRating(int channel = 0) { return _ctRatings[channel < 6 ? channel : 0];
 int getSendInterval() { return _sendInterval; }
 String getTimezone() { return _cfgTimezone; }
 
-// Non-blocking NTP: reduced timeout, no retry hang
+// Non-blocking NTP: configure servers, then poll with zero timeout
 void syncNTP() {
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    setenv("TZ", "UTC0", 1);  // Always use UTC internally
+    setenv("TZ", "UTC0", 1);
     tzset();
 
+    // Only wait 100ms — don't block Core 1 sampling
     struct tm timeinfo;
-    if (getLocalTime(&timeinfo, NTP_SYNC_TIMEOUT_MS)) {
+    if (getLocalTime(&timeinfo, 100)) {
         char buf[64];
         strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &timeinfo);
         Serial.printf("[NTP] Synced: %s\n", buf);
     } else {
-        Serial.println("[NTP] Sync failed — timestamps will be epoch until retry");
+        Serial.println("[NTP] Pending — will sync in background");
     }
 }
 

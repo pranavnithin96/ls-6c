@@ -188,10 +188,23 @@ void loop() {
     feedWatchdog();
     updateLED();
 
-    // --- Serial Commands ---
-    if (Serial.available()) {
-        String cmd = Serial.readStringUntil('\n');
-        if (cmd.length() > 128) { Serial.println("[CMD] Too long"); cmd = ""; }
+    // --- Serial Commands (non-blocking — never stalls sampling) ---
+    static char _cmdBuf[129];
+    static int _cmdLen = 0;
+    static bool _cmdReady = false;
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (_cmdLen > 0) _cmdReady = true;
+            break;
+        }
+        if (_cmdLen < 128) _cmdBuf[_cmdLen++] = c;
+    }
+    if (_cmdReady) {
+        _cmdBuf[_cmdLen] = '\0';
+        String cmd = String(_cmdBuf);
+        _cmdLen = 0;
+        _cmdReady = false;
         cmd.trim();
         feedWatchdog();
 
