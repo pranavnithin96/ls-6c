@@ -33,6 +33,7 @@ void initLED() {
 }
 
 void setLEDState(LEDState state) {
+    bool turnOn = false;
     portENTER_CRITICAL(&_ledMux);
     if (_ledState != state) {
         _ledState = state;
@@ -43,10 +44,11 @@ void setLEDState(LEDState state) {
         }
         if (state == LED_RUNNING) {
             _ledOn = true;
-            digitalWrite(LED_PIN, HIGH);
+            turnOn = true;
         }
     }
     portEXIT_CRITICAL(&_ledMux);
+    if (turnOn) digitalWrite(LED_PIN, HIGH);  // GPIO outside spinlock
 }
 
 LEDState getLEDState() {

@@ -12,13 +12,10 @@
 void logError(const String& message);
 
 // ============================================================================
-// HTTP Sender v3 — All race conditions fixed, heap-safe, zero data loss
-//   FIX #1: Block accumulator protected by spinlock
-//   FIX #2: _bufferCount protected by spinlock (not just volatile)
-//   FIX #3: File operations protected by spinlock (no concurrent access)
-//   FIX #4: JsonDocument explicit 1024 capacity
-//   FIX #5: goto removed, clean control flow
-//   FIX #7: Offline reading count tracked precisely
+// HTTP Sender v4 — SPINLOCK RULES:
+//   portENTER_CRITICAL only for simple variable read/write (no I/O, no alloc)
+//   FreeRTOS mutex (_bufMutex) for longer operations on buffer entries
+//   File operations: never inside any lock (LittleFS needs interrupts)
 // ============================================================================
 
 #define OFFLINE_MAGIC "LS01"
@@ -39,7 +36,7 @@ struct BufferedReading {
 static BufferedReading _sendBuffer[MAX_BUFFER_SIZE];
 static int _bufferHead = 0;
 static int _bufferTail = 0;
-static int _bufferCount = 0;  // Protected by _bufCntMux, not volatile
+static int _bufferCount = 0;
 
 static String _httpServerUrl;
 static String _bulkUploadUrl;
@@ -54,11 +51,10 @@ static bool _httpDebug = false;
 static unsigned long _lastBufferSave = 0;
 static bool _fsReady = false;
 
-// --- Spinlocks for thread safety ---
-static portMUX_TYPE _bufCntMux = portMUX_INITIALIZER_UNLOCKED;   // FIX #2: buffer count
-static portMUX_TYPE _offlineMux = portMUX_INITIALIZER_UNLOCKED;  // offline mode flag
-static portMUX_TYPE _blockMux = portMUX_INITIALIZER_UNLOCKED;    // FIX #1: block accumulator
-static portMUX_TYPE _fileMux = portMUX_INITIALIZER_UNLOCKED;     // FIX #3: file operations
+// Spinlocks — ONLY for simple variable read/write, NEVER for I/O
+static portMUX_TYPE _bufCntMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE _offlineMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE _blockMux = portMUX_INITIALIZER_UNLOCKED;
 
 static volatile bool _offlineMode = false;
 static unsigned long _wifiDownSince = 0;
@@ -73,24 +69,17 @@ static uint8_t _blockBuf[OFFLINE_BLOCK_RAW_SIZE];
 static int _blockIdx = 0;
 static int _blockReadings = 0;
 
-static SemaphoreHandle_t _bufMutex = NULL;  // For buffer entry access (String data)
+static SemaphoreHandle_t _bufMutex = NULL;
 
-// --- Helpers for atomic buffer count ---
+// Atomic buffer count helpers
 static inline int bufCount() {
-    portENTER_CRITICAL(&_bufCntMux);
-    int c = _bufferCount;
-    portEXIT_CRITICAL(&_bufCntMux);
-    return c;
+    portENTER_CRITICAL(&_bufCntMux); int c = _bufferCount; portEXIT_CRITICAL(&_bufCntMux); return c;
 }
 static inline void bufCountInc() {
-    portENTER_CRITICAL(&_bufCntMux);
-    _bufferCount++;
-    portEXIT_CRITICAL(&_bufCntMux);
+    portENTER_CRITICAL(&_bufCntMux); _bufferCount++; portEXIT_CRITICAL(&_bufCntMux);
 }
 static inline void bufCountDec() {
-    portENTER_CRITICAL(&_bufCntMux);
-    _bufferCount--;
-    portEXIT_CRITICAL(&_bufCntMux);
+    portENTER_CRITICAL(&_bufCntMux); _bufferCount--; portEXIT_CRITICAL(&_bufCntMux);
 }
 
 void setBufferMutex(SemaphoreHandle_t m) { _bufMutex = m; }
@@ -99,10 +88,7 @@ bool getHTTPDebug() { return _httpDebug; }
 void disconnectHTTP() {}
 
 bool isOfflineMode() {
-    portENTER_CRITICAL(&_offlineMux);
-    bool m = _offlineMode;
-    portEXIT_CRITICAL(&_offlineMux);
-    return m;
+    portENTER_CRITICAL(&_offlineMux); bool m = _offlineMode; portEXIT_CRITICAL(&_offlineMux); return m;
 }
 uint32_t getOfflineStored() { return _offlineReadingsStored; }
 uint32_t getOfflineFileSize() { return _offlineFileSize; }
@@ -135,30 +121,33 @@ void loadBufferFromFlash() {
     if (loaded > 0) Serial.printf("[BUF] Loaded %d readings from flash\n", loaded);
 }
 
+// FIX: Copy buffer entries under mutex, write file WITHOUT any lock
 void saveBufferToFlash() {
     if (!_fsReady || bufCount() == 0) return;
 
-    File f = LittleFS.open(BUFFER_TMP, "w");
-    if (!f) return;
+    // Step 1: Copy entries under mutex
+    String copies[50];
+    int copyCount = 0;
 
-    f.print("[");
-    bool first = true;
-
-    int snapTail, snapCount;
-    if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        snapTail = _bufferTail;
-        snapCount = bufCount();
+    if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        int idx = _bufferTail;
+        int total = bufCount();
+        for (int i = 0; i < total && copyCount < 50; i++) {
+            if (_sendBuffer[idx].used && _sendBuffer[idx].json.length() > 10) {
+                copies[copyCount++] = _sendBuffer[idx].json;
+            }
+            idx = (idx + 1) % MAX_BUFFER_SIZE;
+        }
         xSemaphoreGive(_bufMutex);
     } else return;
 
-    int idx = snapTail;
-    for (int i = 0; i < snapCount && i < 50; i++) {
-        if (_sendBuffer[idx].used && _sendBuffer[idx].json.length() > 10) {
-            if (!first) f.print(",");
-            f.print(_sendBuffer[idx].json);
-            first = false;
-        }
-        idx = (idx + 1) % MAX_BUFFER_SIZE;
+    // Step 2: Write file WITHOUT any lock (LittleFS needs interrupts)
+    File f = LittleFS.open(BUFFER_TMP, "w");
+    if (!f) return;
+    f.print("[");
+    for (int i = 0; i < copyCount; i++) {
+        if (i > 0) f.print(",");
+        f.print(copies[i]);
         if (i % 10 == 0) feedWatchdog();
     }
     f.print("]");
@@ -169,14 +158,11 @@ void saveBufferToFlash() {
 }
 
 // ====================================================================
-// OFFLINE STORAGE — All operations protected by spinlocks
+// OFFLINE STORAGE — NO locks around I/O, spinlocks only for variables
 // ====================================================================
 
 void writeOfflineHeader(const String& deviceId) {
-    portENTER_CRITICAL(&_fileMux);
-    File f = LittleFS.open(OFFLINE_FILE, "w");
-    if (!f) { portEXIT_CRITICAL(&_fileMux); return; }
-
+    // Prepare header OUTSIDE any lock
     OfflineHeader hdr;
     memcpy(hdr.magic, OFFLINE_MAGIC, 4);
     memset(hdr.device_id, 0, 32);
@@ -189,41 +175,51 @@ void writeOfflineHeader(const String& deviceId) {
         hdr.start_epoch = millis() / 1000;
     }
 
+    // File I/O — NO spinlock (LittleFS needs interrupts)
+    File f = LittleFS.open(OFFLINE_FILE, "w");
+    if (!f) { Serial.println("[OFFLINE] Failed to create file"); return; }
     f.write((uint8_t*)&hdr, sizeof(hdr));
     f.close();
-    portEXIT_CRITICAL(&_fileMux);
 
     _offlineFileSize = sizeof(hdr);
     _offlineReadingsStored = 0;
     _offlineBlockCount = 0;
 }
 
-// FIX #1: flushOfflineBlock protected by _blockMux (called with lock held)
+// Flush block: copy data under spinlock, compress + write OUTSIDE lock
 void flushOfflineBlock() {
-    // Caller MUST hold _blockMux
-    if (_blockReadings == 0) return;
+    // Step 1: Snapshot block data under spinlock (fast, no I/O)
+    uint8_t localBuf[OFFLINE_BLOCK_RAW_SIZE];
+    int localReadings;
+    int localRawSize;
+
+    portENTER_CRITICAL(&_blockMux);
+    if (_blockReadings == 0) { portEXIT_CRITICAL(&_blockMux); return; }
+    localReadings = _blockReadings;
+    localRawSize = _blockReadings * 12;
+    memcpy(localBuf, _blockBuf, localRawSize);
+    _blockReadings = 0;
+    _blockIdx = 0;
+    portEXIT_CRITICAL(&_blockMux);
+
+    // Step 2: Compress OUTSIDE lock (CPU-intensive but no I/O)
     if (!_fsReady) return;
-
-    int rawSize = _blockReadings * 12;
-    int readingsInBlock = _blockReadings;
-
     uint8_t compressed[1024];
     size_t compLen = tdefl_compress_mem_to_mem(compressed, sizeof(compressed),
-                                               _blockBuf, rawSize,
+                                               localBuf, localRawSize,
                                                TDEFL_DEFAULT_MAX_PROBES);
 
-    // FIX #3: File write under file lock
-    portENTER_CRITICAL(&_fileMux);
+    // Step 3: Write to file OUTSIDE lock (LittleFS needs interrupts)
     if (compLen == 0 || compLen == (size_t)-1) {
         File f = LittleFS.open(OFFLINE_FILE, "a");
         if (f) {
-            uint16_t sz = rawSize | 0x8000;
+            uint16_t sz = localRawSize | 0x8000;
             f.write((uint8_t*)&sz, 2);
-            f.write(_blockBuf, rawSize);
-            _offlineFileSize += 2 + rawSize;
+            f.write(localBuf, localRawSize);
+            _offlineFileSize += 2 + localRawSize;
             f.close();
         }
-        compLen = rawSize;  // For logging
+        compLen = localRawSize;
     } else {
         File f = LittleFS.open(OFFLINE_FILE, "a");
         if (f) {
@@ -234,21 +230,17 @@ void flushOfflineBlock() {
             f.close();
         }
     }
-    portEXIT_CRITICAL(&_fileMux);
 
-    _offlineReadingsStored += readingsInBlock;  // FIX #7: precise count
+    _offlineReadingsStored += localReadings;
     _offlineBlockCount++;
 
-    float ratio = (float)(rawSize) / (compLen > 0 ? compLen : 1);
+    float ratio = (float)(localRawSize) / (compLen > 0 ? compLen : 1);
     Serial.printf("[OFFLINE] Blk%u: %d rdgs, %d->%u bytes (%.1fx), %uKB total\n",
-        _offlineBlockCount, readingsInBlock, rawSize, (unsigned)compLen, ratio,
+        _offlineBlockCount, localReadings, localRawSize, (unsigned)compLen, ratio,
         _offlineFileSize / 1024);
-
-    _blockReadings = 0;
-    _blockIdx = 0;
 }
 
-// FIX #1: storeOfflineReading fully protected by _blockMux
+// Store one reading: spinlock only for array access, flush outside lock
 void storeOfflineReading(CTReading readings[6]) {
     if (!_fsReady) return;
     if (_offlineFileSize >= OFFLINE_MAX_BYTES) {
@@ -257,6 +249,8 @@ void storeOfflineReading(CTReading readings[6]) {
         return;
     }
 
+    bool shouldFlush = false;
+
     portENTER_CRITICAL(&_blockMux);
     for (int i = 0; i < 6; i++) {
         int16_t a = (int16_t)(readings[i].amps * 1000.0f);
@@ -264,11 +258,13 @@ void storeOfflineReading(CTReading readings[6]) {
         _blockIdx += 2;
     }
     _blockReadings++;
-
-    if (_blockReadings >= OFFLINE_BLOCK_READINGS) {
-        flushOfflineBlock();  // Flush while holding _blockMux
-    }
+    shouldFlush = (_blockReadings >= OFFLINE_BLOCK_READINGS);
     portEXIT_CRITICAL(&_blockMux);
+
+    // Flush OUTSIDE spinlock (does I/O)
+    if (shouldFlush) {
+        flushOfflineBlock();
+    }
 }
 
 void enterOfflineMode(const String& deviceId) {
@@ -282,15 +278,13 @@ void enterOfflineMode(const String& deviceId) {
     _blockIdx = 0;
     portEXIT_CRITICAL(&_blockMux);
 
-    saveBufferToFlash();
+    saveBufferToFlash();  // No lock issues — uses mutex internally
 
     if (!LittleFS.exists(OFFLINE_FILE)) {
-        writeOfflineHeader(deviceId);
+        writeOfflineHeader(deviceId);  // No lock — file I/O is safe
     } else {
-        portENTER_CRITICAL(&_fileMux);
         File f = LittleFS.open(OFFLINE_FILE, "r");
         if (f) { _offlineFileSize = f.size(); f.close(); }
-        portEXIT_CRITICAL(&_fileMux);
     }
 
     Serial.printf("[OFFLINE] Entered — 1Hz compressed blocks, %uKB stored\n", _offlineFileSize / 1024);
@@ -301,10 +295,7 @@ void exitOfflineMode() {
     if (!_offlineMode) { portEXIT_CRITICAL(&_offlineMux); return; }
     portEXIT_CRITICAL(&_offlineMux);
 
-    // Flush remaining block
-    portENTER_CRITICAL(&_blockMux);
-    if (_blockReadings > 0) flushOfflineBlock();
-    portEXIT_CRITICAL(&_blockMux);
+    flushOfflineBlock();  // Flush remaining — handles its own lock
 
     portENTER_CRITICAL(&_offlineMux);
     _offlineMode = false;
@@ -318,30 +309,26 @@ void exitOfflineMode() {
         _offlineReadingsStored, _offlineFileSize / 1024);
 }
 
-// FIX #3: Upload with file lock
 bool uploadOfflineFile(const String& deviceId) {
     if (!_fsReady || !LittleFS.exists(OFFLINE_FILE)) {
         _uploadPending = false;
         return true;
     }
 
-    portENTER_CRITICAL(&_fileMux);
     File f = LittleFS.open(OFFLINE_FILE, "r");
-    if (!f) { portEXIT_CRITICAL(&_fileMux); _uploadPending = false; return true; }
+    if (!f) { _uploadPending = false; return true; }
     size_t fileSize = f.size();
     if (fileSize <= sizeof(OfflineHeader)) {
         f.close();
-        portEXIT_CRITICAL(&_fileMux);
         LittleFS.remove(OFFLINE_FILE);
         _uploadPending = false;
         return true;
     }
-    portEXIT_CRITICAL(&_fileMux);
+    f.close();
 
     Serial.printf("[UPLOAD] Sending %u bytes...\n", fileSize);
     feedWatchdog();
 
-    // Re-open for streaming (upload takes time, can't hold spinlock)
     File uf = LittleFS.open(OFFLINE_FILE, "r");
     if (!uf) { _uploadPending = false; return true; }
 
@@ -387,7 +374,6 @@ void initHTTPSender(const String& serverUrl, const String& deviceId) {
     if (LittleFS.begin(true)) {
         _fsReady = true;
         loadBufferFromFlash();
-
         if (LittleFS.exists(OFFLINE_FILE)) {
             File f = LittleFS.open(OFFLINE_FILE, "r");
             if (f) {
@@ -405,7 +391,7 @@ void initHTTPSender(const String& serverUrl, const String& deviceId) {
 }
 
 // ====================================================================
-// FIX #4: JSON with explicit 1024-byte capacity
+// QUEUE READING
 // ====================================================================
 void queueReading(const String& deviceId, const String& location, const String& timezone,
                   float gridVoltage, CTReading readings[NUM_CT_CHANNELS], const String& timestamp) {
@@ -432,9 +418,8 @@ void queueReading(const String& deviceId, const String& location, const String& 
     String json;
     serializeJson(doc, json);
 
-    // Validate JSON isn't truncated (FIX #4)
     if (json.length() < 200) {
-        Serial.printf("[HTTP] JSON too short (%d bytes) — possible truncation\n", json.length());
+        Serial.printf("[HTTP] JSON short (%d bytes) — possible truncation\n", json.length());
     }
 
     if (bufCount() >= MAX_BUFFER_SIZE) {
@@ -453,7 +438,7 @@ void queueReading(const String& deviceId, const String& location, const String& 
 }
 
 // ====================================================================
-// FIX #5: processSendQueue — no goto, clean control flow
+// PROCESS SEND QUEUE — Clean control flow, no goto
 // ====================================================================
 void processSendQueue() {
     if (WiFi.status() != WL_CONNECTED) {
@@ -466,7 +451,6 @@ void processSendQueue() {
 
     unsigned long now = millis();
 
-    // --- Priority 1: Send live buffered readings ---
     bool shouldSend = (bufCount() > 0) &&
         (_consecutiveFailures == 0 || (now - _lastSendAttempt) >= (unsigned long)_backoffMs);
 
@@ -480,7 +464,6 @@ void processSendQueue() {
                 xSemaphoreGive(_bufMutex);
             } else break;
 
-            // Skip corrupt entries
             if (json.length() < 10 || json.indexOf("device_id") < 0) {
                 if (_fsReady) {
                     File rf = LittleFS.open("/rejected.log", "a");
@@ -549,12 +532,10 @@ void processSendQueue() {
         }
     }
 
-    // --- Priority 2: Upload offline file (only when live queue empty) ---
     if (_uploadPending && bufCount() == 0 && (now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS)) {
         uploadOfflineFile(_httpDeviceId);
     }
 
-    // --- Periodic RAM buffer save ---
     if (_fsReady && (now - _lastBufferSave >= BUFFER_SAVE_INTERVAL_MS)) {
         _lastBufferSave = now;
         if (bufCount() > 0) saveBufferToFlash();

@@ -68,21 +68,31 @@ void loadErrorsFromFlash() {
 void saveErrorsToFlash() {
     if (!_errorsDirty || _errorCount == 0) return;
 
-    JsonDocument doc;
-    JsonArray arr = doc.to<JsonArray>();
+    // Step 1: Copy error data under spinlock (only simple variable access)
+    String snapTs[MAX_ERROR_LOG];
+    String snapMsg[MAX_ERROR_LOG];
+    int snapCount = 0;
 
     portENTER_CRITICAL(&_errMux);
     int start = (_errorCount >= MAX_ERROR_LOG) ? _errorHead : 0;
-    int count = min(_errorCount, (int)MAX_ERROR_LOG);
-    for (int i = 0; i < count; i++) {
+    snapCount = min(_errorCount, (int)MAX_ERROR_LOG);
+    for (int i = 0; i < snapCount; i++) {
         int idx = (start + i) % MAX_ERROR_LOG;
-        JsonObject e = arr.add<JsonObject>();
-        e["t"] = _errorLog[idx].timestamp;
-        e["m"] = _errorLog[idx].message;
+        snapTs[i] = _errorLog[idx].timestamp;
+        snapMsg[i] = _errorLog[idx].message;
     }
     portEXIT_CRITICAL(&_errMux);
 
-    // Atomic write via temp file
+    // Step 2: Build JSON OUTSIDE spinlock (allocations safe here)
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (int i = 0; i < snapCount; i++) {
+        JsonObject e = arr.add<JsonObject>();
+        e["t"] = snapTs[i];
+        e["m"] = snapMsg[i];
+    }
+
+    // Step 3: Write file OUTSIDE spinlock (LittleFS needs interrupts)
     File f = LittleFS.open("/errors.tmp", "w");
     if (f) {
         serializeJson(doc, f);
