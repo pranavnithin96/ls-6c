@@ -150,7 +150,7 @@ void setup() {
         syncNTP();
         feedWatchdog();
 
-        initHTTPSender(getServerUrl());
+        initHTTPSender(getServerUrl(), getDeviceId());
         setBufferMutex(bufferMutex);
 
         initOTAUpdater(getDeviceId(), getServerUrl());
@@ -305,14 +305,16 @@ void loop() {
                 lastReadings.sample_duration_ms);
 
             if (networkReady && bufferMutex) {
-                if (xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                // Non-blocking: if mutex busy, store offline instead of dropping
+                if (xSemaphoreTake(bufferMutex, 0) == pdTRUE) {
                     String ts = getUTCTimestamp();
                     queueReading(getDeviceId(), getLocationName(), getTimezone(),
                                  getGridVoltage(), lastReadings.ct, ts);
                     xSemaphoreGive(bufferMutex);
                     setLEDState(LED_SENDING);
                 } else {
-                    logError("Mutex timeout — reading not queued");
+                    // Mutex busy — save to offline binary (zero data loss)
+                    storeOfflineReading(lastReadings.ct);
                 }
             }
         }

@@ -290,7 +290,7 @@ bool isWiFiConnected() {
             _lastReconnectAttempt = now;
             // Exponential backoff with jitter to prevent thundering herd
             int jitter = random(0, _reconnectBackoff / 4);
-            _reconnectBackoff = min(_reconnectBackoff * 2 + jitter, 30000);
+            _reconnectBackoff = min(_reconnectBackoff * 2 + jitter, 5000);
         }
         _stopMDNS();
         return false;

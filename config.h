@@ -26,7 +26,7 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define HTTP_TIMEOUT_MS           5000
 #define HEARTBEAT_TIMEOUT_MS      5000
 #define MAX_CONSECUTIVE_FAILURES  5
-#define MAX_BACKOFF_MS            30000
+#define MAX_BACKOFF_MS            5000    // Cap at 5s (was 30s — caused death spiral)
 #define MAX_SENDS_PER_LOOP        3
 #define DNS_CACHE_TTL_MS          300000  // 5 minutes
 

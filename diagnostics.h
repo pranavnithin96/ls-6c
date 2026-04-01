@@ -64,8 +64,13 @@ void diagnosticsLoop() {
         _sendSuccessCount, _sendFailCount, _sendDropCount,
         _wifiReconnectCount, WiFi.RSSI());
 
-    if (freeHeap < LOW_HEAP_THRESHOLD) {
-        Serial.println("[DIAG] WARNING: Low heap memory!");
+    if (freeHeap < 15000) {
+        Serial.println("[DIAG] CRITICAL: Heap exhausted — rebooting to recover");
+        delay(100);
+        ESP.restart();
+    } else if (freeHeap < LOW_HEAP_THRESHOLD) {
+        Serial.printf("[DIAG] WARNING: Low heap %u — clearing buffers\n", freeHeap);
+        // Force save and compact
     }
 }
 

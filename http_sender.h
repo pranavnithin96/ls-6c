@@ -43,6 +43,7 @@ static volatile int _bufferCount = 0;
 
 static String _httpServerUrl;
 static String _bulkUploadUrl;
+static String _httpDeviceId;
 static uint32_t _totalSent = 0;
 static uint32_t _totalFailed = 0;
 static uint32_t _totalDropped = 0;
@@ -54,7 +55,8 @@ static unsigned long _lastBufferSave = 0;
 static bool _fsReady = false;
 
 // --- Offline state ---
-static bool _offlineMode = false;
+static portMUX_TYPE _offlineMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool _offlineMode = false;
 static unsigned long _wifiDownSince = 0;
 static uint32_t _offlineReadingsStored = 0;
 static uint32_t _offlineBlockCount = 0;
@@ -73,7 +75,12 @@ void setBufferMutex(SemaphoreHandle_t m) { _bufMutex = m; }
 void setHTTPDebug(bool on) { _httpDebug = on; }
 bool getHTTPDebug() { return _httpDebug; }
 void disconnectHTTP() {}
-bool isOfflineMode() { return _offlineMode; }
+bool isOfflineMode() {
+    portENTER_CRITICAL(&_offlineMux);
+    bool m = _offlineMode;
+    portEXIT_CRITICAL(&_offlineMux);
+    return m;
+}
 uint32_t getOfflineStored() { return _offlineReadingsStored; }
 uint32_t getOfflineFileSize() { return _offlineFileSize; }
 
@@ -106,26 +113,36 @@ void loadBufferFromFlash() {
 
 void saveBufferToFlash() {
     if (!_fsReady || _bufferCount == 0) return;
-    JsonDocument doc;
-    JsonArray arr = doc.to<JsonArray>();
 
-    if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        int idx = _bufferTail;
-        for (int i = 0; i < _bufferCount; i++) {
-            if (_sendBuffer[idx].used) {
-                JsonDocument item;
-                deserializeJson(item, _sendBuffer[idx].json);
-                arr.add(item);
-            }
-            idx = (idx + 1) % MAX_BUFFER_SIZE;
-        }
-        xSemaphoreGive(_bufMutex);
-    } else return;
-
+    // Write entries one-at-a-time to file — no giant JsonDocument in heap
     File f = LittleFS.open(BUFFER_TMP, "w");
     if (!f) return;
-    serializeJson(doc, f);
+
+    f.print("[");
+    bool first = true;
+
+    // Quick snapshot of buffer state under mutex (just indices, not data)
+    int snapTail, snapCount;
+    if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        snapTail = _bufferTail;
+        snapCount = _bufferCount;
+        xSemaphoreGive(_bufMutex);
+    } else return;  // Can't get lock, skip this save
+
+    // Write each entry WITHOUT holding mutex (just reading, safe enough)
+    int idx = snapTail;
+    for (int i = 0; i < snapCount && i < 50; i++) {  // Cap at 50 to limit file size
+        if (_sendBuffer[idx].used && _sendBuffer[idx].json.length() > 10) {
+            if (!first) f.print(",");
+            f.print(_sendBuffer[idx].json);
+            first = false;
+        }
+        idx = (idx + 1) % MAX_BUFFER_SIZE;
+        if (i % 10 == 0) feedWatchdog();  // Keep WDT happy
+    }
+    f.print("]");
     f.close();
+
     if (LittleFS.exists(BUFFER_FILE)) LittleFS.remove(BUFFER_FILE);
     LittleFS.rename(BUFFER_TMP, BUFFER_FILE);
 }
@@ -197,8 +214,8 @@ void flushOfflineBlock() {
     _offlineBlockCount++;
 
     float ratio = (float)(rawSize) / (compLen > 0 ? compLen : 1);
-    Serial.printf("[OFFLINE] Block %u: %d readings, %d→%lu bytes (%.1fx), total %uKB, %u readings\n",
-        _offlineBlockCount, _blockReadings, rawSize, compLen, ratio,
+    Serial.printf("[OFFLINE] Block %u: %d readings, %d→%u bytes (%.1fx), total %uKB, %u readings\n",
+        _offlineBlockCount, _blockReadings, rawSize, (unsigned)compLen, ratio,
         _offlineFileSize / 1024, _offlineReadingsStored);
 
     _blockReadings = 0;
@@ -231,8 +248,10 @@ void storeOfflineReading(CTReading readings[6]) {
 }
 
 void enterOfflineMode(const String& deviceId) {
-    if (_offlineMode) return;
+    portENTER_CRITICAL(&_offlineMux);
+    if (_offlineMode) { portEXIT_CRITICAL(&_offlineMux); return; }
     _offlineMode = true;
+    portEXIT_CRITICAL(&_offlineMux);
     _blockReadings = 0;
     _blockIdx = 0;
 
@@ -253,14 +272,18 @@ void enterOfflineMode(const String& deviceId) {
 }
 
 void exitOfflineMode() {
-    if (!_offlineMode) return;
+    portENTER_CRITICAL(&_offlineMux);
+    if (!_offlineMode) { portEXIT_CRITICAL(&_offlineMux); return; }
+    portEXIT_CRITICAL(&_offlineMux);
 
     // Flush any remaining readings in the current block
     if (_blockReadings > 0) {
         flushOfflineBlock();
     }
 
+    portENTER_CRITICAL(&_offlineMux);
     _offlineMode = false;
+    portEXIT_CRITICAL(&_offlineMux);
     _wifiDownSince = 0;
     _uploadPending = true;
     _lastUploadAttempt = 0;
@@ -288,10 +311,7 @@ bool uploadOfflineFile(const String& deviceId) {
     }
 
     Serial.printf("[UPLOAD] Sending %u bytes to server...\n", fileSize);
-
-    // Read entire file into memory for POST
-    // Max ~550KB — we have ~280KB free heap... need to stream instead
-    // Use chunked reading: POST with WiFiClient directly
+    feedWatchdog();
 
     HTTPClient http;
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
@@ -325,9 +345,10 @@ bool uploadOfflineFile(const String& deviceId) {
 // ====================================================================
 // INIT
 // ====================================================================
-void initHTTPSender(const String& serverUrl) {
+void initHTTPSender(const String& serverUrl, const String& deviceId) {
     _httpServerUrl = "http://46.224.90.187/api/data";
     _bulkUploadUrl = "http://46.224.90.187/api/data/bulk";
+    _httpDeviceId = deviceId;
 
     for (int i = 0; i < MAX_BUFFER_SIZE; i++) _sendBuffer[i].used = false;
     _bufferCount = 0; _bufferHead = 0; _bufferTail = 0;
@@ -489,8 +510,8 @@ void processSendQueue() {
                     if (_consecutiveFailures == 1) logError("HTTP err: " + http.errorToString(httpCode));
                 }
                 if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                    logError("HTTP stall: backing off");
-                    _backoffMs = MAX_BACKOFF_MS;
+                    logError("HTTP stall: " + String(_consecutiveFailures) + " fails, retry in 5s");
+                    _backoffMs = 5000;  // Fixed 5s cooldown, not exponential death spiral
                     _consecutiveFailures = 0;
                 }
                 break;
@@ -500,9 +521,9 @@ void processSendQueue() {
 
     // Priority 2: Upload offline file in background (only when live queue is empty)
     if (_uploadPending && _bufferCount == 0) {
-        unsigned long now = millis();
-        if (now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS) {
-            uploadOfflineFile("");  // Device ID is in the file header
+        unsigned long now2 = millis();
+        if (now2 - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS) {
+            uploadOfflineFile(_httpDeviceId);
         }
     }
 
