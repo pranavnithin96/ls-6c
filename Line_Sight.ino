@@ -66,6 +66,10 @@ void networkTask(void* param) {
             otaLoop();            // OTA check — every 1h
         }
 
+        // Buffer save runs ALWAYS, even when WiFi is down
+        // (processSendQueue skips this when disconnected)
+        periodicBufferSave();
+
         diagnosticsLoop();
     }
 }

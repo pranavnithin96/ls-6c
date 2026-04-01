@@ -567,6 +567,11 @@ void processSendQueue() {
         uploadOfflineFile(_httpDeviceId);
     }
 
+}
+
+// Periodic buffer save — must be called from Core 0 regardless of WiFi state
+void periodicBufferSave() {
+    unsigned long now = millis();
     if (_fsReady && (now - _lastBufferSave >= BUFFER_SAVE_INTERVAL_MS)) {
         _lastBufferSave = now;
         if (bufCount() > 0) saveBufferToFlash();
