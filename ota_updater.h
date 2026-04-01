@@ -17,7 +17,6 @@ static String _otaBaseUrl;
 static unsigned long _lastOTACheck = 0;
 static volatile bool _otaInProgress = false;
 static bool _otaForceCheck = false;
-static TaskHandle_t _otaTaskHandle = NULL;
 
 void forceOTACheck() { _otaForceCheck = true; }
 
@@ -258,21 +257,14 @@ void checkForUpdate() {
     }
 }
 
-// Background OTA task — runs on Core 1 so Core 0 keeps sending data
-void otaTaskFunc(void* param) {
-    checkForUpdate();
-    _otaTaskHandle = NULL;
-    vTaskDelete(NULL);
-}
-
+// OTA runs on Core 0 (blocks data POST during download — acceptable for yearly updates)
 void otaLoop() {
-    if (_otaInProgress || _otaTaskHandle != NULL) return;
+    if (_otaInProgress) return;
 
     unsigned long now = millis();
     if (_otaForceCheck || (now - _lastOTACheck >= OTA_CHECK_INTERVAL_MS)) {
         _lastOTACheck = now;
         _otaForceCheck = false;
-        // Run OTA on Core 1 as background task — Core 0 continues sending data
-        xTaskCreatePinnedToCore(otaTaskFunc, "OTA", 8192, NULL, 0, &_otaTaskHandle, 1);
+        checkForUpdate();
     }
 }

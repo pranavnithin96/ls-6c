@@ -191,6 +191,7 @@ void loop() {
     // --- Serial Commands ---
     if (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
+        if (cmd.length() > 128) { Serial.println("[CMD] Too long"); cmd = ""; }
         cmd.trim();
         feedWatchdog();
 
@@ -264,10 +265,12 @@ void loop() {
         }
     }
 
-    // --- NTP retry if timestamps are still epoch ---
+    // --- NTP retry (max 5 attempts, then give up until reboot) ---
     static unsigned long lastNTPRetry = 0;
-    if (isWiFiConnected() && getUTCTimestamp().startsWith("1970") && millis() - lastNTPRetry > 30000) {
+    static int ntpRetries = 0;
+    if (isWiFiConnected() && ntpRetries < 5 && getUTCTimestamp().startsWith("1970") && millis() - lastNTPRetry > 30000) {
         lastNTPRetry = millis();
+        ntpRetries++;
         syncNTP();
     }
 

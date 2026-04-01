@@ -82,6 +82,24 @@ static inline void bufCountDec() {
     portENTER_CRITICAL(&_bufCntMux); _bufferCount--; portEXIT_CRITICAL(&_bufCntMux);
 }
 
+// Write to rejected log with 50KB size cap (prevents flash fill over months)
+#define REJECTED_LOG "/rejected.log"
+#define REJECTED_MAX_BYTES 50000
+
+void writeRejected(const String& json) {
+    if (!_fsReady) return;
+    if (LittleFS.exists(REJECTED_LOG)) {
+        File check = LittleFS.open(REJECTED_LOG, "r");
+        if (check) {
+            size_t sz = check.size();
+            check.close();
+            if (sz >= REJECTED_MAX_BYTES) return;  // Cap reached, stop writing
+        }
+    }
+    File rf = LittleFS.open(REJECTED_LOG, "a");
+    if (rf) { rf.println(json); rf.close(); }
+}
+
 void setBufferMutex(SemaphoreHandle_t m) { _bufMutex = m; }
 void setHTTPDebug(bool on) { _httpDebug = on; }
 bool getHTTPDebug() { return _httpDebug; }
@@ -471,10 +489,7 @@ void processSendQueue() {
             } else break;
 
             if (json.length() < 10 || json.indexOf("device_id") < 0) {
-                if (_fsReady) {
-                    File rf = LittleFS.open("/rejected.log", "a");
-                    if (rf) { rf.println(json); rf.close(); }
-                }
+                writeRejected(json);
                 if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     _sendBuffer[_bufferTail].used = false;
                     _sendBuffer[_bufferTail].json = String();
@@ -506,10 +521,7 @@ void processSendQueue() {
                 }
                 sent++;
             } else if (httpCode == 400) {
-                if (_fsReady) {
-                    File rf = LittleFS.open("/rejected.log", "a");
-                    if (rf) { rf.println(json); rf.close(); }
-                }
+                writeRejected(json);
                 if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     _sendBuffer[_bufferTail].used = false;
                     _sendBuffer[_bufferTail].json = String();
