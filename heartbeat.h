@@ -192,6 +192,7 @@ void processCommands(const String& responseBody) {
         } else if (action == "recalibrate") {
             calibrateCTZero();
         } else if (action == "reboot") {
+            flushBeforeRestart();
             delay(500);
             ESP.restart();
         } else if (action == "debug_on") {
@@ -201,6 +202,7 @@ void processCommands(const String& responseBody) {
         } else if (action == "update_firmware") {
             forceOTACheck();
         } else if (action == "factory_reset") {
+            flushBeforeRestart();
             Preferences p; p.begin("lscfg", false);
             p.clear(); p.end();
             delay(500);

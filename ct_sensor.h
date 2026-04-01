@@ -35,10 +35,10 @@ static bool _multiCalLoaded = false;
 // Forward declaration
 void feedWatchdog();
 
-static float mvToAmps(int ch, float mv) {
-    if (!_multiCalLoaded) return mv * DEFAULT_AMPS_PER_MV;
+static float mvToAmps(int ch, float mv, CalPoint calSnap[][CAL_POINTS], bool multiCalSnap) {
+    if (!multiCalSnap) return mv * DEFAULT_AMPS_PER_MV;
 
-    CalPoint* p = _calPoints[ch];
+    CalPoint* p = calSnap[ch];
 
     // Validate points are usable
     if (p[0].mv == 0 && p[0].amps == 0 && p[1].mv == 0) {
@@ -196,10 +196,14 @@ AllCTReadings readAllCT(float grid_voltage) {
 
     all.sample_duration_ms = (micros() - t0) / 1000;
 
-    // Take a snapshot of calibration data under lock
+    // Snapshot ALL calibration data under lock (zeroMv + calPoints)
     float zeroSnap[NUM_CT_CHANNELS];
+    CalPoint calSnap[NUM_CT_CHANNELS][CAL_POINTS];
+    bool multiCalSnap;
     portENTER_CRITICAL(&_calMux);
     for (int i = 0; i < NUM_CT_CHANNELS; i++) zeroSnap[i] = _zeroMv[i];
+    memcpy(calSnap, _calPoints, sizeof(calSnap));
+    multiCalSnap = _multiCalLoaded;
     portEXIT_CRITICAL(&_calMux);
 
     for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
@@ -211,7 +215,7 @@ AllCTReadings readAllCT(float grid_voltage) {
         float corrected = avgMv - zeroSnap[ch];
         if (corrected < 0) corrected = 0;
 
-        float amps = mvToAmps(ch, corrected);
+        float amps = mvToAmps(ch, corrected, calSnap, multiCalSnap);
         // Guard against NaN/Inf
         if (isnan(amps) || isinf(amps)) amps = 0.0f;
 

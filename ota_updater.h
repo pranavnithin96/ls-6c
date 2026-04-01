@@ -154,6 +154,7 @@ void checkForUpdate() {
     setLEDState(LED_OTA_UPDATING);
 
     HTTPClient dlHttp;
+    dlHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     dlHttp.begin(downloadUrl);
     dlHttp.setTimeout(60000);  // Max for uint16_t-safe HTTPClient timeout
     int dlCode = dlHttp.GET();
@@ -249,6 +250,7 @@ void checkForUpdate() {
         otaPrefs.end();
 
         Serial.printf("[OTA] Success! Rebooting to %s...\n", newVersion.c_str());
+        flushBeforeRestart();
         delay(1000);
         ESP.restart();
     } else {

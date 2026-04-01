@@ -14,7 +14,7 @@
  *   - Timestamps at sample time, not queue time (was 950ms off)
  *   - LittleFS with atomic writes (was SPIFFS with corruption risk)
  *   - Removed web server in station mode (was leaking sockets)
- *   - WiFi reset uses WIFI_OFF/ON (was disconnect which left orphans)
+ *   - WiFi uses reconnect() with exponential backoff + jitter
  *   - OTA: partition size check, version comparison, download integrity
  *   - AP portal: PIN authentication (was open to anyone)
  *   - Thread-safe LED and error log (was unprotected cross-core)
@@ -215,6 +215,7 @@ void loop() {
             Serial.println("Type 'reset_confirm' to factory reset");
         } else if (cmd == "reset_confirm") {
             Serial.println("[RESET] Factory reset!");
+            flushBeforeRestart();
             Preferences p; p.begin("lscfg", false); p.clear(); p.end();
             delay(500);
             ESP.restart();
@@ -227,6 +228,7 @@ void loop() {
             bootButtonPressStart = millis();
         } else if (millis() - bootButtonPressStart >= FACTORY_RESET_HOLD_MS) {
             Serial.println("[RESET] Button factory reset!");
+            flushBeforeRestart();
             feedWatchdog();
             Preferences p; p.begin("lscfg", false); p.clear(); p.end();
             delay(1000);

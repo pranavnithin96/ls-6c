@@ -69,5 +69,3 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define MDNS_HOSTNAME            "linesights"
 #define FACTORY_RESET_HOLD_MS    5000
 
-// --- Default Send Interval ---
-#define DEFAULT_SEND_INTERVAL    1  // seconds

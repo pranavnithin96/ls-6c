@@ -139,34 +139,42 @@ void loadBufferFromFlash() {
     if (loaded > 0) Serial.printf("[BUF] Loaded %d readings from flash\n", loaded);
 }
 
-// FIX: Copy buffer entries under mutex, write file WITHOUT any lock
+// Save entire ring buffer to flash — copies under mutex, writes unlocked
 void saveBufferToFlash() {
     if (!_fsReady || bufCount() == 0) return;
 
-    // Step 1: Copy entries under mutex
-    String copies[50];
-    int copyCount = 0;
-
+    // Step 1: Snapshot indices under mutex, stream entries to file
+    int snapTail, snapCount;
     if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        int idx = _bufferTail;
-        int total = bufCount();
-        for (int i = 0; i < total && copyCount < 50; i++) {
-            if (_sendBuffer[idx].used && _sendBuffer[idx].json.length() > 10) {
-                copies[copyCount++] = _sendBuffer[idx].json;
-            }
-            idx = (idx + 1) % MAX_BUFFER_SIZE;
-        }
+        snapTail = _bufferTail;
+        snapCount = bufCount();
         xSemaphoreGive(_bufMutex);
     } else return;
 
-    // Step 2: Write file WITHOUT any lock (LittleFS needs interrupts)
+    // Step 2: Write ALL entries to temp file (LittleFS needs interrupts, no lock)
     File f = LittleFS.open(BUFFER_TMP, "w");
     if (!f) return;
     f.print("[");
-    for (int i = 0; i < copyCount; i++) {
-        if (i > 0) f.print(",");
-        f.print(copies[i]);
-        if (i % 10 == 0) feedWatchdog();
+    bool first = true;
+    int idx = snapTail;
+    for (int i = 0; i < snapCount; i++) {
+        // Re-acquire mutex per entry to avoid holding it for entire write
+        String jsonCopy;
+        bool valid = false;
+        if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (_sendBuffer[idx].used && _sendBuffer[idx].json.length() > 10) {
+                jsonCopy = _sendBuffer[idx].json;
+                valid = true;
+            }
+            xSemaphoreGive(_bufMutex);
+        }
+        if (valid) {
+            if (!first) f.print(",");
+            f.print(jsonCopy);
+            first = false;
+        }
+        idx = (idx + 1) % MAX_BUFFER_SIZE;
+        if (i % 20 == 0) feedWatchdog();
     }
     f.print("]");
     f.close();
@@ -547,7 +555,7 @@ void processSendQueue() {
                 if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
                     logError("HTTP stall: retry in 5s");
                     _backoffMs = 5000;
-                    _consecutiveFailures = 0;
+                    _consecutiveFailures = 1;  // Keep >0 so backoff check is enforced
                 }
                 break;
             }
@@ -563,6 +571,16 @@ void processSendQueue() {
         if (bufCount() > 0) saveBufferToFlash();
         else if (LittleFS.exists(BUFFER_FILE)) LittleFS.remove(BUFFER_FILE);
     }
+}
+
+// Call before any ESP.restart() to preserve buffered data
+void flushBeforeRestart() {
+    if (_fsReady && bufCount() > 0) {
+        Serial.printf("[BUF] Flushing %d readings to flash before restart...\n", bufCount());
+        saveBufferToFlash();
+    }
+    // Also flush any partial offline block
+    flushOfflineBlock();
 }
 
 int getQueueSize()          { return bufCount(); }

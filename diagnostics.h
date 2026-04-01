@@ -18,6 +18,8 @@ static uint32_t _wifiReconnectCount = 0;
 static uint32_t _ctErrorCount = 0;
 static String _bootReasonStr = "Unknown";
 
+void flushBeforeRestart();  // Defined in http_sender.h
+
 void initDiagnostics() {
     _bootTime = millis();
 
@@ -66,6 +68,7 @@ void diagnosticsLoop() {
 
     if (freeHeap < 15000) {
         Serial.println("[DIAG] CRITICAL: Heap exhausted — rebooting to recover");
+        flushBeforeRestart();
         delay(100);
         ESP.restart();
     } else if (freeHeap < LOW_HEAP_THRESHOLD) {
