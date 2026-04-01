@@ -177,6 +177,7 @@ void checkForUpdate() {
     if (contentLength <= 0 || contentLength > OTA_MAX_SIZE) {
         Serial.printf("[OTA] Invalid size: %d (max: %d)\n", contentLength, OTA_MAX_SIZE);
         _otaInProgress = false;
+        _otaDownloadFailed = true;
         setLEDState(LED_ERROR);
         dlHttp.end();
         return;
@@ -187,6 +188,7 @@ void checkForUpdate() {
     if (!Update.begin(contentLength)) {
         Serial.printf("[OTA] Begin failed: %s\n", Update.errorString());
         _otaInProgress = false;
+        _otaDownloadFailed = true;
         setLEDState(LED_ERROR);
         dlHttp.end();
         return;
@@ -253,6 +255,7 @@ void checkForUpdate() {
     if (!Update.end()) {
         Serial.printf("[OTA] Finalize failed: %s\n", Update.errorString());
         _otaInProgress = false;
+        _otaDownloadFailed = true;
         setLEDState(LED_ERROR);
         return;
     }

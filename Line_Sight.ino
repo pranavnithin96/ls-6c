@@ -38,6 +38,7 @@
 // ============================================================================
 static SemaphoreHandle_t bufferMutex = NULL;
 static volatile bool networkReady = false;
+static volatile bool wifiConnected = false;  // Updated ONLY by Core 0
 static unsigned long lastReadingTime = 0;
 static unsigned long bootButtonPressStart = 0;
 static AllCTReadings lastReadings = {};
@@ -56,22 +57,15 @@ void networkTask(void* param) {
         vTaskDelayUntil(&xLastWake, xPeriod);
         esp_task_wdt_reset();
 
-        // 1. Data POST — highest priority
-        if (isWiFiConnected()) {
-            processSendQueue();
+        // WiFi management — ONLY Core 0 calls isWiFiConnected()
+        wifiConnected = isWiFiConnected();
+
+        if (wifiConnected) {
+            processSendQueue();   // Data POST — highest priority
+            heartbeatLoop();      // Heartbeat — every 60s
+            otaLoop();            // OTA check — every 1h
         }
 
-        // 2. Heartbeat — every 60s
-        if (isWiFiConnected()) {
-            heartbeatLoop();
-        }
-
-        // 3. OTA check — every 1h
-        if (isWiFiConnected()) {
-            otaLoop();
-        }
-
-        // 4. Diagnostics
         diagnosticsLoop();
     }
 }
@@ -145,29 +139,26 @@ void setup() {
         return;
     }
 
-    // 6. Network services (only if WiFi connected)
+    // 6. ALWAYS init sender + LittleFS (even without WiFi — needed for offline storage)
+    initHTTPSender(getServerUrl(), getDeviceId());
+    setBufferMutex(bufferMutex);
+    initHeartbeat(getServerUrl());
+    initOTAUpdater(getDeviceId(), getServerUrl());
+    initStatusServer();
+
     if (isWiFiConnected()) {
         syncNTP();
         feedWatchdog();
-
-        initHTTPSender(getServerUrl(), getDeviceId());
-        setBufferMutex(bufferMutex);
-
-        initOTAUpdater(getDeviceId(), getServerUrl());
-        initHeartbeat(getServerUrl());
-        initStatusServer();  // No-op in station mode (saves sockets)
-
-        networkReady = true;
     }
+
+    networkReady = true;  // ALWAYS true — Core 0 checks WiFi per-operation
 
     // 7. CT sensors
     initCTSensors();
     feedWatchdog();
 
-    // 8. Launch network task on Core 0
-    if (networkReady) {
-        xTaskCreatePinnedToCore(networkTask, "Net", NETWORK_TASK_STACK, NULL, 1, NULL, 0);
-    }
+    // 8. ALWAYS launch Core 0 task — it handles WiFi reconnect + data POST when ready
+    xTaskCreatePinnedToCore(networkTask, "Net", NETWORK_TASK_STACK, NULL, 1, NULL, 0);
 
     setLEDState(LED_RUNNING);
 
@@ -258,35 +249,43 @@ void loop() {
         return;
     }
 
-    // --- WiFi State + Offline Mode ---
+    // --- WiFi State + Offline Mode (reads volatile wifiConnected from Core 0) ---
     static unsigned long wifiDownStart = 0;
-    if (!isWiFiConnected()) {
-        if (getLEDState() != LED_WIFI_DISCONNECTED) {
+    static bool wasConnected = false;
+    if (!wifiConnected) {
+        if (wasConnected) {
             setLEDState(LED_WIFI_DISCONNECTED);
             recordWiFiReconnect();
             logError("WiFi disconnected");
+            wasConnected = false;
         }
         if (wifiDownStart == 0) wifiDownStart = millis();
 
         // Enter offline mode after grace period
         if (!isOfflineMode() && (millis() - wifiDownStart > OFFLINE_GRACE_MS)) {
+            // Only set the flag — don't do saveBufferToFlash here (Core 0 handles it)
             enterOfflineMode(getDeviceId());
         }
     } else {
-        wifiDownStart = 0;
-        if (getLEDState() == LED_WIFI_DISCONNECTED) {
+        if (!wasConnected) {
             setLEDState(LED_RUNNING);
-            syncNTP();
+            wasConnected = true;
         }
+        wifiDownStart = 0;
     }
 
-    // --- NTP retry (max 5 attempts, then give up until reboot) ---
+    // --- NTP retry (max 5 attempts, non-blocking 100ms each) ---
     static unsigned long lastNTPRetry = 0;
     static int ntpRetries = 0;
-    if (isWiFiConnected() && ntpRetries < 5 && getUTCTimestamp().startsWith("1970") && millis() - lastNTPRetry > 30000) {
-        lastNTPRetry = millis();
-        ntpRetries++;
-        syncNTP();
+    if (wifiConnected && ntpRetries < 5 && millis() - lastNTPRetry > 30000) {
+        struct tm t;
+        if (!getLocalTime(&t, 0)) {
+            lastNTPRetry = millis();
+            ntpRetries++;
+            syncNTP();
+        } else {
+            ntpRetries = 5;  // Already synced, stop retrying
+        }
     }
 
     // ===== CT SAMPLING — Always 1Hz, route depends on online/offline =====

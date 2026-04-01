@@ -52,7 +52,7 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 
 // --- OTA ---
 #define OTA_CHECK_INTERVAL_MS 3600000  // 1 hour
-#define OTA_DOWNLOAD_TIMEOUT  180000   // 180 seconds (1MB at 10KBps Indian WiFi)
+#define OTA_DOWNLOAD_TIMEOUT  300000   // 300 seconds (1MB at 4KBps worst-case Indian WiFi)
 #define OTA_RETRY_DELAY_MS    10000   // 10s before retry on failure
 #define OTA_MAX_RETRIES       3       // Retry download up to 3 times
 #define MAX_CRASH_COUNT       3
