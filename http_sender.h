@@ -209,27 +209,33 @@ void flushOfflineBlock() {
                                                localBuf, localRawSize,
                                                TDEFL_DEFAULT_MAX_PROBES);
 
-    // Step 3: Write to file OUTSIDE lock (LittleFS needs interrupts)
+    // Step 3: Write to file with CRC16 for power-loss detection
+    // Block format: [uint16_t size_flags] [uint16_t crc16] [data...]
+    //   Bit 15 of size_flags: 1=uncompressed, 0=compressed
+    //   CRC16 covers the data bytes only
+    File f = LittleFS.open(OFFLINE_FILE, "a");
+    if (!f) return;
+
     if (compLen == 0 || compLen == (size_t)-1) {
-        File f = LittleFS.open(OFFLINE_FILE, "a");
-        if (f) {
-            uint16_t sz = localRawSize | 0x8000;
-            f.write((uint8_t*)&sz, 2);
-            f.write(localBuf, localRawSize);
-            _offlineFileSize += 2 + localRawSize;
-            f.close();
-        }
+        // Uncompressed fallback
+        uint16_t sz = localRawSize | 0x8000;
+        uint16_t crc = 0xFFFF;
+        for (int i = 0; i < localRawSize; i++) crc = (crc >> 8) ^ ((crc ^ localBuf[i]) & 0xFF) * 0x1021;
+        f.write((uint8_t*)&sz, 2);
+        f.write((uint8_t*)&crc, 2);
+        f.write(localBuf, localRawSize);
+        _offlineFileSize += 4 + localRawSize;
         compLen = localRawSize;
     } else {
-        File f = LittleFS.open(OFFLINE_FILE, "a");
-        if (f) {
-            uint16_t sz = (uint16_t)compLen;
-            f.write((uint8_t*)&sz, 2);
-            f.write(compressed, compLen);
-            _offlineFileSize += 2 + compLen;
-            f.close();
-        }
+        uint16_t sz = (uint16_t)compLen;
+        uint16_t crc = 0xFFFF;
+        for (size_t i = 0; i < compLen; i++) crc = (crc >> 8) ^ ((crc ^ compressed[i]) & 0xFF) * 0x1021;
+        f.write((uint8_t*)&sz, 2);
+        f.write((uint8_t*)&crc, 2);
+        f.write(compressed, compLen);
+        _offlineFileSize += 4 + compLen;
     }
+    f.close();
 
     _offlineReadingsStored += localReadings;
     _offlineBlockCount++;
@@ -517,10 +523,14 @@ void processSendQueue() {
                 _totalFailed++; _consecutiveFailures++;
                 _backoffMs = min(_backoffMs * 2, (int)MAX_BACKOFF_MS);
                 recordSendFailure();
-                if (httpCode > 0) {
-                    if (_consecutiveFailures == 1) logError("HTTP " + String(httpCode));
-                } else {
-                    if (_consecutiveFailures == 1) logError("HTTP err: " + http.errorToString(httpCode));
+                if (_consecutiveFailures == 1) {
+                    char errBuf[64];
+                    if (httpCode > 0) {
+                        snprintf(errBuf, sizeof(errBuf), "HTTP %d", httpCode);
+                    } else {
+                        snprintf(errBuf, sizeof(errBuf), "HTTP err: %s", http.errorToString(httpCode).c_str());
+                    }
+                    logError(errBuf);
                 }
                 if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
                     logError("HTTP stall: retry in 5s");

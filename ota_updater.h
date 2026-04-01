@@ -15,8 +15,9 @@
 static String _otaDeviceId;
 static String _otaBaseUrl;
 static unsigned long _lastOTACheck = 0;
-static bool _otaInProgress = false;
+static volatile bool _otaInProgress = false;
 static bool _otaForceCheck = false;
+static TaskHandle_t _otaTaskHandle = NULL;
 
 void forceOTACheck() { _otaForceCheck = true; }
 
@@ -102,9 +103,13 @@ void checkForUpdate() {
     disconnectHTTP();
     Serial.printf("[OTA] Checking (heap: %u)\n", ESP.getFreeHeap());
 
-    String checkUrl = _otaBaseUrl + "check?device_id=" + _otaDeviceId + "&current_version=" + FIRMWARE_VERSION;
+    char checkUrlBuf[256];
+    snprintf(checkUrlBuf, sizeof(checkUrlBuf), "%scheck?device_id=%s&current_version=%s",
+        _otaBaseUrl.c_str(), _otaDeviceId.c_str(), FIRMWARE_VERSION);
+    String checkUrl = checkUrlBuf;
 
     HTTPClient http;
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.begin(checkUrl);
     http.setTimeout(10000);
     int httpCode = http.GET();
@@ -253,13 +258,21 @@ void checkForUpdate() {
     }
 }
 
+// Background OTA task — runs on Core 1 so Core 0 keeps sending data
+void otaTaskFunc(void* param) {
+    checkForUpdate();
+    _otaTaskHandle = NULL;
+    vTaskDelete(NULL);
+}
+
 void otaLoop() {
-    if (_otaInProgress) return;
+    if (_otaInProgress || _otaTaskHandle != NULL) return;
 
     unsigned long now = millis();
     if (_otaForceCheck || (now - _lastOTACheck >= OTA_CHECK_INTERVAL_MS)) {
         _lastOTACheck = now;
         _otaForceCheck = false;
-        checkForUpdate();
+        // Run OTA on Core 1 as background task — Core 0 continues sending data
+        xTaskCreatePinnedToCore(otaTaskFunc, "OTA", 8192, NULL, 0, &_otaTaskHandle, 1);
     }
 }

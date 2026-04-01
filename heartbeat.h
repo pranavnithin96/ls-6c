@@ -11,19 +11,20 @@
 #include "ct_sensor.h"
 
 // ============================================================================
-// Heartbeat — Thread-safe error log, rate-limited commands, bounded storage
+// Heartbeat — Thread-safe error log with FIXED-SIZE char arrays (no heap
+// allocation inside spinlocks), rate-limited commands, bounded storage
 // ============================================================================
 
 #define ERROR_LOG_FILE "/errors.json"
 
-// Forward declarations
 void calibrateCTZero();
 void setHTTPDebug(bool on);
 void forceOTACheck();
 
+// Fixed-size error entry — NO String objects, safe inside portENTER_CRITICAL
 struct ErrorEntry {
-    String timestamp;
-    String message;
+    char timestamp[32];
+    char message[128];
 };
 
 static portMUX_TYPE _errMux = portMUX_INITIALIZER_UNLOCKED;
@@ -35,7 +36,7 @@ static unsigned long _lastErrorSave = 0;
 static String _heartbeatUrl;
 static String _hbBootReason;
 static bool _errorsDirty = false;
-static unsigned long _lastCommandTime = 0;  // Rate limiting
+static unsigned long _lastCommandTime = 0;
 
 int getRSSIMin();
 int getRSSIAvg();
@@ -57,8 +58,8 @@ void loadErrorsFromFlash() {
     JsonArray arr = doc.as<JsonArray>();
     for (JsonVariant v : arr) {
         if (_errorCount >= MAX_ERROR_LOG) break;
-        _errorLog[_errorHead].timestamp = v["t"].as<String>();
-        _errorLog[_errorHead].message = v["m"].as<String>();
+        strlcpy(_errorLog[_errorHead].timestamp, v["t"] | "", sizeof(_errorLog[0].timestamp));
+        strlcpy(_errorLog[_errorHead].message, v["m"] | "", sizeof(_errorLog[0].message));
         _errorHead = (_errorHead + 1) % MAX_ERROR_LOG;
         _errorCount++;
     }
@@ -68,9 +69,9 @@ void loadErrorsFromFlash() {
 void saveErrorsToFlash() {
     if (!_errorsDirty || _errorCount == 0) return;
 
-    // Step 1: Copy error data under spinlock (only simple variable access)
-    String snapTs[MAX_ERROR_LOG];
-    String snapMsg[MAX_ERROR_LOG];
+    // Snapshot under spinlock — only char array copies (no alloc, no I/O)
+    char snapTs[MAX_ERROR_LOG][32];
+    char snapMsg[MAX_ERROR_LOG][128];
     int snapCount = 0;
 
     portENTER_CRITICAL(&_errMux);
@@ -78,12 +79,12 @@ void saveErrorsToFlash() {
     snapCount = min(_errorCount, (int)MAX_ERROR_LOG);
     for (int i = 0; i < snapCount; i++) {
         int idx = (start + i) % MAX_ERROR_LOG;
-        snapTs[i] = _errorLog[idx].timestamp;
-        snapMsg[i] = _errorLog[idx].message;
+        memcpy(snapTs[i], _errorLog[idx].timestamp, 32);
+        memcpy(snapMsg[i], _errorLog[idx].message, 128);
     }
     portEXIT_CRITICAL(&_errMux);
 
-    // Step 2: Build JSON OUTSIDE spinlock (allocations safe here)
+    // Build JSON OUTSIDE spinlock
     JsonDocument doc;
     JsonArray arr = doc.to<JsonArray>();
     for (int i = 0; i < snapCount; i++) {
@@ -92,7 +93,7 @@ void saveErrorsToFlash() {
         e["m"] = snapMsg[i];
     }
 
-    // Step 3: Write file OUTSIDE spinlock (LittleFS needs interrupts)
+    // Write file OUTSIDE spinlock
     File f = LittleFS.open("/errors.tmp", "w");
     if (f) {
         serializeJson(doc, f);
@@ -103,14 +104,21 @@ void saveErrorsToFlash() {
     }
 }
 
-// Thread-safe error logging — callable from any core
+// Thread-safe error logging — only fixed-size memcpy inside spinlock
 void logError(const String& message) {
-    // Get timestamp OUTSIDE critical section (getLocalTime needs env locks)
-    String ts = getUTCTimestamp();
+    // Get timestamp OUTSIDE critical section
+    char ts[32];
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 0)) {
+        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S.000Z", &timeinfo);
+    } else {
+        strlcpy(ts, "1970-01-01T00:00:00.000Z", sizeof(ts));
+    }
 
+    // Only fixed-size copies inside spinlock — NO heap allocation
     portENTER_CRITICAL(&_errMux);
-    _errorLog[_errorHead].timestamp = ts;
-    _errorLog[_errorHead].message = message;
+    strlcpy(_errorLog[_errorHead].timestamp, ts, sizeof(_errorLog[0].timestamp));
+    strlcpy(_errorLog[_errorHead].message, message.c_str(), sizeof(_errorLog[0].message));
     _errorHead = (_errorHead + 1) % MAX_ERROR_LOG;
     if (_errorCount < MAX_ERROR_LOG) _errorCount++;
     _errorsDirty = true;
@@ -120,7 +128,6 @@ void logError(const String& message) {
 }
 
 void initHeartbeat(const String& serverUrl) {
-    // Bypass Cloudflare — direct IP
     _heartbeatUrl = "http://46.224.90.187/api/firmware/heartbeat";
 
     esp_reset_reason_t reason = esp_reset_reason();
@@ -152,18 +159,14 @@ void processCommands(const String& responseBody) {
     JsonArray commands = doc["commands"];
     if (commands.isNull() || commands.size() == 0) return;
 
-    // Rate limit: max 1 command batch per 30 seconds
     unsigned long now = millis();
     if (now - _lastCommandTime < 30000) {
-        Serial.println("[CMD] Rate limited — ignoring commands");
+        Serial.println("[CMD] Rate limited");
         return;
     }
     _lastCommandTime = now;
 
-    // Limit command array size to prevent DoS
     int cmdCount = min((int)commands.size(), 10);
-    Serial.printf("[CMD] Processing %d command(s)\n", cmdCount);
-
     int processed = 0;
     for (JsonObject cmd : commands) {
         if (processed >= cmdCount) break;
@@ -179,19 +182,16 @@ void processCommands(const String& responseBody) {
             if (val >= 1 && val <= 60) {
                 Preferences p; p.begin("lscfg", false);
                 p.putInt("interval", val); p.end();
-                Serial.printf("[CMD] Interval: %ds (reboot to apply)\n", val);
             }
         } else if (action == "set_voltage") {
             float val = cmd["value"] | -1.0f;
             if (val >= 100 && val <= 250) {
                 Preferences p; p.begin("lscfg", false);
                 p.putFloat("volt", val); p.end();
-                Serial.printf("[CMD] Voltage: %.0fV (reboot to apply)\n", val);
             }
         } else if (action == "recalibrate") {
             calibrateCTZero();
         } else if (action == "reboot") {
-            Serial.println("[CMD] Reboot requested");
             delay(500);
             ESP.restart();
         } else if (action == "debug_on") {
@@ -201,13 +201,10 @@ void processCommands(const String& responseBody) {
         } else if (action == "update_firmware") {
             forceOTACheck();
         } else if (action == "factory_reset") {
-            Serial.println("[CMD] Factory reset!");
             Preferences p; p.begin("lscfg", false);
             p.clear(); p.end();
             delay(500);
             ESP.restart();
-        } else {
-            Serial.printf("[CMD] Unknown: %s\n", action.c_str());
         }
     }
 }
@@ -233,34 +230,36 @@ void sendHeartbeat() {
     doc["total_dropped"] = getTotalDropped();
     doc["ct_calibrated"] = isCTCalibrated();
 
-    // Errors — copy under lock, build JSON outside
-    String errTimestamps[MAX_ERROR_LOG];
-    String errMessages[MAX_ERROR_LOG];
-    int errCopyCount = 0;
+    // Snapshot errors under spinlock — only fixed-size char copies
+    char snapTs[MAX_ERROR_LOG][32];
+    char snapMsg[MAX_ERROR_LOG][128];
+    int errCount = 0;
 
     portENTER_CRITICAL(&_errMux);
     if (_errorCount > 0) {
         int start = (_errorCount >= MAX_ERROR_LOG) ? _errorHead : 0;
-        errCopyCount = min(_errorCount, (int)MAX_ERROR_LOG);
-        for (int i = 0; i < errCopyCount; i++) {
+        errCount = min(_errorCount, (int)MAX_ERROR_LOG);
+        for (int i = 0; i < errCount; i++) {
             int idx = (start + i) % MAX_ERROR_LOG;
-            errTimestamps[i] = _errorLog[idx].timestamp;
-            errMessages[i] = _errorLog[idx].message;
+            memcpy(snapTs[i], _errorLog[idx].timestamp, 32);
+            memcpy(snapMsg[i], _errorLog[idx].message, 128);
         }
     }
     portEXIT_CRITICAL(&_errMux);
 
+    // Build error JSON OUTSIDE spinlock
     JsonArray errors = doc["errors"].to<JsonArray>();
-    for (int i = 0; i < errCopyCount; i++) {
+    for (int i = 0; i < errCount; i++) {
         JsonObject e = errors.add<JsonObject>();
-        e["timestamp"] = errTimestamps[i];
-        e["message"] = errMessages[i];
+        e["timestamp"] = snapTs[i];
+        e["message"] = snapMsg[i];
     }
 
     String json;
     serializeJson(doc, json);
 
     HTTPClient http;
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.begin(_heartbeatUrl);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(HEARTBEAT_TIMEOUT_MS);
@@ -274,10 +273,12 @@ void sendHeartbeat() {
     } else if (httpCode > 0) {
         Serial.printf("[HB] HTTP %d\n", httpCode);
     } else {
-        logError("HB fail: " + http.errorToString(httpCode));
+        char errBuf[64];
+        snprintf(errBuf, sizeof(errBuf), "HB fail: %s", http.errorToString(httpCode).c_str());
+        logError(errBuf);
     }
 
-    http.end();  // Always cleanup
+    http.end();
 }
 
 void heartbeatLoop() {
