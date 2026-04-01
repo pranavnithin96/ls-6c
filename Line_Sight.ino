@@ -326,21 +326,20 @@ void loop() {
                 lastReadings.sample_duration_ms);
 
             if (networkReady && bufferMutex) {
-                // Non-blocking: if mutex busy, store offline instead of dropping
-                if (xSemaphoreTake(bufferMutex, 0) == pdTRUE) {
+                // 100ms timeout — Core 0 holds mutex <10ms, so this always succeeds.
+                // Old design used timeout=0 with offline fallback, but that created
+                // orphaned readings in _blockBuf that never flushed and had wrong timestamps.
+                if (xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     String ts = getUTCTimestamp();
                     queueReading(getDeviceId(), getLocationName(), getTimezone(),
                                  getGridVoltage(), lastReadings.ct, ts);
                     xSemaphoreGive(bufferMutex);
                     setLEDState(LED_SENDING);
                 } else {
-                    // Mutex busy — save to offline binary
-                    // Ensure offline file has header before writing
-                    if (!LittleFS.exists(OFFLINE_FILE)) {
-                        writeOfflineHeader(getDeviceId());
-                    }
+                    // Should never happen (Core 0 holds <10ms, we wait 100ms)
+                    // But if it does: store offline with proper timestamp tracking
                     storeOfflineReading(lastReadings.ct);
-                    _uploadPending = true;  // Ensure it gets uploaded later
+                    Serial.println("[WARN] Mutex timeout — reading stored offline");
                 }
             }
         }

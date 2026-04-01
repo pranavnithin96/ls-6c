@@ -300,17 +300,11 @@ void storeOfflineReading(CTReading readings[6]) {
 }
 
 // Called from Core 1 — must be FAST. No saveBufferToFlash here.
-// Core 0's processSendQueue will save the buffer on next cycle.
 void enterOfflineMode(const String& deviceId) {
     portENTER_CRITICAL(&_offlineMux);
     if (_offlineMode) { portEXIT_CRITICAL(&_offlineMux); return; }
     _offlineMode = true;
     portEXIT_CRITICAL(&_offlineMux);
-
-    portENTER_CRITICAL(&_blockMux);
-    _blockReadings = 0;
-    _blockIdx = 0;
-    portEXIT_CRITICAL(&_blockMux);
 
     // Only init the offline file header — fast single write
     if (!LittleFS.exists(OFFLINE_FILE)) {
