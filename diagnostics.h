@@ -74,18 +74,15 @@ void diagnosticsLoop() {
     }
 }
 
+// FIX #5: snprintf instead of String concatenation (prevents heap fragmentation)
 String getDiagnosticsJSON() {
-    String json = "{";
-    json += "\"uptime_s\":" + String(getUptimeSeconds());
-    json += ",\"free_heap\":" + String(ESP.getFreeHeap());
-    json += ",\"min_heap\":" + String(ESP.getMinFreeHeap());
-    json += ",\"wifi_rssi\":" + String(WiFi.RSSI());
-    json += ",\"sent\":" + String(_sendSuccessCount);
-    json += ",\"failed\":" + String(_sendFailCount);
-    json += ",\"dropped\":" + String(_sendDropCount);
-    json += ",\"wifi_reconnects\":" + String(_wifiReconnectCount);
-    json += ",\"boot_reason\":\"" + _bootReasonStr + "\"";
-    json += ",\"firmware\":\"" FIRMWARE_VERSION "\"";
-    json += "}";
-    return json;
+    char buf[384];
+    snprintf(buf, sizeof(buf),
+        "{\"uptime_s\":%lu,\"free_heap\":%u,\"min_heap\":%u,\"wifi_rssi\":%d,"
+        "\"sent\":%u,\"failed\":%u,\"dropped\":%u,\"wifi_reconnects\":%u,"
+        "\"boot_reason\":\"%s\",\"firmware\":\"" FIRMWARE_VERSION "\"}",
+        getUptimeSeconds(), ESP.getFreeHeap(), ESP.getMinFreeHeap(), WiFi.RSSI(),
+        _sendSuccessCount, _sendFailCount, _sendDropCount, _wifiReconnectCount,
+        _bootReasonStr.c_str());
+    return String(buf);
 }
