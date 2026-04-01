@@ -316,8 +316,13 @@ void loop() {
                     xSemaphoreGive(bufferMutex);
                     setLEDState(LED_SENDING);
                 } else {
-                    // Mutex busy — save to offline binary (zero data loss)
+                    // Mutex busy — save to offline binary
+                    // Ensure offline file has header before writing
+                    if (!LittleFS.exists(OFFLINE_FILE)) {
+                        writeOfflineHeader(getDeviceId());
+                    }
                     storeOfflineReading(lastReadings.ct);
+                    _uploadPending = true;  // Ensure it gets uploaded later
                 }
             }
         }

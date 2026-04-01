@@ -43,7 +43,7 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 
 // --- Buffers ---
 #define MAX_BUFFER_SIZE       300   // ~5 min at 1 Hz
-#define BUFFER_SAVE_INTERVAL_MS  300000  // 5 minutes
+#define BUFFER_SAVE_INTERVAL_MS  60000   // 60 seconds (minimize power-loss data window)
 
 // --- Heartbeat ---
 #define HEARTBEAT_INTERVAL_MS 60000
