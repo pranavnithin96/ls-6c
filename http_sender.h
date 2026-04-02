@@ -482,9 +482,50 @@ void processSendQueue() {
         if (_wifiDownSince == 0) _wifiDownSince = millis();
         return;
     }
-
-    if (isOfflineMode()) exitOfflineMode();
     _wifiDownSince = 0;
+
+    // If in offline mode (server was unreachable), stay there until a probe succeeds
+    if (isOfflineMode()) {
+        unsigned long now = millis();
+        if (now - _lastSendAttempt < 10000) return;  // Probe every 10s
+
+        // Try one probe POST to see if server is back
+        if (bufCount() > 0) {
+            String json;
+            if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                if (_sendBuffer[_bufferTail].used) json = _sendBuffer[_bufferTail].json;
+                xSemaphoreGive(_bufMutex);
+            }
+            if (json.length() > 10) {
+                HTTPClient http;
+                http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+                http.begin(_httpServerUrl);
+                http.addHeader("Content-Type", "application/json");
+                http.setTimeout(HTTP_TIMEOUT_MS);
+                int code = http.POST(json);
+                http.end();
+                _lastSendAttempt = millis();
+
+                if (code == 200) {
+                    Serial.println("[HTTP] Server back — exiting offline mode");
+                    _consecutiveFailures = 0;
+                    _backoffMs = 1000;
+                    // Dequeue the probe reading
+                    if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        _sendBuffer[_bufferTail].used = false;
+                        _sendBuffer[_bufferTail].json = String();
+                        _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
+                        bufCountDec();
+                        xSemaphoreGive(_bufMutex);
+                    }
+                    _totalSent++;
+                    recordSendSuccess();
+                    exitOfflineMode();
+                }
+            }
+        }
+        return;
+    }
 
     unsigned long now = millis();
 
@@ -562,10 +603,24 @@ void processSendQueue() {
                     _backoffMs = 5000;
                     _consecutiveFailures = 1;
 
-                    // Server is down — stop filling RAM buffer with Strings.
-                    // Enter offline mode to store readings on flash instead.
                     if (!isOfflineMode()) {
+                        // Save buffer to flash FIRST, then free the Strings
+                        saveBufferToFlash();
+
+                        // Free ring buffer Strings to recover heap
+                        if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                            for (int i = 0; i < MAX_BUFFER_SIZE; i++) {
+                                _sendBuffer[i].json = String();
+                                _sendBuffer[i].used = false;
+                            }
+                            _bufferHead = 0;
+                            _bufferTail = 0;
+                            _bufferCount = 0;
+                            xSemaphoreGive(_bufMutex);
+                        }
+
                         enterOfflineMode(_httpDeviceId);
+                        Serial.printf("[HTTP] Offline mode — heap recovered to %u\n", ESP.getFreeHeap());
                     }
                 }
                 break;
