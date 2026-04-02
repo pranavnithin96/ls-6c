@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.0.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.2.1"
+#define FIRMWARE_VERSION "2.3.2"
 
 // --- Hardware Pins ---
 #define NUM_CT_CHANNELS   6
