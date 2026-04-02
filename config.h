@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.0.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.2.0"
+#define FIRMWARE_VERSION "2.2.1"
 
 // --- Hardware Pins ---
 #define NUM_CT_CHANNELS   6
@@ -37,8 +37,8 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define OFFLINE_FILE           "/offline.dat"
 #define OFFLINE_MAX_BYTES      550000     // Cap at ~537KB (leave room for other files)
 #define OFFLINE_GRACE_MS       30000      // 30s before entering offline mode
-#define OFFLINE_BLOCK_READINGS 60         // Compress every 60 readings (1 min blocks)
-#define OFFLINE_BLOCK_RAW_SIZE (OFFLINE_BLOCK_READINGS * 12)  // 720 bytes per block
+#define OFFLINE_BLOCK_READINGS 10         // Compress every 10 readings (10s blocks, max 9s loss on crash)
+#define OFFLINE_BLOCK_RAW_SIZE (OFFLINE_BLOCK_READINGS * 12)  // 120 bytes per block
 #define OFFLINE_UPLOAD_RETRY_MS 60000     // Retry upload every 60s on failure
 
 // --- Buffers ---

@@ -66,6 +66,7 @@ static uint32_t _offlineBlockCount = 0;
 static uint32_t _offlineFileSize = 0;
 static unsigned long _lastUploadAttempt = 0;
 static volatile bool _uploadPending = false;
+static volatile bool _offlineTestLock = false;  // Blocks probe during test
 
 // Block accumulator
 static uint8_t _blockBuf[OFFLINE_BLOCK_RAW_SIZE];
@@ -481,6 +482,7 @@ void processSendQueue() {
 
     // If in offline mode (server unreachable), probe every 10s
     if (isOfflineMode()) {
+        if (_offlineTestLock) return;  // Test in progress — don't probe
         unsigned long now = millis();
         if (now - _lastSendAttempt < 10000) return;
         // Probe with a minimal POST

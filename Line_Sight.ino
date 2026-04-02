@@ -217,6 +217,28 @@ void loop() {
             } else {
                 Serial.println("Usage: calpoint <ch 1-6> <point 0-2> <amps>");
             }
+        } else if (cmd == "test_offline") {
+            int testSecs = 25;  // 25 readings = 2 full blocks (10 each) + 5 partial
+            Serial.printf("[TEST] Storing %d offline readings...\n", testSecs);
+            _offlineTestLock = true;
+            enterOfflineMode(getDeviceId());
+            int count = 0;
+            unsigned long testStart = millis();
+            while (count < testSecs) {
+                feedWatchdog();
+                if (millis() - lastReadingTime >= 1000) {
+                    lastReadingTime = millis();
+                    lastReadings = readAllCT(getGridVoltage());
+                    storeOfflineReading(lastReadings.ct);
+                    count++;
+                    Serial.printf("[TEST] %d/%d stored:%u file:%uB heap:%u\n",
+                        count, testSecs, getOfflineStored(),
+                        getOfflineFileSize(), ESP.getFreeHeap());
+                }
+            }
+            Serial.printf("[TEST] Done. Releasing offline mode — upload should follow\n");
+            _offlineTestLock = false;
+            exitOfflineMode();
         } else if (cmd == "update") {
             forceOTACheck();
         } else if (cmd == "reset") {

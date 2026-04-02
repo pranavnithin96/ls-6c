@@ -20,6 +20,8 @@ static String _bootReasonStr = "Unknown";
 
 void flushBeforeRestart();  // Defined in http_sender.h
 
+static uint32_t _crashCount = 0;
+
 void initDiagnostics() {
     _bootTime = millis();
 
@@ -38,7 +40,23 @@ void initDiagnostics() {
         case ESP_RST_BROWNOUT:  _bootReasonStr = "Brownout"; break;
         default:                _bootReasonStr = "Unknown (" + String((int)reason) + ")"; break;
     }
-    Serial.printf("[DIAG] Boot reason: %s | Heap: %u bytes\n", _bootReasonStr.c_str(), ESP.getFreeHeap());
+
+    // Track crash count in NVS — persists across reboots
+    Preferences crashPrefs;
+    crashPrefs.begin("diag", false);
+    _crashCount = crashPrefs.getUInt("crashes", 0);
+    if (reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT ||
+        reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT || reason == ESP_RST_BROWNOUT) {
+        _crashCount++;
+        crashPrefs.putUInt("crashes", _crashCount);
+    } else if (reason == ESP_RST_POWERON) {
+        _crashCount = 0;  // Reset on clean power cycle
+        crashPrefs.putUInt("crashes", 0);
+    }
+    crashPrefs.end();
+
+    Serial.printf("[DIAG] Boot: %s | Crashes: %u | Heap: %u\n",
+        _bootReasonStr.c_str(), _crashCount, ESP.getFreeHeap());
 }
 
 void feedWatchdog() { esp_task_wdt_reset(); }
@@ -51,6 +69,7 @@ void recordCTError()        { _ctErrorCount++; }
 
 unsigned long getUptimeSeconds() { return (millis() - _bootTime) / 1000; }
 String getBootReason()      { return _bootReasonStr; }
+uint32_t getCrashCount()    { return _crashCount; }
 
 void diagnosticsLoop() {
     unsigned long now = millis();

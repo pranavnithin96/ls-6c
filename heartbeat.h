@@ -231,6 +231,7 @@ void sendHeartbeat() {
     doc["total_failed"] = getTotalFailed();
     doc["total_dropped"] = getTotalDropped();
     doc["ct_calibrated"] = isCTCalibrated();
+    doc["crash_count"] = getCrashCount();
 
     // Snapshot errors under spinlock — only fixed-size char copies
     char snapTs[MAX_ERROR_LOG][32];
