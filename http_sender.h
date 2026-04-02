@@ -28,8 +28,11 @@ struct __attribute__((packed)) OfflineHeader {
     uint32_t start_epoch;
 };
 
+// Fixed-size buffer entries — NO heap allocation, NO fragmentation
+#define JSON_BUF_SIZE 640
 struct BufferedReading {
-    String json;
+    char json[JSON_BUF_SIZE];
+    uint16_t len;
     bool used;
 };
 
@@ -127,9 +130,8 @@ void loadBufferFromFlash() {
     int loaded = 0;
     for (JsonVariant v : arr) {
         if (bufCount() >= MAX_BUFFER_SIZE) break;
-        String json;
-        serializeJson(v, json);
-        _sendBuffer[_bufferHead].json = json;
+        size_t len = serializeJson(v, _sendBuffer[_bufferHead].json, JSON_BUF_SIZE);
+        _sendBuffer[_bufferHead].len = len;
         _sendBuffer[_bufferHead].used = true;
         _bufferHead = (_bufferHead + 1) % MAX_BUFFER_SIZE;
         bufCountInc();
@@ -158,19 +160,9 @@ void saveBufferToFlash() {
     bool first = true;
     int idx = snapTail;
     for (int i = 0; i < snapCount; i++) {
-        // Re-acquire mutex per entry to avoid holding it for entire write
-        String jsonCopy;
-        bool valid = false;
-        if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            if (_sendBuffer[idx].used && _sendBuffer[idx].json.length() > 10) {
-                jsonCopy = _sendBuffer[idx].json;
-                valid = true;
-            }
-            xSemaphoreGive(_bufMutex);
-        }
-        if (valid) {
+        if (_sendBuffer[idx].used && _sendBuffer[idx].len > 10) {
             if (!first) f.print(",");
-            f.print(jsonCopy);
+            f.write((uint8_t*)_sendBuffer[idx].json, _sendBuffer[idx].len);
             first = false;
         }
         idx = (idx + 1) % MAX_BUFFER_SIZE;
@@ -450,17 +442,8 @@ void queueReading(const String& deviceId, const String& location, const String& 
         return;  // Don't queue garbage
     }
 
-    // Check heap before allocating String — if too low, store offline instead
-    if (ESP.getFreeHeap() < 40000) {
-        Serial.printf("[HTTP] Low heap %u — storing offline\n", ESP.getFreeHeap());
-        storeOfflineReading(readings);
-        return;
-    }
-
-    String json = jsonBuf;
 
     if (bufCount() >= MAX_BUFFER_SIZE) {
-        _sendBuffer[_bufferTail].json = String();
         _sendBuffer[_bufferTail].used = false;
         _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
         bufCountDec();
@@ -468,7 +451,8 @@ void queueReading(const String& deviceId, const String& location, const String& 
         recordSendDrop();
     }
 
-    _sendBuffer[_bufferHead].json = json;
+    memcpy(_sendBuffer[_bufferHead].json, jsonBuf, jsonLen + 1);
+    _sendBuffer[_bufferHead].len = jsonLen;
     _sendBuffer[_bufferHead].used = true;
     _bufferHead = (_bufferHead + 1) % MAX_BUFFER_SIZE;
     bufCountInc();
@@ -484,45 +468,24 @@ void processSendQueue() {
     }
     _wifiDownSince = 0;
 
-    // If in offline mode (server was unreachable), stay there until a probe succeeds
+    // If in offline mode (server unreachable), probe every 10s
     if (isOfflineMode()) {
         unsigned long now = millis();
-        if (now - _lastSendAttempt < 10000) return;  // Probe every 10s
-
-        // Try one probe POST to see if server is back
-        if (bufCount() > 0) {
-            String json;
-            if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                if (_sendBuffer[_bufferTail].used) json = _sendBuffer[_bufferTail].json;
-                xSemaphoreGive(_bufMutex);
-            }
-            if (json.length() > 10) {
-                HTTPClient http;
-                http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-                http.begin(_httpServerUrl);
-                http.addHeader("Content-Type", "application/json");
-                http.setTimeout(HTTP_TIMEOUT_MS);
-                int code = http.POST(json);
-                http.end();
-                _lastSendAttempt = millis();
-
-                if (code == 200) {
-                    Serial.println("[HTTP] Server back — exiting offline mode");
-                    _consecutiveFailures = 0;
-                    _backoffMs = 1000;
-                    // Dequeue the probe reading
-                    if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                        _sendBuffer[_bufferTail].used = false;
-                        _sendBuffer[_bufferTail].json = String();
-                        _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
-                        bufCountDec();
-                        xSemaphoreGive(_bufMutex);
-                    }
-                    _totalSent++;
-                    recordSendSuccess();
-                    exitOfflineMode();
-                }
-            }
+        if (now - _lastSendAttempt < 10000) return;
+        // Probe with a minimal POST
+        HTTPClient http;
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        http.begin(_httpServerUrl);
+        http.addHeader("Content-Type", "application/json");
+        http.setTimeout(HTTP_TIMEOUT_MS);
+        int code = http.POST("{}");
+        http.end();
+        _lastSendAttempt = millis();
+        if (code > 0) {  // Server responded (even 400 means it's reachable)
+            Serial.printf("[HTTP] Server back (HTTP %d) — exiting offline mode\n", code);
+            _consecutiveFailures = 0;
+            _backoffMs = 1000;
+            exitOfflineMode();
         }
         return;
     }
@@ -535,22 +498,11 @@ void processSendQueue() {
     if (shouldSend) {
         int sent = 0;
         while (bufCount() > 0 && sent < MAX_SENDS_PER_LOOP) {
-            String json;
-            if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                if (!_sendBuffer[_bufferTail].used) { xSemaphoreGive(_bufMutex); break; }
-                json = _sendBuffer[_bufferTail].json;
-                xSemaphoreGive(_bufMutex);
-            } else break;
-
-            if (json.length() < 10 || json.indexOf("device_id") < 0) {
-                writeRejected(json);
-                if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    _sendBuffer[_bufferTail].used = false;
-                    _sendBuffer[_bufferTail].json = String();
-                    _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
-                    bufCountDec();
-                    xSemaphoreGive(_bufMutex);
-                }
+            // Read from tail — no String allocation, just pointer to fixed buffer
+            if (!_sendBuffer[_bufferTail].used || _sendBuffer[_bufferTail].len < 10) {
+                _sendBuffer[_bufferTail].used = false;
+                _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
+                bufCountDec();
                 continue;
             }
 
@@ -559,30 +511,22 @@ void processSendQueue() {
             http.begin(_httpServerUrl);
             http.addHeader("Content-Type", "application/json");
             http.setTimeout(HTTP_TIMEOUT_MS);
-            int httpCode = http.POST(json);
+            int httpCode = http.POST((uint8_t*)_sendBuffer[_bufferTail].json, _sendBuffer[_bufferTail].len);
             http.end();
             _lastSendAttempt = millis();
 
             if (httpCode == 200) {
                 _totalSent++; _consecutiveFailures = 0; _backoffMs = 1000;
                 recordSendSuccess();
-                if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    _sendBuffer[_bufferTail].used = false;
-                    _sendBuffer[_bufferTail].json = String();
-                    _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
-                    bufCountDec();
-                    xSemaphoreGive(_bufMutex);
-                }
+                _sendBuffer[_bufferTail].used = false;
+                _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
+                bufCountDec();
                 sent++;
             } else if (httpCode == 400) {
-                writeRejected(json);
-                if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    _sendBuffer[_bufferTail].used = false;
-                    _sendBuffer[_bufferTail].json = String();
-                    _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
-                    bufCountDec();
-                    xSemaphoreGive(_bufMutex);
-                }
+                writeRejected(String(_sendBuffer[_bufferTail].json));
+                _sendBuffer[_bufferTail].used = false;
+                _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
+                bufCountDec();
                 logError("400 — saved to /rejected.log");
                 sent++;
             } else {
@@ -604,23 +548,12 @@ void processSendQueue() {
                     _consecutiveFailures = 1;
 
                     if (!isOfflineMode()) {
-                        // Save buffer to flash FIRST, then free the Strings
                         saveBufferToFlash();
-
-                        // Free ring buffer Strings to recover heap
-                        if (_bufMutex && xSemaphoreTake(_bufMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                            for (int i = 0; i < MAX_BUFFER_SIZE; i++) {
-                                _sendBuffer[i].json = String();
-                                _sendBuffer[i].used = false;
-                            }
-                            _bufferHead = 0;
-                            _bufferTail = 0;
-                            _bufferCount = 0;
-                            xSemaphoreGive(_bufMutex);
-                        }
-
+                        // Clear buffer (fixed arrays, no heap to free)
+                        for (int i = 0; i < MAX_BUFFER_SIZE; i++) _sendBuffer[i].used = false;
+                        _bufferHead = 0; _bufferTail = 0; _bufferCount = 0;
                         enterOfflineMode(_httpDeviceId);
-                        Serial.printf("[HTTP] Offline mode — heap recovered to %u\n", ESP.getFreeHeap());
+                        Serial.printf("[HTTP] Offline mode — heap: %u\n", ESP.getFreeHeap());
                     }
                 }
                 break;

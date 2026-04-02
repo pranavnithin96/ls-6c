@@ -42,7 +42,7 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define OFFLINE_UPLOAD_RETRY_MS 60000     // Retry upload every 60s on failure
 
 // --- Buffers ---
-#define MAX_BUFFER_SIZE       300   // ~5 min at 1 Hz
+#define MAX_BUFFER_SIZE       30    // 30s pipeline buffer (fixed char arrays, no heap alloc)
 #define BUFFER_SAVE_INTERVAL_MS  60000   // 60 seconds (minimize power-loss data window)
 
 // --- Heartbeat ---
