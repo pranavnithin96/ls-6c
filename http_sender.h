@@ -179,8 +179,9 @@ void saveBufferToFlash() {
 // OFFLINE STORAGE — NO locks around I/O, spinlocks only for variables
 // ====================================================================
 
+static uint32_t _lastKnownEpoch = 0;  // Fallback timestamp
+
 void writeOfflineHeader(const String& deviceId) {
-    // Prepare header OUTSIDE any lock
     OfflineHeader hdr;
     memcpy(hdr.magic, OFFLINE_MAGIC, 4);
     memset(hdr.device_id, 0, 32);
@@ -189,8 +190,13 @@ void writeOfflineHeader(const String& deviceId) {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 0)) {
         hdr.start_epoch = mktime(&timeinfo);
+        _lastKnownEpoch = hdr.start_epoch;
+    } else if (_lastKnownEpoch > 0) {
+        // NTP not synced — use last known time + elapsed seconds
+        hdr.start_epoch = _lastKnownEpoch + (millis() / 1000);
     } else {
-        hdr.start_epoch = millis() / 1000;
+        // Never synced — server will reject with 422, but at least we store data
+        hdr.start_epoch = 0;
     }
 
     // File I/O — NO spinlock (LittleFS needs interrupts)
@@ -235,23 +241,17 @@ void flushOfflineBlock() {
     if (!f) return;
 
     if (compLen == 0 || compLen == (size_t)-1) {
-        // Uncompressed fallback
+        // Uncompressed fallback — bit 15 = raw flag
         uint16_t sz = localRawSize | 0x8000;
-        uint16_t crc = 0xFFFF;
-        for (int i = 0; i < localRawSize; i++) crc = (crc >> 8) ^ ((crc ^ localBuf[i]) & 0xFF) * 0x1021;
         f.write((uint8_t*)&sz, 2);
-        f.write((uint8_t*)&crc, 2);
         f.write(localBuf, localRawSize);
-        _offlineFileSize += 4 + localRawSize;
+        _offlineFileSize += 2 + localRawSize;
         compLen = localRawSize;
     } else {
         uint16_t sz = (uint16_t)compLen;
-        uint16_t crc = 0xFFFF;
-        for (size_t i = 0; i < compLen; i++) crc = (crc >> 8) ^ ((crc ^ compressed[i]) & 0xFF) * 0x1021;
         f.write((uint8_t*)&sz, 2);
-        f.write((uint8_t*)&crc, 2);
         f.write(compressed, compLen);
-        _offlineFileSize += 4 + compLen;
+        _offlineFileSize += 2 + compLen;
     }
     f.close();
 
@@ -373,6 +373,17 @@ bool uploadOfflineFile(const String& deviceId) {
         _offlineBlockCount = 0;
         return true;
     } else {
+        if (httpCode == 422) {
+            // Epoch-0 timestamps — delete the corrupt file, data is useless
+            Serial.println("[UPLOAD] 422 — bad timestamps, deleting offline file");
+            LittleFS.remove(OFFLINE_FILE);
+            _uploadPending = false;
+            _offlineReadingsStored = 0;
+            _offlineFileSize = 0;
+            logError("422 — offline data had bad timestamps");
+            syncNTP();
+            return true;
+        }
         Serial.printf("[UPLOAD] Failed: HTTP %d — retry in 60s\n", httpCode);
         _lastUploadAttempt = millis();
         return false;
@@ -518,6 +529,8 @@ void processSendQueue() {
             if (httpCode == 200) {
                 _totalSent++; _consecutiveFailures = 0; _backoffMs = 1000;
                 recordSendSuccess();
+                // Keep last known epoch fresh for offline fallback
+                struct tm t; if (getLocalTime(&t, 0)) _lastKnownEpoch = mktime(&t);
                 _sendBuffer[_bufferTail].used = false;
                 _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
                 bufCountDec();
@@ -529,6 +542,15 @@ void processSendQueue() {
                 bufCountDec();
                 logError("400 — saved to /rejected.log");
                 sent++;
+            } else if (httpCode == 422) {
+                // 422 = data logically wrong (e.g. epoch-0 timestamps, RTC not synced)
+                // Retrying won't help — trigger NTP sync and drop this reading
+                logError("422 — RTC not synced, triggering NTP");
+                _sendBuffer[_bufferTail].used = false;
+                _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
+                bufCountDec();
+                syncNTP();  // Try to fix the clock
+                break;      // Stop sending until timestamps are valid
             } else {
                 _totalFailed++; _consecutiveFailures++;
                 _backoffMs = min(_backoffMs * 2, (int)MAX_BACKOFF_MS);
