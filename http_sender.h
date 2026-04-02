@@ -374,15 +374,15 @@ bool uploadOfflineFile(const String& deviceId) {
         _offlineBlockCount = 0;
         return true;
     } else {
-        if (httpCode == 422) {
-            // Epoch-0 timestamps — delete the corrupt file, data is useless
-            Serial.println("[UPLOAD] 422 — bad timestamps, deleting offline file");
+        if (httpCode == 400 || httpCode == 422) {
+            // 400 = corrupt/bad format, 422 = bad timestamps — delete, can't fix
+            Serial.printf("[UPLOAD] %d — deleting corrupt offline file\n", httpCode);
             LittleFS.remove(OFFLINE_FILE);
             _uploadPending = false;
             _offlineReadingsStored = 0;
             _offlineFileSize = 0;
-            logError("422 — offline data had bad timestamps");
-            syncNTP();
+            logError(httpCode == 422 ? "422 — bad timestamps" : "400 — corrupt offline data");
+            if (httpCode == 422) syncNTP();
             return true;
         }
         Serial.printf("[UPLOAD] Failed: HTTP %d — retry in 60s\n", httpCode);
