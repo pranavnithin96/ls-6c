@@ -442,12 +442,22 @@ void queueReading(const String& deviceId, const String& location, const String& 
     }
     doc["readings"]["voltage_rms"] = serialized(String(gridVoltage, 1));
 
-    String json;
-    serializeJson(doc, json);
-
-    if (json.length() < 200) {
-        Serial.printf("[HTTP] JSON short (%d bytes) — possible truncation\n", json.length());
+    // Serialize to fixed stack buffer — avoids heap fragmentation from String growth
+    char jsonBuf[768];
+    size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
+    if (jsonLen < 200 || jsonLen >= sizeof(jsonBuf)) {
+        Serial.printf("[HTTP] JSON bad: %u bytes (heap:%u)\n", jsonLen, ESP.getFreeHeap());
+        return;  // Don't queue garbage
     }
+
+    // Check heap before allocating String — if too low, store offline instead
+    if (ESP.getFreeHeap() < 40000) {
+        Serial.printf("[HTTP] Low heap %u — storing offline\n", ESP.getFreeHeap());
+        storeOfflineReading(readings);
+        return;
+    }
+
+    String json = jsonBuf;
 
     if (bufCount() >= MAX_BUFFER_SIZE) {
         _sendBuffer[_bufferTail].json = String();
@@ -548,9 +558,15 @@ void processSendQueue() {
                     logError(errBuf);
                 }
                 if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                    logError("HTTP stall: retry in 5s");
+                    logError("HTTP stall: server unreachable");
                     _backoffMs = 5000;
-                    _consecutiveFailures = 1;  // Keep >0 so backoff check is enforced
+                    _consecutiveFailures = 1;
+
+                    // Server is down — stop filling RAM buffer with Strings.
+                    // Enter offline mode to store readings on flash instead.
+                    if (!isOfflineMode()) {
+                        enterOfflineMode(_httpDeviceId);
+                    }
                 }
                 break;
             }
