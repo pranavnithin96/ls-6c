@@ -356,7 +356,7 @@ void loop() {
                     queueReading(getDeviceId(), getLocationName(), getTimezone(),
                                  getGridVoltage(), lastReadings.ct, ts);
                     xSemaphoreGive(bufferMutex);
-                    setLEDState(LED_SENDING);
+                    setLEDState(LED_RUNNING);
                 } else {
                     // Should never happen (Core 0 holds <10ms, we wait 100ms)
                     // But if it does: store offline with proper timestamp tracking

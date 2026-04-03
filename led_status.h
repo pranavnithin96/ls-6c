@@ -8,13 +8,12 @@
 
 enum LEDState {
     LED_BOOTING,            // Fast 100ms blink
-    LED_WIFI_CONNECTING,    // 500ms blink
-    LED_WIFI_AP_MODE,       // Double blink + pause
+    LED_WIFI_CONNECTING,    // Fast 100ms blink (same as booting)
+    LED_WIFI_AP_MODE,       // Double blink, no pause
     LED_RUNNING,            // Solid on
-    LED_SENDING,            // Brief off-pulse every 2s
-    LED_ERROR,              // Triple fast blink + pause (auto-clears after 30s)
+    LED_ERROR,              // Triple fast blink
     LED_OTA_UPDATING,       // Very fast 50ms blink
-    LED_WIFI_DISCONNECTED   // Slow 1s blink
+    LED_WIFI_DISCONNECTED   // LED off
 };
 
 static portMUX_TYPE _ledMux = portMUX_INITIALIZER_UNLOCKED;
@@ -75,41 +74,36 @@ void updateLED() {
 
     switch (state) {
         case LED_BOOTING:
+        case LED_WIFI_CONNECTING:
+            // Fast 100ms blink
             if (elapsed >= 100) {
                 _ledOn = !_ledOn; digitalWrite(LED_PIN, _ledOn); _ledLastToggle = now;
             }
             break;
-        case LED_WIFI_CONNECTING:
-            if (elapsed >= 500) {
-                _ledOn = !_ledOn; digitalWrite(LED_PIN, _ledOn); _ledLastToggle = now;
-            }
-            break;
         case LED_WIFI_AP_MODE:
-            if (_ledBlinkCount < 4) {
-                if (elapsed >= 150) { _ledOn = !_ledOn; digitalWrite(LED_PIN, _ledOn); _ledBlinkCount++; _ledLastToggle = now; }
-            } else {
-                if (elapsed >= 800) { _ledBlinkCount = 0; _ledLastToggle = now; }
+            // Double blink, no pause — continuous on/off/on/off
+            if (elapsed >= 200) {
+                _ledOn = !_ledOn; digitalWrite(LED_PIN, _ledOn); _ledBlinkCount++; _ledLastToggle = now;
             }
             break;
         case LED_RUNNING:
+            // Solid on
             if (!_ledOn) { _ledOn = true; digitalWrite(LED_PIN, HIGH); }
             break;
-        case LED_SENDING:
-            if (_ledOn && elapsed >= 2000) { _ledOn = false; digitalWrite(LED_PIN, LOW); _ledLastToggle = now; }
-            else if (!_ledOn && elapsed >= 50) { _ledOn = true; digitalWrite(LED_PIN, HIGH); _ledLastToggle = now; }
-            break;
         case LED_ERROR:
+            // Triple fast blink (6 toggles = 3 on/off cycles), then repeat
             if (_ledBlinkCount < 6) {
                 if (elapsed >= 100) { _ledOn = !_ledOn; digitalWrite(LED_PIN, _ledOn); _ledBlinkCount++; _ledLastToggle = now; }
             } else {
-                if (elapsed >= 1000) { _ledBlinkCount = 0; _ledLastToggle = now; }
+                if (elapsed >= 500) { _ledBlinkCount = 0; _ledLastToggle = now; }
             }
             break;
         case LED_OTA_UPDATING:
             if (elapsed >= 50) { _ledOn = !_ledOn; digitalWrite(LED_PIN, _ledOn); _ledLastToggle = now; }
             break;
         case LED_WIFI_DISCONNECTED:
-            if (elapsed >= 1000) { _ledOn = !_ledOn; digitalWrite(LED_PIN, _ledOn); _ledLastToggle = now; }
+            // LED off
+            if (_ledOn) { _ledOn = false; digitalWrite(LED_PIN, LOW); }
             break;
     }
 }

@@ -273,6 +273,16 @@ void sendHeartbeat() {
         Serial.printf("[HB] OK | heap:%u | Q:%d | S:%u\n",
             ESP.getFreeHeap(), getQueueSize(), getTotalSent());
         processCommands(response);
+
+        // Clear error log after successful send — prevents stale errors repeating
+        if (errCount > 0) {
+            portENTER_CRITICAL(&_errMux);
+            _errorHead = 0;
+            _errorCount = 0;
+            _errorsDirty = true;
+            portEXIT_CRITICAL(&_errMux);
+            saveErrorsToFlash();  // Persist the cleared state
+        }
     } else if (httpCode > 0) {
         Serial.printf("[HB] HTTP %d\n", httpCode);
     } else {
