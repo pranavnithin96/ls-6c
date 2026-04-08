@@ -17,7 +17,6 @@
 
 #define ERROR_LOG_FILE "/errors.json"
 
-void calibrateCTZero();
 void setHTTPDebug(bool on);
 void forceOTACheck();
 
@@ -189,8 +188,6 @@ void processCommands(const String& responseBody) {
                 Preferences p; p.begin("lscfg", false);
                 p.putFloat("volt", val); p.end();
             }
-        } else if (action == "recalibrate") {
-            calibrateCTZero();
         } else if (action == "reboot") {
             flushBeforeRestart();
             delay(500);

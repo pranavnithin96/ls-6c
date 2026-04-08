@@ -172,7 +172,7 @@ void setup() {
     Serial.printf("  Server:    %s\n", getServerUrl().c_str());
     Serial.printf("  Voltage:   %.0fV | Interval: %ds\n", getGridVoltage(), getSendInterval());
     Serial.println("---------------------");
-    Serial.println("Commands: status | calibrate | calpoint | debug | reset | update");
+    Serial.println("Commands: status | calpoint | debug | reset | update");
     Serial.println("Monitoring started...\n");
 }
 
@@ -205,8 +205,6 @@ void loop() {
 
         if (cmd == "status") {
             printStatus();
-        } else if (cmd == "calibrate") {
-            calibrateCTZero();
         } else if (cmd == "debug") {
             setHTTPDebug(!getHTTPDebug());
             Serial.printf("[CMD] HTTP debug: %s\n", getHTTPDebug() ? "ON" : "OFF");
