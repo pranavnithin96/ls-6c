@@ -71,6 +71,7 @@ void networkTask(void* param) {
         periodicBufferSave();
 
         diagnosticsLoop();
+        scheduledRebootLoop();    // 7-day maintenance reboot, safe-gated
     }
 }
 
@@ -127,6 +128,7 @@ void setup() {
 
     // 4. Diagnostics & watchdog
     initDiagnostics();
+    initScheduledReboot();
     feedWatchdog();
 
     // 5. WiFi
@@ -221,7 +223,6 @@ void loop() {
             _offlineTestLock = true;
             enterOfflineMode(getDeviceId());
             int count = 0;
-            unsigned long testStart = millis();
             while (count < testSecs) {
                 feedWatchdog();
                 if (millis() - lastReadingTime >= 1000) {
@@ -298,18 +299,34 @@ void loop() {
         wifiDownStart = 0;
     }
 
-    // --- NTP retry (max 5 attempts, non-blocking 100ms each) ---
+    // --- NTP retry: never give up while unsynced ---
+    // Post-outage the router/WAN often comes up minutes AFTER the ESP32; the old
+    // max-5-then-stop left the clock unsynced for the whole uptime, so every
+    // offline block was flagged UNSYNCED and staged unresolved server-side.
+    // First 5 tries at 30s, then every 15 min. Once synced, zero further cost.
     static unsigned long lastNTPRetry = 0;
     static int ntpRetries = 0;
-    if (wifiConnected && ntpRetries < 5 && millis() - lastNTPRetry > 30000) {
+    static bool ntpSynced = false;
+    if (wifiConnected && !ntpSynced &&
+        millis() - lastNTPRetry > (ntpRetries < 5 ? 30000UL : 900000UL)) {
         struct tm t;
-        if (!getLocalTime(&t, 0)) {
+        if (getLocalTime(&t, 0)) {
+            ntpSynced = true;
+        } else {
             lastNTPRetry = millis();
             ntpRetries++;
             syncNTP();
-        } else {
-            ntpRetries = 5;  // Already synced, stop retrying
         }
+    } else if (wifiConnected && ntpSynced &&
+               (getNtpSyncAgeS() < 0 || getNtpSyncAgeS() > (long)NTP_STALE_RESYNC_S) &&
+               millis() - lastNTPRetry > 60000) {
+        // SNTP should auto-resync every 15 min; if it silently stalls for 2h,
+        // re-kick it. age < 0 (never synced this session) matters after a
+        // SOFTWARE reboot: the RTC carries time across ESP.restart, so the
+        // clock reads synced without SNTP ever being started — without this,
+        // a post-scheduled-reboot uptime would run on pure RTC drift.
+        lastNTPRetry = millis();
+        syncNTP();
     }
 
     // ===== CT SAMPLING — Always 1Hz, route depends on online/offline =====
@@ -345,15 +362,33 @@ void loop() {
                 isUploadPending() ? " UPL" : "",
                 lastReadings.sample_duration_ms);
 
+            // Stamp at SAMPLE time (not queue time): queue-time labels collided
+            // when phase drift compressed spacing under 1s and the server 400'd
+            // the twin (observed fleet-wide at a ~61s cadence). With sample-time
+            // stamps the only remaining collision source is a BACKWARD SNTP step
+            // (oscillator ran fast) re-issuing an already-used second. Never drop
+            // and never emit a duplicate label — clamp the label forward by 1s.
+            // Skew is bounded by the step size (<1s in steady state) and clears
+            // at the next forward step or send gap.
+            static time_t lastQueuedEpoch = 0;
+            time_t sampleEpoch = getEpochAt(lastReadings.timestamp_ms);
+            if (sampleEpoch != 0 && lastQueuedEpoch != 0 && sampleEpoch <= lastQueuedEpoch) {
+                sampleEpoch = lastQueuedEpoch + 1;
+            }
             if (networkReady && bufferMutex) {
                 // 100ms timeout — Core 0 holds mutex <10ms, so this always succeeds.
                 // Old design used timeout=0 with offline fallback, but that created
                 // orphaned readings in _blockBuf that never flushed and had wrong timestamps.
                 if (xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    String ts = getUTCTimestamp();
+                    if (sampleEpoch != 0) lastQueuedEpoch = sampleEpoch;
+                    String ts = formatUTCEpoch(sampleEpoch);
                     queueReading(getDeviceId(), getLocationName(), getTimezone(),
                                  getGridVoltage(), lastReadings.ct, ts);
                     xSemaphoreGive(bufferMutex);
+                    // Ring-full overflow (if any) is written to /rejected.log HERE,
+                    // outside the mutex — file I/O under bufferMutex starved Core 0's
+                    // saveBufferToFlash and broke the <10ms hold invariant.
+                    flushOverflowReading();
                     setLEDState(LED_RUNNING);
                 } else {
                     // Should never happen (Core 0 holds <10ms, we wait 100ms)

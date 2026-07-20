@@ -19,6 +19,12 @@ static uint32_t _ctErrorCount = 0;
 static String _bootReasonStr = "Unknown";
 
 void flushBeforeRestart();  // Defined in http_sender.h
+// Safe-gate inputs for the scheduled reboot (defined later in the sketch)
+void logError(const String& message);
+int getQueueSize();
+bool isUploadPending();
+bool isOfflineMode();
+bool isRejectedDrainPending();
 
 static uint32_t _crashCount = 0;
 
@@ -70,6 +76,7 @@ void recordCTError()        { _ctErrorCount++; }
 unsigned long getUptimeSeconds() { return (millis() - _bootTime) / 1000; }
 String getBootReason()      { return _bootReasonStr; }
 uint32_t getCrashCount()    { return _crashCount; }
+uint32_t getWiFiReconnectCount() { return _wifiReconnectCount; }
 
 void diagnosticsLoop() {
     unsigned long now = millis();
@@ -94,6 +101,55 @@ void diagnosticsLoop() {
         Serial.printf("[DIAG] WARNING: Low heap %u — clearing buffers\n", freeHeap);
         // Force save and compact
     }
+}
+
+// ============================================================================
+// Scheduled maintenance reboot — planned beats unplanned (heap fragmentation,
+// WiFi-stack rot). Costs ~5-20s of sampling per event: a deliberate,
+// owner-approved zero-loss exception, taken only at a provably safe moment.
+// ============================================================================
+static uint32_t _rebootAfterS = 0;   // 0 = disabled
+
+void initScheduledReboot() {
+    Preferences p;
+    p.begin("lscfg", true);
+    int days = p.getInt("rebootdays", SCHEDULED_REBOOT_DAYS);
+    p.end();
+    if (days <= 0) { _rebootAfterS = 0; return; }
+    // getUptimeSeconds() is millis()-based and wraps at 49.7 days — a threshold
+    // beyond that would silently never fire. Clamp with margin.
+    if (days > 45) days = 45;
+    // Deterministic per-device jitter (±3h from the MAC) so the fleet never
+    // gaps simultaneously — same reasoning as the WiFi reconnect jitter.
+    int32_t jitterS = (int32_t)(ESP.getEfuseMac() % 21600ULL) - 10800;
+    _rebootAfterS = (uint32_t)days * 86400UL + jitterS;
+    Serial.printf("[DIAG] Scheduled reboot after %u s of uptime\n", _rebootAfterS);
+}
+
+void scheduledRebootLoop() {
+    if (_rebootAfterS == 0 || getUptimeSeconds() < _rebootAfterS) return;
+    static unsigned long lastGateCheck = 0;
+    if (millis() - lastGateCheck < 60000) return;   // re-try the gate 1x/min
+    lastGateCheck = millis();
+    // Safe gate: never reboot with undelivered data or an unsynced clock.
+    // If conditions never clear, the device just keeps running — reboot is
+    // opportunistic maintenance, not a deadline.
+    if (WiFi.status() != WL_CONNECTED) return;
+    if (isOfflineMode() || isUploadPending() || getQueueSize() > 0) return;
+    if (isRejectedDrainPending()) return;   // finish an operator-requested drain first
+    struct tm t;
+    if (!getLocalTime(&t, 0)) return;
+    logError("scheduled maintenance reboot");
+    Serial.println("[DIAG] Scheduled maintenance reboot — flushing and restarting");
+    // Flush twice, 1.1s apart: Core 1 may queue one more reading between the
+    // safe-gate check and the first flush's snapshot; the second flush catches
+    // it (the next 1Hz reading lands within the delay). Shrinks per-reboot RAM
+    // loss from ≤1 reading to ~zero.
+    flushBeforeRestart();
+    delay(1100);
+    flushBeforeRestart();
+    delay(200);
+    ESP.restart();
 }
 
 // FIX #5: snprintf instead of String concatenation (prevents heap fragmentation)

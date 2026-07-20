@@ -1,9 +1,16 @@
 #pragma once
 // ============================================================================
-// LineSights LS-6C-IOT v2.0.0 — Configuration
+// LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.6"
+#define FIRMWARE_VERSION "2.7.0"
+
+// --- Feature flags ---
+// Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
+// payload only. Default OFF; runtime override via Preferences("lscfg","wfstats").
+// When off, the live payload and offline records are byte-identical to v2.6
+// except the unconditional LS01->LS02 offline-format bump (C3 needs it).
+#define FEATURE_WAVEFORM_STATS 0
 
 // --- Hardware Pins ---
 #define NUM_CT_CHANNELS   6
@@ -32,6 +39,21 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 
 // --- Send Mode ---
 #define DEFAULT_SEND_INTERVAL    1  // seconds
+
+// --- Time sync ---
+#define NTP_SYNC_INTERVAL_MS   900000  // SNTP auto re-sync every 15 min (explicit, not SDK default)
+#define NTP_STALE_RESYNC_S     7200    // re-kick syncNTP if no successful sync for 2h while WiFi up
+
+// --- Maintenance reboot ---
+// Planned reboot beats an unplanned wedge, but it costs ~5-20s of sampling —
+// a deliberate, owner-approved zero-loss exception. Deterministic per-device
+// jitter (±3h from MAC) staggers the fleet. 0 = disabled.
+#define SCHEDULED_REBOOT_DAYS  7       // runtime override: Preferences "rebootdays" / heartbeat set_reboot_days
+
+// --- Offline chunking (poor-WiFi resumability) ---
+// Cap each offline file at 64KB: uploads become short bursts a spotty link can
+// finish, and delivered chunks are progress a dying stream can't take back.
+#define OFFLINE_CHUNK_BYTES    65536
 
 // --- Offline Storage (tiered, gzip compressed) ---
 #define OFFLINE_FILE           "/offline.dat"

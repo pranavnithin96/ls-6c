@@ -198,6 +198,21 @@ void processCommands(const String& responseBody) {
             setHTTPDebug(false);
         } else if (action == "update_firmware") {
             forceOTACheck();
+        } else if (action == "wfstats_on") {
+            setWaveformStats(true);          // enable waveform features on this unit
+        } else if (action == "wfstats_off") {
+            setWaveformStats(false);
+        } else if (action == "recover_rejected") {
+            recoverRejectedFiles();          // re-queue quarantined offline files
+        } else if (action == "upload_rejected_log") {
+            requestRejectedDrain();          // drained one file per tick by processSendQueue
+        } else if (action == "set_reboot_days") {
+            int val = cmd["value"] | -1;     // 0 disables; max 45 (millis rollover at 49.7d)
+            if (val >= 0 && val <= 45) {
+                Preferences p; p.begin("lscfg", false);
+                p.putInt("rebootdays", val); p.end();
+                initScheduledReboot();       // recompute immediately, no reboot needed
+            }
         } else if (action == "factory_reset") {
             flushBeforeRestart();
             Preferences p; p.begin("lscfg", false);
@@ -229,6 +244,25 @@ void sendHeartbeat() {
     doc["total_dropped"] = getTotalDropped();
     doc["ct_calibrated"] = isCTCalibrated();
     doc["crash_count"] = getCrashCount();
+    doc["wfstats"] = waveformStatsEnabled();          // waveform feature state
+    struct tm _tsync; doc["clock_synced"] = getLocalTime(&_tsync, 0);
+    doc["rejected_files"] = getRejectedFileCount();   // quarantined offline files awaiting recovery
+    // --- Diagnosis fields (v2.7): turn the fleet page into a root-cause board ---
+    doc["device_epoch"] = (uint32_t)time(nullptr);    // server: offset = received_at - this = clock skew
+    doc["offline_stored"] = getOfflineStored();       // readings in the CURRENT chunk only
+    doc["offline_bytes"] = getOfflineFileSize();      // current chunk size
+    doc["offline_backlog_bytes"] = getBacklogBytes(); // rotated chunks + quarantined files awaiting upload
+    doc["rejected_log_bytes"] = getRejectedLogBytes();// 400'd live readings parked on flash (cap 50KB)
+    doc["wifi_reconnects"] = getWiFiReconnectCount(); // link flakiness since boot
+    doc["last_http_code"] = getLastHttpCode();        // "unreachable" vs "server rejecting", cleanly
+    doc["last_success_age_s"] = getLastSuccessAgeS(); // seconds since a data POST succeeded (-1 never)
+    float _tc = temperatureRead();                    // thermal stress (coarse internal sensor)
+    if (isnan(_tc) || isinf(_tc)) _tc = 0.0f;         // raw "nan" would break the whole JSON body
+    doc["cpu_temp_c"] = serialized(String(_tc, 1));
+    doc["heap_largest_block"] = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);  // fragmentation
+    doc["mac"] = WiFi.macAddress();                   // stable hardware identity
+    doc["build"] = __DATE__ " " __TIME__;             // exact build, beyond version string
+    doc["ntp_sync_age_s"] = getNtpSyncAgeS();         // seconds since last SNTP sync (-1 never)
 
     // Snapshot errors under spinlock — only fixed-size char copies
     char snapTs[MAX_ERROR_LOG][32];

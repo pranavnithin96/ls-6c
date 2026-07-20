@@ -6,6 +6,8 @@
 #include <ESPmDNS.h>
 #include <DNSServer.h>
 #include <time.h>
+#include <sys/time.h>
+#include "esp_sntp.h"
 #include "config.h"
 
 // ============================================================================
@@ -311,8 +313,19 @@ int getCtRating(int channel = 0) { return _ctRatings[channel < 6 ? channel : 0];
 int getSendInterval() { return _sendInterval; }
 String getTimezone() { return _cfgTimezone; }
 
-// Non-blocking NTP: configure servers, then poll with zero timeout
+// Millis of the last successful SNTP sync (0 = never this uptime)
+static volatile uint32_t _lastNtpSyncMs = 0;
+static void _ntpSyncCallback(struct timeval* tv) { _lastNtpSyncMs = millis(); }
+// Seconds since the last successful sync; -1 = never this uptime
+long getNtpSyncAgeS() { return _lastNtpSyncMs ? (long)((millis() - _lastNtpSyncMs) / 1000) : -1; }
+
+// Non-blocking NTP: configure servers, then poll with zero timeout.
+// SNTP keeps auto re-syncing every NTP_SYNC_INTERVAL_MS after the first success —
+// set explicitly (15 min) rather than trusting the SDK's default, and record each
+// sync so the heartbeat can report staleness (ntp_sync_age_s).
 void syncNTP() {
+    sntp_set_time_sync_notification_cb(_ntpSyncCallback);
+    sntp_set_sync_interval(NTP_SYNC_INTERVAL_MS);
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     setenv("TZ", "UTC0", 1);
     tzset();
@@ -334,4 +347,30 @@ String getUTCTimestamp() {
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S.000Z", &timeinfo);
     return String(buf);
+}
+
+// Epoch at a given millis() instant — for stamping a reading at its SAMPLE time
+// rather than queue time (queue-time stamping produced same-second twins the
+// server 400s). Returns 0 while the clock is unsynced.
+time_t getEpochAt(unsigned long millisAt) {
+    struct tm probe;
+    if (!getLocalTime(&probe, 0)) return 0;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t nowMs = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    int64_t sampleMs = nowMs - (int64_t)(millis() - millisAt);
+    return (time_t)(sampleMs / 1000);
+}
+
+String formatUTCEpoch(time_t ep) {
+    if (ep == 0) return "1970-01-01T00:00:00.000Z";
+    struct tm t;
+    gmtime_r(&ep, &t);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S.000Z", &t);
+    return String(buf);
+}
+
+String getUTCTimestampAt(unsigned long millisAt) {
+    return formatUTCEpoch(getEpochAt(millisAt));
 }
