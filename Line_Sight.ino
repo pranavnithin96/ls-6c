@@ -279,7 +279,9 @@ void loop() {
     static bool wasConnected = false;
     if (!wifiConnected) {
         if (wasConnected) {
-            setLEDState(LED_WIFI_DISCONNECTED);
+            // Blink while reconnecting, not off — a dark LED reads as a dead board.
+            // Solid = connected, blinking = trying to reconnect, off = no power.
+            setLEDState(LED_WIFI_CONNECTING);
             recordWiFiReconnect();
             logError("WiFi disconnected");
             wasConnected = false;
