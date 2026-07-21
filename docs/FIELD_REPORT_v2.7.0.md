@@ -156,11 +156,43 @@ alert threshold set from that line would never fire.
 - Idempotent ingest is live (unique index on `(pi_device_id, time)` +
   `ON CONFLICT DO NOTHING` on every path), so re-sends and drains are safe.
 
-## Recommended sequencing
+## Resolution path — fix forward in 2.8
 
-1. **Deactivate the 2.7 OTA release** until defect 1 is fixed — `sb1`, `sb2` and
-   `aravind_cnc2` are still on 2.6 and will auto-upgrade into this state.
-2. Fix defects 1 and 2; ship as 2.7.1.
-3. The 15 stuck devices need that build delivered by OTA (the update path itself
-   still works) or a USB reflash. A plain reboot will **not** clear it.
-4. Once drained, expect the pcs fleet to return to ~3,602 readings/h.
+Decision (Pranav, 2026-07-21): no 2.7.1 patch, these fixes land in **2.8**.
+
+**Status now:**
+
+- **2.7 has been DEACTIVATED in the OTA registry** (server session, 2026-07-21
+  ~05:10 UTC). `/api/firmware/check` now answers `{"update_available": false}`
+  to everyone, so `sb1`, `sb2` and `aravind_cnc2` — still on 2.6 — can no longer
+  auto-upgrade into the wedged state. Reversible at any time; publishing 2.8
+  with `set_active` supersedes it automatically.
+- The 15 pcs devices stay degraded (~53% loss) until 2.8 ships. This is
+  degradation, not blindness — ~1,700 readings/h is still one every ~2 s, which
+  cycle detection tolerates.
+
+**The OTA channel still reaches the wedged devices — this is the recovery path.**
+Verified 2026-07-21: every stuck pcs unit is still polling `/api/firmware/check`
+(6 polls each today, most recent 05:07 UTC). The update path is independent of
+the jammed send ring, so activating 2.8 will reach them and they will self-heal
+on the next poll. **No USB reflash and no site visit are required**, provided 2.8
+clears `/rejected.log` (or fixes the gate so the existing drain can).
+
+**Sequencing:**
+
+1. Build 2.8 with defects 1 and 2 fixed (defect 3 optional).
+2. Upload to the OTA registry and set active — that re-enables updates fleet-wide
+   and supersedes the deactivated 2.7 in one step.
+3. Stuck devices update on their next poll; expect the pcs fleet to return to
+   ~3,602 readings/h once their logs drain.
+4. Consider whether 2.8 should clear a full `/rejected.log` on first boot as a
+   one-shot recovery, rather than relying on the drain gate to unwedge itself —
+   these devices already have ~301 KB parked, and the parked rows are largely
+   same-second duplicates the server now no-ops anyway (idempotent ingest is
+   live), so discarding them costs little and guarantees recovery.
+
+**No server-side changes are required for 2.8.** The LS02 decoder, the
+`rejected-ndjson` drain endpoint, idempotent ingest and all v2.7 heartbeat
+fields/commands are deployed and tested; 2.8's fixes are internal to the
+firmware. If 2.8 changes the wire format or adds heartbeat fields, say so and the
+server side will follow.
