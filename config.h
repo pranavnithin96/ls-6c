@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.7.0"
+#define FIRMWARE_VERSION "2.8.0"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -65,6 +65,14 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 
 // --- Buffers ---
 #define MAX_BUFFER_SIZE       30    // 30s pipeline buffer (fixed char arrays, no heap alloc)
+// Background (offline/rejected) uploads normally wait for the live send ring to
+// drain first, so fresh readings ship ahead of backlog. Waiting for the ring to
+// be *completely* empty deadlocks on spotty-but-connected units whose ring never
+// empties: the drain never runs, /rejected.log never clears (proven: pcs1/pcs7
+// drained 0 bytes). So allow a background upload once the ring is at/below this
+// low-water mark, and force one after BG_UPLOAD_STARVE_MS no matter what.
+#define BG_UPLOAD_LOWATER      (MAX_BUFFER_SIZE / 4)   // 7 of 30 — "mostly caught up"
+#define BG_UPLOAD_STARVE_MS    120000UL                // never stall a pending drain/upload >2min
 #define BUFFER_SAVE_INTERVAL_MS  60000   // 60 seconds (minimize power-loss data window)
 
 // --- Heartbeat ---

@@ -124,7 +124,7 @@ New in v2.7 (add columns when the fleet updates):
 | `device_epoch` | clock skew: `received_at - device_epoch` (the mark_pdc +17.7h case) |
 | `clock_synced` | NTP state, directly |
 | `offline_stored`, `offline_bytes` | flash backlog depth / time-to-full |
-| `rejected_log_bytes` | 400'd live readings parked on flash (cap 50,000) |
+| `rejected_log_bytes` | 400'd live readings parked on flash. Sum of active + up to 4 archives; **worst case ~300,000 bytes, not 50,000** (50KB is the per-file rotate threshold). Alert off ~300KB total. |
 | `rejected_files` | quarantined offline files awaiting `recover_rejected` |
 | `wifi_reconnects` | link flap count since boot |
 | `last_http_code`, `last_success_age_s` | "unreachable" vs "server rejecting", cleanly (-1 = never) |

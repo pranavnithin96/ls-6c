@@ -311,6 +311,26 @@ String getServerUrl() { return _cfgServerUrl; }
 float getGridVoltage() { return _gridVoltage; }
 int getCtRating(int channel = 0) { return _ctRatings[channel < 6 ? channel : 0]; }
 int getSendInterval() { return _sendInterval; }
+
+// Live setters (Defect 2): update the RUNNING value AND persist to NVS, so the
+// heartbeat set_interval / set_voltage commands take effect immediately. The
+// main loop reads getSendInterval()/getGridVoltage() every iteration, so no
+// reboot is needed. Range-checked here (single source of truth). Previously the
+// command wrote NVS only, so it was a no-op until the next reboot.
+void setSendInterval(int val) {
+    if (val < 1 || val > 60) return;
+    _sendInterval = val;
+    _prefs.begin("lscfg", false);
+    _prefs.putInt("interval", val);
+    _prefs.end();
+}
+void setGridVoltage(float val) {
+    if (val < 100.0f || val > 250.0f) return;
+    _gridVoltage = val;
+    _prefs.begin("lscfg", false);
+    _prefs.putFloat("volt", val);
+    _prefs.end();
+}
 String getTimezone() { return _cfgTimezone; }
 
 // Millis of the last successful SNTP sync (0 = never this uptime)

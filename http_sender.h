@@ -118,6 +118,7 @@ static uint32_t _offlineBlockCount = 0;
 static uint32_t _offlineFileSize = 0;
 static unsigned long _lastUploadAttempt = 0;
 static volatile bool _uploadPending = false;
+static unsigned long _bgUploadBlockedSince = 0;  // starvation timer for background uploads (Defect 1)
 static volatile bool _offlineTestLock = false;  // Blocks probe during test
 
 // Block accumulator
@@ -159,12 +160,17 @@ static inline void bufCountDec() {
     portENTER_CRITICAL(&_bufCntMux); _bufferCount--; portEXIT_CRITICAL(&_bufCntMux);
 }
 
-// Rejected-log lifecycle: 50KB active file, rotated to numbered archives when
-// full, drained by the heartbeat "upload_rejected_log" command. The old behavior
-// (cap reached -> silently stop writing) was active data loss on the fleet.
+// Rejected-log lifecycle: active file rotated to numbered archives when it hits
+// REJECTED_MAX_BYTES, drained by the heartbeat "upload_rejected_log" command. The
+// old behavior (cap reached -> silently stop writing) was active data loss.
+// Real on-flash budget (Defect 3): the active file is only hard-dropped at
+// 2×REJECTED_MAX_BYTES (~100KB) once every archive is full, plus REJECTED_ARCHIVE_MAX
+// archives of ~REJECTED_MAX_BYTES each (~200KB) => ~300KB worst case, matching the
+// ~301KB the fleet reports. REJECTED_MAX_BYTES is PER FILE, not a total cap — size
+// any alert threshold off ~300KB total, not 50KB.
 #define REJECTED_LOG "/rejected.log"
-#define REJECTED_MAX_BYTES 50000
-#define REJECTED_ARCHIVE_MAX 4        // /rejected.1.log .. /rejected.4.log (~250KB total budget)
+#define REJECTED_MAX_BYTES 50000      // per-file rotate threshold (active hard-drops at 2×)
+#define REJECTED_ARCHIVE_MAX 4        // /rejected.1.log .. /rejected.4.log (~300KB total budget)
 
 // Rotate the ACTIVE rejected.log into a FREE archive slot. Archives are
 // IMMUTABLE once created — never renamed, shifted, or overwritten; only the
@@ -833,6 +839,23 @@ void initHTTPSender(const String& serverUrl, const String& deviceId) {
             _uploadPending = true;
             Serial.println("[FS] Offline data pending (legacy queue)");
         }
+        // Boot recovery (Defect 1): if any rejected data is parked on flash, queue
+        // the drain now. At boot the send ring is empty, so the low-water gate is
+        // open immediately and the archives upload (server idempotently no-ops the
+        // same-second dups; unique rows are kept — never deleted). This is what lets
+        // a unit wedged on the old ring-empty gate self-heal the moment it updates
+        // and reboots, without waiting for an operator upload_rejected_log command.
+        {
+            bool rejParked = LittleFS.exists(REJECTED_LOG);
+            for (int n = 1; !rejParked && n <= REJECTED_ARCHIVE_MAX; n++) {
+                char rp[24]; snprintf(rp, sizeof(rp), "/rejected.%d.log", n);
+                if (LittleFS.exists(rp)) rejParked = true;
+            }
+            if (rejParked) {
+                _rejectedDrainPending = true;
+                Serial.println("[FS] Rejected data parked — drain queued for boot recovery");
+            }
+        }
         Serial.printf("[FS] LittleFS %u/%u bytes\n", LittleFS.usedBytes(), LittleFS.totalBytes());
     } else {
         Serial.println("[FS] LittleFS failed");
@@ -1043,12 +1066,31 @@ void processSendQueue() {
         }
     }
 
-    if (_uploadPending && bufCount() == 0 && (now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS)) {
+    // Background-upload window (Defect 1). Was hard-gated on bufCount()==0, which
+    // deadlocked: a spotty-but-connected unit's ring never empties, so the offline
+    // backlog and /rejected.log never uploaded (pcs1/pcs7 drained 0 bytes). Now the
+    // window opens when the ring is at/below the low-water mark (mostly caught up),
+    // OR — so it can never be starved forever — once a pending upload has been
+    // blocked for BG_UPLOAD_STARVE_MS. Still one file per tick, still rate-limited
+    // by OFFLINE_UPLOAD_RETRY_MS, so Core-0 hold stays bounded. Fresh readings keep
+    // priority up to the low-water mark; the forced path costs ~1 send slot/2min.
+    bool ringQuiet = (bufCount() <= BG_UPLOAD_LOWATER);
+    if (!ringQuiet && (_uploadPending || _rejectedDrainPending)) {
+        if (_bgUploadBlockedSince == 0) _bgUploadBlockedSince = now;
+        if (now - _bgUploadBlockedSince >= BG_UPLOAD_STARVE_MS) {
+            ringQuiet = true;              // starvation escape — force forward progress
+            _bgUploadBlockedSince = now;   // re-arm so the next forced tick is another STARVE_MS out
+        }
+    } else {
+        _bgUploadBlockedSince = 0;         // ring drained or nothing pending — reset the timer
+    }
+
+    if (_uploadPending && ringQuiet && (now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS)) {
         uploadOfflineFile(_httpDeviceId);
-    } else if (_rejectedDrainPending && bufCount() == 0 &&
+    } else if (_rejectedDrainPending && ringQuiet &&
                (_lastUploadAttempt == 0 || now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS)) {
-        // Rejected-log drain: one immutable file per tick, ring-empty gated —
-        // offline backlog (raw readings) always takes priority via the else-if.
+        // Rejected-log drain: one immutable file per tick — offline backlog (raw
+        // readings) always takes priority via the else-if.
         drainOneRejectedFile();
     }
 }

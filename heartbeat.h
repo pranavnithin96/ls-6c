@@ -178,16 +178,10 @@ void processCommands(const String& responseBody) {
 
         if (action == "set_interval") {
             int val = cmd["value"] | -1;
-            if (val >= 1 && val <= 60) {
-                Preferences p; p.begin("lscfg", false);
-                p.putInt("interval", val); p.end();
-            }
+            setSendInterval(val);          // live + persisted (range-checked inside) — Defect 2
         } else if (action == "set_voltage") {
             float val = cmd["value"] | -1.0f;
-            if (val >= 100 && val <= 250) {
-                Preferences p; p.begin("lscfg", false);
-                p.putFloat("volt", val); p.end();
-            }
+            setGridVoltage(val);           // live + persisted (range-checked inside) — Defect 2
         } else if (action == "reboot") {
             flushBeforeRestart();
             delay(500);
