@@ -73,15 +73,26 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 // low-water mark, and force one after BG_UPLOAD_STARVE_MS no matter what.
 #define BG_UPLOAD_LOWATER      (MAX_BUFFER_SIZE / 4)   // 7 of 30 — "mostly caught up"
 #define BG_UPLOAD_STARVE_MS    120000UL                // never stall a pending drain/upload >2min
-// Rejected-log recovery grace. Whenever reject data is parked AND the device is
-// online (boot with backlog, or a live 200 after reconnect), it drains first —
-// lossless upload; the idempotent server dedups. If the drain can't clear it
-// within this window while live data keeps flowing, the log is DISPOSED: a full
-// rejected log drags device throughput (FS churn), and its contents are largely
-// duplicates the server already has. Deliberate trade (Pranav 2026-07-21): drop
-// the low-value backlog rather than let it degrade operation. Only fires while
-// ONLINE (recent live 200) — a genuine outage never loses parked rows.
-#define REJECTED_RECOVERY_CLEAR_MS 60000UL             // 60s online grace to drain, then dispose
+// Rejected-log recovery. Whenever reject data is parked AND the device is online
+// (boot with backlog, or a live 200 after reconnect), it drains first — lossless
+// upload; the idempotent server dedups. The dispose backstop watches DRAIN
+// PROGRESS, not wall-clock time: every file delivered restarts the clock, so a
+// drain that is getting somewhere is never cut off no matter how big the backlog
+// or how slowly the ring lets it run. Only a drain that is genuinely stuck —
+// nothing delivered for REJECTED_STALL_MS while live data keeps flowing — gets
+// the log DISPOSED, because a full rejected log drags throughput (FS churn) and
+// its contents are largely duplicates the server already has.
+//
+// Why progress and not a deadline: the drain is gated on a quiet ring, and on a
+// saturated unit it only runs via the starvation escape every BG_UPLOAD_STARVE_MS.
+// A fixed grace shorter than that escape disposes the backlog before the drain is
+// ever ALLOWED to run — which is exactly the saturated unit that has a full log.
+// The static_assert keeps that relationship from being broken by a later tweak.
+#define REJECTED_ONLINE_WINDOW_MS  60000UL   // a live 200 this recent == "online"
+#define REJECTED_STALL_MS         300000UL   // no drain progress this long while online -> dispose
+static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
+              "REJECTED_STALL_MS must outlast BG_UPLOAD_STARVE_MS, or a ring-blocked "
+              "drain is disposed before the starvation escape ever lets it run");
 #define BUFFER_SAVE_INTERVAL_MS  60000   // 60 seconds (minimize power-loss data window)
 
 // --- Heartbeat ---

@@ -133,8 +133,11 @@ static unsigned long _lastUploadAttempt = 0;
 static volatile bool _uploadPending = false;
 static unsigned long _bgUploadBlockedSince = 0;  // starvation timer for background uploads (Defect 1)
 static bool _rejRecoveryArmed = false;           // drain-then-dispose recovery active this online session
-static unsigned long _rejRecoveryDeadline = 0;   // 0 = not started; set on first successful POST
-static bool _rejParked = false;                  // reject data exists on flash (cheap flag, avoids FS scan)
+static unsigned long _rejLastProgressMs = 0;     // 0 = clock not started; else millis() of last drain progress
+// Written from BOTH cores — Core 1 via flushOverflowReading()->writeRejected() on
+// ring overflow, Core 0 via the 400/422 dispositions — and read on Core 0. Same
+// reason _overflowPending/_rejectedDrainPending/_uploadPending are volatile.
+static volatile bool _rejParked = false;         // reject data exists on flash (cheap flag, avoids FS scan)
 static volatile bool _offlineTestLock = false;  // Blocks probe during test
 
 // Block accumulator
@@ -1055,7 +1058,7 @@ void processSendQueue() {
                 if (_rejParked && !_rejRecoveryArmed) {
                     _rejectedDrainPending = true;
                     _rejRecoveryArmed = true;
-                    _rejRecoveryDeadline = 0;   // grace restarts from this success
+                    _rejLastProgressMs = 0;     // stall clock starts from this success
                 }
                 // Keep last known epoch fresh for offline fallback
                 struct tm t; if (getLocalTime(&t, 0)) _lastKnownEpoch = mktime(&t);
@@ -1113,26 +1116,33 @@ void processSendQueue() {
         }
     }
 
-    // Rejected-log dispose backstop. Armed whenever data is parked and the device
-    // is online (boot with backlog, or a live 200 after reconnect). The drain runs
-    // first (lossless). The grace timer starts only once a live POST has succeeded,
-    // so an offline unit never loses parked rows. If the drain hasn't cleared the
-    // log by the deadline AND we're still online (a live 200 within the grace —
-    // i.e. fresh data flows but the reject drain won't), DISPOSE it so it stops
-    // dragging operation. If we've dropped offline, restart the grace on reconnect.
+    // Rejected-log dispose backstop — watches DRAIN PROGRESS, not elapsed time.
+    // Every file the drain delivers stamps _rejLastProgressMs and restarts the
+    // clock, so a drain that is getting somewhere is never cut off, however big
+    // the backlog or however slowly the ring lets it run. A saturated unit only
+    // drains via the starvation escape (one file per BG_UPLOAD_STARVE_MS) — that
+    // still counts as progress, so its backlog gets DELIVERED rather than binned.
+    // Only a drain that has delivered nothing for REJECTED_STALL_MS while live
+    // data keeps flowing is treated as wedged, and the log disposed.
+    //
+    // The online test is unchanged: dispose requires a live 200 inside the window,
+    // so a genuine outage never costs parked rows — going offline parks the clock
+    // and it restarts on reconnect.
     if (_rejRecoveryArmed) {
-        if (_rejRecoveryDeadline == 0) {
-            if (_lastSuccessMs != 0) _rejRecoveryDeadline = now + REJECTED_RECOVERY_CLEAR_MS;
-        } else if (now >= _rejRecoveryDeadline) {
-            if (_lastSuccessMs != 0 && (now - _lastSuccessMs) < REJECTED_RECOVERY_CLEAR_MS) {
-                uint32_t left = getRejectedLogBytes();
-                clearAllRejected();   // disarms _rejRecoveryArmed/_rejectedDrainPending/_rejParked
-                if (left) {
-                    Serial.printf("[FS] Rejected store disposed after grace (%u bytes undelivered)\n", left);
-                    logError("rejected store disposed — undeliverable while online");
-                }
-            } else {
-                _rejRecoveryDeadline = 0;   // went offline — restart grace on next reconnect
+        bool online = (_lastSuccessMs != 0 &&
+                       (now - _lastSuccessMs) < REJECTED_ONLINE_WINDOW_MS);
+        if (!online) {
+            _rejLastProgressMs = 0;       // offline — stall clock restarts on reconnect
+        } else if (_rejLastProgressMs == 0) {
+            _rejLastProgressMs = now;     // confirmed online: start counting from here
+        } else if ((now - _rejLastProgressMs) >= REJECTED_STALL_MS) {
+            // Unsigned elapsed-form comparison: correct across the ~49.7-day
+            // millis() rollover, unlike a stored `now + WINDOW` deadline.
+            uint32_t left = getRejectedLogBytes();
+            clearAllRejected();   // disarms _rejRecoveryArmed/_rejectedDrainPending/_rejParked
+            if (left) {
+                Serial.printf("[FS] Rejected store disposed — drain stalled (%u bytes undelivered)\n", left);
+                logError("rejected store disposed — drain stalled while online");
             }
         }
     }
@@ -1301,6 +1311,7 @@ static void clearAllRejected() {
     _rejectedDrainPending = false;
     _rejRecoveryArmed = false;
     _rejParked = false;
+    _rejLastProgressMs = 0;
 }
 
 static void drainOneRejectedFile() {
@@ -1317,6 +1328,7 @@ static void drainOneRejectedFile() {
         if (_postRejectedFile(p)) {
             drainFails = 0;
             _lastUploadAttempt = 0;
+            _rejLastProgressMs = millis();   // delivered a file — restart the stall clock
         } else {
             _lastUploadAttempt = millis();
             if (++drainFails >= 10) {
@@ -1329,10 +1341,15 @@ static void drainOneRejectedFile() {
     }
     // No archives left: rotate the active log so next tick streams an immutable
     // copy while Core 1 appends to a fresh active file.
-    if (LittleFS.exists(REJECTED_LOG) && rotateRejectedLog()) { _lastUploadAttempt = 0; return; }
+    if (LittleFS.exists(REJECTED_LOG) && rotateRejectedLog()) {
+        _lastUploadAttempt = 0;
+        _rejLastProgressMs = millis();   // rotated active->archive: forward progress
+        return;
+    }
     // Fully drained and delivered (every file got a 200) — cancel the dispose
     // backstop; there is nothing left to dispose, and it all reached the server.
     _rejectedDrainPending = false;
     _rejParked = false;
     _rejRecoveryArmed = false;
+    _rejLastProgressMs = 0;
 }
