@@ -73,13 +73,15 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 // low-water mark, and force one after BG_UPLOAD_STARVE_MS no matter what.
 #define BG_UPLOAD_LOWATER      (MAX_BUFFER_SIZE / 4)   // 7 of 30 — "mostly caught up"
 #define BG_UPLOAD_STARVE_MS    120000UL                // never stall a pending drain/upload >2min
-// First-boot recovery: on the first boot after a firmware update, GUARANTEE the
-// rejected store ends up empty even if the drain can't complete on a saturated
-// unit — the backstop that makes OTA recovery certain, not drain-dependent. The
-// boot drain-kick still runs first (lossless upload; server dedups), and this
-// timer only starts once the unit is confirmed ONLINE (first successful POST),
-// so an offline unit never loses its parked rows.
-#define REJECTED_RECOVERY_CLEAR_MS 120000UL            // 2min online grace, then unconditional clear
+// Rejected-log recovery grace. Whenever reject data is parked AND the device is
+// online (boot with backlog, or a live 200 after reconnect), it drains first —
+// lossless upload; the idempotent server dedups. If the drain can't clear it
+// within this window while live data keeps flowing, the log is DISPOSED: a full
+// rejected log drags device throughput (FS churn), and its contents are largely
+// duplicates the server already has. Deliberate trade (Pranav 2026-07-21): drop
+// the low-value backlog rather than let it degrade operation. Only fires while
+// ONLINE (recent live 200) — a genuine outage never loses parked rows.
+#define REJECTED_RECOVERY_CLEAR_MS 60000UL             // 60s online grace to drain, then dispose
 #define BUFFER_SAVE_INTERVAL_MS  60000   // 60 seconds (minimize power-loss data window)
 
 // --- Heartbeat ---

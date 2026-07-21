@@ -132,8 +132,9 @@ static uint32_t _offlineFileSize = 0;
 static unsigned long _lastUploadAttempt = 0;
 static volatile bool _uploadPending = false;
 static unsigned long _bgUploadBlockedSince = 0;  // starvation timer for background uploads (Defect 1)
-static bool _rejRecoveryArmed = false;           // one-shot first-boot-after-update rejected-log recovery
+static bool _rejRecoveryArmed = false;           // drain-then-dispose recovery active this online session
 static unsigned long _rejRecoveryDeadline = 0;   // 0 = not started; set on first successful POST
+static bool _rejParked = false;                  // reject data exists on flash (cheap flag, avoids FS scan)
 static volatile bool _offlineTestLock = false;  // Blocks probe during test
 
 // Block accumulator
@@ -237,7 +238,7 @@ void writeRejected(const String& json) {
         }
     }
     File rf = LittleFS.open(REJECTED_LOG, "a");
-    if (rf) { rf.println(json); rf.close(); }
+    if (rf) { rf.println(json); rf.close(); _rejParked = true; }
     if (locked) xSemaphoreGive(_rejMux);
 }
 
@@ -872,26 +873,10 @@ void initHTTPSender(const String& serverUrl, const String& deviceId) {
                 if (LittleFS.exists(rp)) rejParked = true;
             }
             if (rejParked) {
-                _rejectedDrainPending = true;
-                Serial.println("[FS] Rejected data parked — drain queued for boot recovery");
-                // First boot after a firmware update? Arm the guaranteed-clear
-                // backstop (fires 2min after we're confirmed online, whether or
-                // not the drain finished). Version marker in NVS survives OTA, so
-                // this is strictly one-shot per new firmware. The drain above runs
-                // first and uploads losslessly; this only wipes what it couldn't.
-                Preferences vp; vp.begin("lscfg", false);
-                if (vp.getString("fwver", "") != FIRMWARE_VERSION) {
-                    vp.putString("fwver", FIRMWARE_VERSION);
-                    _rejRecoveryArmed = true;
-                    Serial.printf("[FS] First boot of %s — rejected recovery armed\n", FIRMWARE_VERSION);
-                }
-                vp.end();
-            } else {
-                // No parked data, but still stamp the version marker so a later
-                // boot that DOES accumulate parked data doesn't misfire recovery.
-                Preferences vp; vp.begin("lscfg", false);
-                if (vp.getString("fwver", "") != FIRMWARE_VERSION) vp.putString("fwver", FIRMWARE_VERSION);
-                vp.end();
+                _rejParked = true;
+                _rejectedDrainPending = true;   // try to deliver it first (lossless)
+                _rejRecoveryArmed = true;        // ...then dispose if it can't clear while online
+                Serial.println("[FS] Rejected data parked — drain queued, dispose backstop armed");
             }
         }
         Serial.printf("[FS] LittleFS %u/%u bytes\n", LittleFS.usedBytes(), LittleFS.totalBytes());
@@ -1063,6 +1048,15 @@ void processSendQueue() {
                 _lastSuccessMs = millis();
                 _totalSent++; _consecutiveFailures = 0; _backoffMs = 1000;
                 recordSendSuccess();
+                // The server just confirmed it's up and taking data. That 200 is
+                // the green light to clear any parked reject backlog: kick the
+                // drain (delivers it, server dedups) and arm the dispose backstop
+                // so it can't linger and drag operation if the drain won't clear.
+                if (_rejParked && !_rejRecoveryArmed) {
+                    _rejectedDrainPending = true;
+                    _rejRecoveryArmed = true;
+                    _rejRecoveryDeadline = 0;   // grace restarts from this success
+                }
                 // Keep last known epoch fresh for offline fallback
                 struct tm t; if (getLocalTime(&t, 0)) _lastKnownEpoch = mktime(&t);
                 _sendBuffer[_bufferTail].used = false;
@@ -1119,19 +1113,27 @@ void processSendQueue() {
         }
     }
 
-    // First-boot recovery backstop: guarantee the rejected store ends up empty
-    // even if the drain can't complete on a saturated unit. Start the grace timer
-    // only once the unit is confirmed online (a successful POST happened), so an
-    // offline unit never loses its parked rows; then, after the grace window, wipe
-    // whatever the lossless drain couldn't upload. Certain, drain-independent.
+    // Rejected-log dispose backstop. Armed whenever data is parked and the device
+    // is online (boot with backlog, or a live 200 after reconnect). The drain runs
+    // first (lossless). The grace timer starts only once a live POST has succeeded,
+    // so an offline unit never loses parked rows. If the drain hasn't cleared the
+    // log by the deadline AND we're still online (a live 200 within the grace —
+    // i.e. fresh data flows but the reject drain won't), DISPOSE it so it stops
+    // dragging operation. If we've dropped offline, restart the grace on reconnect.
     if (_rejRecoveryArmed) {
         if (_rejRecoveryDeadline == 0) {
             if (_lastSuccessMs != 0) _rejRecoveryDeadline = now + REJECTED_RECOVERY_CLEAR_MS;
         } else if (now >= _rejRecoveryDeadline) {
-            uint32_t left = getRejectedLogBytes();
-            clearAllRejected();   // disarms _rejRecoveryArmed + _rejectedDrainPending
-            Serial.printf("[FS] First-boot recovery: rejected store cleared (%u bytes remained)\n", left);
-            logError("rejected store cleared by first-boot recovery backstop");
+            if (_lastSuccessMs != 0 && (now - _lastSuccessMs) < REJECTED_RECOVERY_CLEAR_MS) {
+                uint32_t left = getRejectedLogBytes();
+                clearAllRejected();   // disarms _rejRecoveryArmed/_rejectedDrainPending/_rejParked
+                if (left) {
+                    Serial.printf("[FS] Rejected store disposed after grace (%u bytes undelivered)\n", left);
+                    logError("rejected store disposed — undeliverable while online");
+                }
+            } else {
+                _rejRecoveryDeadline = 0;   // went offline — restart grace on next reconnect
+            }
         }
     }
 
@@ -1298,6 +1300,7 @@ static void clearAllRejected() {
     }
     _rejectedDrainPending = false;
     _rejRecoveryArmed = false;
+    _rejParked = false;
 }
 
 static void drainOneRejectedFile() {
@@ -1327,5 +1330,9 @@ static void drainOneRejectedFile() {
     // No archives left: rotate the active log so next tick streams an immutable
     // copy while Core 1 appends to a fresh active file.
     if (LittleFS.exists(REJECTED_LOG) && rotateRejectedLog()) { _lastUploadAttempt = 0; return; }
-    _rejectedDrainPending = false;   // nothing left to drain
+    // Fully drained and delivered (every file got a 200) — cancel the dispose
+    // backstop; there is nothing left to dispose, and it all reached the server.
+    _rejectedDrainPending = false;
+    _rejParked = false;
+    _rejRecoveryArmed = false;
 }
