@@ -84,7 +84,7 @@ void initCTSensors() {
 
     Serial.printf("[CT] %d channels | %d samples | %dms window\n",
         NUM_CT_CHANNELS, ADC_SAMPLES_PER_CH, (ADC_SAMPLES_PER_CH * SAMPLE_INTERVAL_US) / 1000);
-    Serial.println("[CT] Manufacturer formula: amps = 0.0123 * count + 0.13");
+    Serial.println("[CT] Rating-aware cal: 50A=0.0090/ct, 100A=0.0327/ct, else legacy 0.0123+0.13");
 }
 
 // Multi-point calibration recording — kept as future option, not used by default readAllCT path.
@@ -122,10 +122,41 @@ void setCalPoint(int ch, int pt, float knownAmps) {
     Serial.printf("[CT] CH%d pt%d: %.1fmV = %.3fA (recorded, not active)\n", ch+1, pt, mv, knownAmps);
 }
 
-// Read all CT channels — manufacturer's exact formula on raw ADC counts.
-// amps = 0.0123 * count + 0.13  (empirical fit calibrated against this hardware)
-// No auto-zero subtraction, no noise threshold — the +0.13 baseline is the
-// correct floor for this diode-rectifier topology.
+// ---------------------------------------------------------------------------
+// Rating-aware CT calibration (2.9.0). One formula never fit both sensor types:
+// the legacy 0.0123*count+0.13 sat BETWEEN them, so 50A CTs overread ~40% and
+// 100A CTs underread ~2.6x on the same firmware. Each channel's rating is set by
+// the installer at setup (getCtRating), so we select the empirically-fit slope
+// per rating. Fit against a multimeter clamp on PRODUCTION sensors 2026-07-21;
+// these CTs read 0 count at 0A, so no +0.13 floor. Fix-forward: readings from
+// firmware >= 2.9.0 use these — firmware_version is the calibration stamp.
+//   100A : 0.0327 A/count  — solid (resistive furnace, verified 0-35A)
+//   50A  : 0.0090 A/count  — PROVISIONAL (verified only to 3.5A, on a motor)
+//   150A / unset : legacy manufacturer formula, unchanged (not yet calibrated)
+// ---------------------------------------------------------------------------
+#define CT_SLOPE_50A     0.0090f
+#define CT_SLOPE_100A    0.0327f
+#define CT_SLOPE_LEGACY  0.0123f
+#define CT_OFFSET_LEGACY 0.13f
+
+static inline float ctSlope(int rating) {
+    switch (rating) {
+        case 100: return CT_SLOPE_100A;
+        case 50:  return CT_SLOPE_50A;
+        default:  return CT_SLOPE_LEGACY;
+    }
+}
+// count -> amps for a channel of the given CT rating.
+static inline float ctCountToAmps(int rating, float count) {
+    switch (rating) {
+        case 100: return CT_SLOPE_100A * count;                          // through origin
+        case 50:  return CT_SLOPE_50A  * count;                          // through origin
+        default:  return CT_SLOPE_LEGACY * count + CT_OFFSET_LEGACY;     // legacy fallback (150A/unset)
+    }
+}
+
+// Read all CT channels — per-rating calibration on raw ADC counts (see above).
+// Legacy fallback keeps the +0.13 floor; the 50A/100A fits are through-origin.
 AllCTReadings readAllCT(float grid_voltage) {
     AllCTReadings all = {};
     all.timestamp_ms = millis();  // Timestamp at START of sampling
@@ -169,8 +200,9 @@ AllCTReadings readAllCT(float grid_voltage) {
 
         float avgCount = (float)sumCounts[ch] / ADC_SAMPLES_PER_CH;
 
-        // Manufacturer's exact formula — character for character
-        float amps = (0.0123f * avgCount) + 0.13f;
+        // Rating-aware calibration (2.9.0) — formula chosen by the channel's CT type
+        int rating = getCtRating(ch);
+        float amps = ctCountToAmps(rating, avgCount);
 
         // Guard against NaN/Inf only
         if (isnan(amps) || isinf(amps)) amps = 0.0f;
@@ -185,8 +217,8 @@ AllCTReadings readAllCT(float grid_voltage) {
         // Computed unconditionally (tens of us total); emitted only when the flag
         // is on (see queueReading). Saturates with the ADC at ~50.5A: on a pinned
         // channel max≈avg → ratio→1, ripple→0 (expected, documented).
-        r.peak_amps = (0.0123f * maxCount[ch]) + 0.13f;
-        r.min_amps  = (0.0123f * minCount[ch]) + 0.13f;
+        r.peak_amps = ctCountToAmps(rating, maxCount[ch]);
+        r.min_amps  = ctCountToAmps(rating, minCount[ch]);
 
         // Within-second std in counts. Compute E[X^2]-E[X]^2 in DOUBLE: the terms
         // are close at ~1e6-1e7 magnitudes and float32 loses the difference to
@@ -195,7 +227,7 @@ AllCTReadings readAllCT(float grid_voltage) {
         double meanSq = (double)sumSq[ch] / ADC_SAMPLES_PER_CH;
         double var    = meanSq - meanC * meanC;
         if (var < 0.0) var = 0.0;                  // guard tiny negative from rounding
-        r.ripple_amps = 0.0123f * (float)sqrt(var);  // spread, no +0.13 offset
+        r.ripple_amps = ctSlope(rating) * (float)sqrt(var);  // spread scaled by channel slope, no offset
 
         // env_peak_ratio: within-second max/mean of the rectified envelope.
         // NOT electrical crest factor (no waveform access; +0.13 offset means
@@ -209,7 +241,7 @@ AllCTReadings readAllCT(float grid_voltage) {
         const int subN = ADC_SAMPLES_PER_CH / 5;
         for (int k = 0; k < 5; k++) {
             float subAvg = (float)subSum[ch][k] / subN;
-            r.env5[k] = (0.0123f * subAvg) + 0.13f;
+            r.env5[k] = ctCountToAmps(rating, subAvg);
         }
 
         all.ct[ch] = r;

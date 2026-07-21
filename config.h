@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.8.0"
+#define FIRMWARE_VERSION "2.9.0"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
