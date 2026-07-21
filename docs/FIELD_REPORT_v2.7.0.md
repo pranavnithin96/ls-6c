@@ -196,3 +196,88 @@ clears `/rejected.log` (or fixes the gate so the existing drain can).
 fields/commands are deployed and tested; 2.8's fixes are internal to the
 firmware. If 2.8 changes the wire format or adds heartbeat fields, say so and the
 server side will follow.
+
+---
+
+# 2.8.0 follow-up — 2026-07-21, after rollout
+
+**The 2.8 backstop works. The underlying cause was misdiagnosed (by me, in the
+section above) and is still open.**
+
+## What 2.8 fixed — confirmed in the field
+
+The first-boot recovery backstop does exactly what it promised. Devices that
+took 2.8 and can keep up are now clean:
+
+| Device | fw | `rejected_log_bytes` | sent/h | dropped/h |
+|---|---|---:|---:|---:|
+| mark_pdc | 2.8.0 | **0** | 3,593 | 0 |
+| mark_new_pdc | 2.8.0 | **0** | 3,621 | 1 |
+| mark_new_1 | 2.8.0 | **0** | 3,621 | 1 |
+| meton_04 | 2.8.0 | 462 | 3,595 | 7 |
+
+## What is still broken — and the correction to my earlier diagnosis
+
+I claimed a full `/rejected.log` *causes* the throughput collapse. **That was
+backwards.** 2.8 cleared the logs on first boot, and on the PC Sons fleet they
+**refilled to ~301 KB within ~1.5 h** and the devices are dropping again at the
+same ~1,880/h. A full log is a **symptom that then amplifies** the real problem,
+not the origin of it.
+
+The real variable is per-site delivery capacity:
+
+| Site | devices | readings/h **per device** |
+|---|---:|---:|
+| Meton | 1 | 3,372 |
+| Mark | 5 | 3,255 |
+| Aravind | 5 | 2,193 |
+| Shree Balaji | 2 | 1,690 |
+| **Vasa** | **1** | **1,684** |
+| **PC Sons** | **15** | **1,535** |
+
+Note Vasa: a **single** device that still only manages 1,684/h. So this is not
+device contention and not a shared-uplink bandwidth limit — it tracks the site's
+network round-trip. And the log-size gradient is monotonic *within* that
+(mark_pdc1 at 300 KB still does 2,984/h, far better than any pcs unit at the same
+log size), which is what a symptom looks like rather than a cause.
+
+## Root cause: no HTTP connection reuse
+
+`http_sender.h` opens and tears down a TCP connection for **every single
+reading**:
+
+```
+:982   http.begin(_httpServerUrl);   ... POST ...
+:986   http.end();
+:1023  http.begin(_httpServerUrl);   ... POST ...
+:1027  http.end();
+```
+
+There is **no `http.setReuse(true)`** anywhere in the file. So each 1 Hz reading
+pays a full TCP handshake + POST + response + teardown. On a site with ~200 ms
+RTT that is ~500–600 ms of the 1 s budget spent on connection setup, and any
+jitter pushes it over — the ring backs up, overflow lands in `/rejected.log`, the
+log fills, and the amplifier described above kicks in.
+
+Sites with a fast path to the server (Mark, Meton) stay under budget and run
+clean at 3,600/h. Sites with a slower path never do.
+
+**Suggested fix: `http.setReuse(true)`** on the live-POST client so the TCP
+connection persists across readings. This removes one full round-trip per
+reading and should roughly double effective throughput — very likely enough to
+put every current site under budget. The server supports keep-alive (nginx
+upstream keepalive is already deployed).
+
+If that is not sufficient on the slowest sites, the structural fix is to **batch
+N readings per live POST** (the LS02 bulk path already proves the server accepts
+batches), rather than one HTTP request per second per device.
+
+## Server side
+
+Unchanged and healthy: 6–8 ms ingest, `last_http_code: 200` fleet-wide, no rate
+limiting in nginx, idempotent ingest live. The `rejected-ndjson` drain endpoint
+has still never been exercised by a real device — the 2.8 backstop clears the
+log locally rather than uploading it, so those parked readings are being
+discarded rather than recovered. That is the accepted trade (Pranav: recovery
+must be certain), but worth stating plainly: **the drain path remains unproven in
+production.**
