@@ -105,6 +105,8 @@ static unsigned long _lastSuccessMs = 0;
 // Rejected-log drain state (machinery defined below processSendQueue)
 static volatile bool _rejectedDrainPending = false;
 static void drainOneRejectedFile();
+uint32_t getRejectedLogBytes();          // defined below; used by first-boot recovery backstop
+static void clearAllRejected();          // defined below; used by first-boot recovery backstop
 
 // Spinlocks — ONLY for simple variable read/write, NEVER for I/O
 static portMUX_TYPE _bufCntMux = portMUX_INITIALIZER_UNLOCKED;
@@ -119,6 +121,8 @@ static uint32_t _offlineFileSize = 0;
 static unsigned long _lastUploadAttempt = 0;
 static volatile bool _uploadPending = false;
 static unsigned long _bgUploadBlockedSince = 0;  // starvation timer for background uploads (Defect 1)
+static bool _rejRecoveryArmed = false;           // one-shot first-boot-after-update rejected-log recovery
+static unsigned long _rejRecoveryDeadline = 0;   // 0 = not started; set on first successful POST
 static volatile bool _offlineTestLock = false;  // Blocks probe during test
 
 // Block accumulator
@@ -854,6 +858,24 @@ void initHTTPSender(const String& serverUrl, const String& deviceId) {
             if (rejParked) {
                 _rejectedDrainPending = true;
                 Serial.println("[FS] Rejected data parked — drain queued for boot recovery");
+                // First boot after a firmware update? Arm the guaranteed-clear
+                // backstop (fires 2min after we're confirmed online, whether or
+                // not the drain finished). Version marker in NVS survives OTA, so
+                // this is strictly one-shot per new firmware. The drain above runs
+                // first and uploads losslessly; this only wipes what it couldn't.
+                Preferences vp; vp.begin("lscfg", false);
+                if (vp.getString("fwver", "") != FIRMWARE_VERSION) {
+                    vp.putString("fwver", FIRMWARE_VERSION);
+                    _rejRecoveryArmed = true;
+                    Serial.printf("[FS] First boot of %s — rejected recovery armed\n", FIRMWARE_VERSION);
+                }
+                vp.end();
+            } else {
+                // No parked data, but still stamp the version marker so a later
+                // boot that DOES accumulate parked data doesn't misfire recovery.
+                Preferences vp; vp.begin("lscfg", false);
+                if (vp.getString("fwver", "") != FIRMWARE_VERSION) vp.putString("fwver", FIRMWARE_VERSION);
+                vp.end();
             }
         }
         Serial.printf("[FS] LittleFS %u/%u bytes\n", LittleFS.usedBytes(), LittleFS.totalBytes());
@@ -1066,6 +1088,22 @@ void processSendQueue() {
         }
     }
 
+    // First-boot recovery backstop: guarantee the rejected store ends up empty
+    // even if the drain can't complete on a saturated unit. Start the grace timer
+    // only once the unit is confirmed online (a successful POST happened), so an
+    // offline unit never loses its parked rows; then, after the grace window, wipe
+    // whatever the lossless drain couldn't upload. Certain, drain-independent.
+    if (_rejRecoveryArmed) {
+        if (_rejRecoveryDeadline == 0) {
+            if (_lastSuccessMs != 0) _rejRecoveryDeadline = now + REJECTED_RECOVERY_CLEAR_MS;
+        } else if (now >= _rejRecoveryDeadline) {
+            uint32_t left = getRejectedLogBytes();
+            clearAllRejected();   // disarms _rejRecoveryArmed + _rejectedDrainPending
+            Serial.printf("[FS] First-boot recovery: rejected store cleared (%u bytes remained)\n", left);
+            logError("rejected store cleared by first-boot recovery backstop");
+        }
+    }
+
     // Background-upload window (Defect 1). Was hard-gated on bufCount()==0, which
     // deadlocked: a spotty-but-connected unit's ring never empties, so the offline
     // backlog and /rejected.log never uploaded (pcs1/pcs7 drained 0 bytes). Now the
@@ -1214,6 +1252,22 @@ static bool _postRejectedFile(const char* path) {
 // Only immutable archives are ever streamed; the active file is rotated first.
 void requestRejectedDrain() { _rejectedDrainPending = true; }
 bool isRejectedDrainPending() { return _rejectedDrainPending; }
+
+// Unconditional wipe of the entire rejected store (active + archives). Only ever
+// called by the first-boot recovery backstop below, AFTER the lossless drain has
+// had an online grace window — the guarantee that a unit wedged by the old
+// ring-empty gate cannot stay wedged, independent of whether the drain works.
+static void clearAllRejected() {
+    if (!_fsReady) return;
+    char p[24];
+    LittleFS.remove(REJECTED_LOG);
+    for (int n = 1; n <= REJECTED_ARCHIVE_MAX; n++) {
+        snprintf(p, sizeof(p), "/rejected.%d.log", n);
+        LittleFS.remove(p);
+    }
+    _rejectedDrainPending = false;
+    _rejRecoveryArmed = false;
+}
 
 static void drainOneRejectedFile() {
     // Give up after 10 consecutive failures (server missing the endpoint, etc.)
