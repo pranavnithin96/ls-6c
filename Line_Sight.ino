@@ -391,7 +391,10 @@ void loop() {
                     // outside the mutex — file I/O under bufferMutex starved Core 0's
                     // saveBufferToFlash and broke the <10ms hold invariant.
                     flushOverflowReading();
-                    setLEDState(LED_RUNNING);
+                    // Only force solid when actually connected — otherwise this
+                    // ran every reading and stomped the reconnecting blink back to
+                    // solid within ~1s (LED "blinked once then went solid").
+                    if (wifiConnected) setLEDState(LED_RUNNING);
                 } else {
                     // Should never happen (Core 0 holds <10ms, we wait 100ms)
                     // But if it does: store offline with proper timestamp tracking
