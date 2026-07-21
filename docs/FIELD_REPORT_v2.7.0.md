@@ -216,30 +216,47 @@ took 2.8 and can keep up are now clean:
 | mark_new_1 | 2.8.0 | **0** | 3,621 | 1 |
 | meton_04 | 2.8.0 | 462 | 3,595 | 7 |
 
-## What is still broken — and the correction to my earlier diagnosis
+## What is still broken — corrected analysis
 
-I claimed a full `/rejected.log` *causes* the throughput collapse. **That was
-backwards.** 2.8 cleared the logs on first boot, and on the PC Sons fleet they
-**refilled to ~301 KB within ~1.5 h** and the devices are dropping again at the
-same ~1,880/h. A full log is a **symptom that then amplifies** the real problem,
-not the origin of it.
+**Retraction:** an earlier revision of this section claimed the full
+`/rejected.log` was only a symptom, citing Vasa as a single-device site that was
+also slow. **Vasa does not run this hardware** — it has no ESP32 telemetry at all
+and should never have been in the comparison. With ESP32-only devices, the
+evidence points the other way.
 
-The real variable is per-site delivery capacity:
+**Within a single site, with the network held constant and all units on 2.8.0,
+throughput tracks `rejected_log_bytes` monotonically:**
 
-| Site | devices | readings/h **per device** |
-|---|---:|---:|
-| Meton | 1 | 3,372 |
-| Mark | 5 | 3,255 |
-| Aravind | 5 | 2,193 |
-| Shree Balaji | 2 | 1,690 |
-| **Vasa** | **1** | **1,684** |
-| **PC Sons** | **15** | **1,535** |
+| Mark device | RSSI | `rejected_log_bytes` | sent/h |
+|---|---:|---:|---:|
+| mark_new_pdc | −52 | **0** | **3,620** |
+| mark_new_1 | −76 | **0** | **3,620** |
+| mark_pdc | −53 | **0** | 3,594 |
+| mark_04 | −72 | 262,862 | 3,270 |
+| mark_pdc1 | −76 | 300,341 | 2,950 |
 
-Note Vasa: a **single** device that still only manages 1,684/h. So this is not
-device contention and not a shared-uplink bandwidth limit — it tracks the site's
-network round-trip. And the log-size gradient is monotonic *within* that
-(mark_pdc1 at 300 KB still does 2,984/h, far better than any pcs unit at the same
-log size), which is what a symptom looks like rather than a cause.
+Same gradient at Aravind (61 KB → 3,528; 70 KB → 3,508; 187 KB → 3,359).
+
+Crucially this is **not signal strength**: mark_new_1 at −76 dBm matches
+mark_new_pdc at −52 dBm exactly, and the PC Sons units span −46 to −76 dBm while
+all sitting at ~1,700/h. A full log slows the device; a cleared one does not.
+
+**So 2.8's backstop worked, and the devices that could keep up stayed clean.**
+The three Mark units at 0 bytes are the proof. The open question is narrower than
+I framed it: **why do some units overflow in the first place**, refilling the log
+the backstop cleared?
+
+Two things the data shows and one it does not:
+
+- **Shown:** PC Sons carries an *additional* penalty beyond log size — its units
+  sit at ~1,700/h while mark_pdc1 and sb1 manage 2,950 and 2,697 at the same
+  ~301 KB. Something site-specific compounds it (15 devices is the obvious
+  candidate, though this is not proven).
+- **Shown:** two units are separately sick on weak signal — aravind_03 (−90 dBm,
+  547/h) and sb2 (−87 dBm, 537/h, still on 2.6). Those are a different problem.
+- **Not shown:** a single isolated root cause for the initial overflow. I do not
+  have RTT-per-site measurements from the device side, and the server cannot see
+  them.
 
 ## Root cause: no HTTP connection reuse
 
@@ -263,9 +280,9 @@ Sites with a fast path to the server (Mark, Meton) stay under budget and run
 clean at 3,600/h. Sites with a slower path never do.
 
 **Suggested fix: `http.setReuse(true)`** on the live-POST client so the TCP
-connection persists across readings. This removes one full round-trip per
-reading and should roughly double effective throughput — very likely enough to
-put every current site under budget. The server supports keep-alive (nginx
+connection persists across readings. This removes one full round-trip per reading
+and is the cheapest available headroom — it does not depend on which of the
+theories above is right, because every device pays this cost on every reading. The server supports keep-alive (nginx
 upstream keepalive is already deployed).
 
 If that is not sufficient on the slowest sites, the structural fix is to **batch
