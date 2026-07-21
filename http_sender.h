@@ -98,6 +98,17 @@ static unsigned long _lastSendAttempt = 0;
 static int _backoffMs = 1000;
 static bool _httpDebug = false;
 static unsigned long _lastBufferSave = 0;
+
+// Persistent connection for the 1 Hz live path.
+//
+// A stack-local HTTPClient meant one TCP connect + teardown per reading. At 15
+// devices behind a single NAT that is ~900 connections/min, which pinned the
+// site router's translation table in LAST-ACK and cost PC Sons ~53% of its
+// readings (see docs/FIELD_REPORT_v2.7.0.md). These live at file scope so the
+// socket outlives each request; setReuse(true) in initHTTPSender() makes end()
+// keep the connection open instead of closing it.
+static WiFiClient _liveClient;
+static HTTPClient _liveHttp;
 static bool _fsReady = false;
 // Telemetry: last data-plane HTTP result + when a POST last succeeded (0 = never)
 static int _lastHttpCode = 0;
@@ -792,6 +803,11 @@ void initHTTPSender(const String& serverUrl, const String& deviceId) {
     _bulkUploadUrl = "http://46.224.90.187/api/data/bulk";
     _httpDeviceId = deviceId;
 
+    // Set once: begin() does not touch _reuse, so this survives every request.
+    _liveHttp.setReuse(true);
+    _liveHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    _liveHttp.setTimeout(HTTP_TIMEOUT_MS);
+
     for (int i = 0; i < MAX_BUFFER_SIZE; i++) _sendBuffer[i].used = false;
     _bufferCount = 0; _bufferHead = 0; _bufferTail = 0;
     if (!_rejMux) _rejMux = xSemaphoreCreateMutex();   // before any writeRejected is possible
@@ -962,6 +978,32 @@ void queueReading(const String& deviceId, const String& location, const String& 
 }
 
 // ====================================================================
+// LIVE POST — one pooled TCP connection, reused across readings
+// ====================================================================
+// end() is still called per request and MUST be: it calls clear(), which resets
+// the accumulated _headers so they don't duplicate on the next request. Under
+// setReuse(true) end() does NOT stop the socket — HTTPClient::disconnect()
+// takes the "tcp keep open for reuse" branch — so the connection survives and
+// the next begin()/POST reuses it via connect()'s already-connected fast path.
+static int _livePost(const char* body, uint16_t len) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        _liveHttp.begin(_liveClient, _httpServerUrl);
+        _liveHttp.addHeader("Content-Type", "application/json");
+        int code = _liveHttp.POST((uint8_t*)body, len);
+        _liveHttp.end();
+
+        if (code > 0 || attempt == 1) return code;
+
+        // A negative code on a pooled socket usually means the peer (or the
+        // NAT) dropped an idle keep-alive connection while we thought it was
+        // live. Discard it and try once more on a fresh one, so a reaped
+        // socket costs one retry rather than a dropped reading.
+        _liveClient.stop();
+    }
+    return 0;
+}
+
+// ====================================================================
 // PROCESS SEND QUEUE — Clean control flow, no goto
 // ====================================================================
 void processSendQueue() {
@@ -976,14 +1018,8 @@ void processSendQueue() {
         if (_offlineTestLock) return;  // Test in progress — don't probe
         unsigned long now = millis();
         if (now - _lastSendAttempt < 10000) return;
-        // Probe with a minimal POST
-        HTTPClient http;
-        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-        http.begin(_httpServerUrl);
-        http.addHeader("Content-Type", "application/json");
-        http.setTimeout(HTTP_TIMEOUT_MS);
-        int code = http.POST("{}");
-        http.end();
+        // Probe with a minimal POST, over the same pooled connection.
+        int code = _livePost("{}", 2);
         _lastSendAttempt = millis();
         if (code > 0) {  // Server responded (even 400 means it's reachable)
             Serial.printf("[HTTP] Server back (HTTP %d) — exiting offline mode\n", code);
@@ -1018,13 +1054,8 @@ void processSendQueue() {
                 continue;
             }
 
-            HTTPClient http;
-            http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-            http.begin(_httpServerUrl);
-            http.addHeader("Content-Type", "application/json");
-            http.setTimeout(HTTP_TIMEOUT_MS);
-            int httpCode = http.POST((uint8_t*)_sendBuffer[_bufferTail].json, _sendBuffer[_bufferTail].len);
-            http.end();
+            int httpCode = _livePost(_sendBuffer[_bufferTail].json,
+                                     _sendBuffer[_bufferTail].len);
             _lastSendAttempt = millis();
             _lastHttpCode = httpCode;
 
@@ -1065,7 +1096,7 @@ void processSendQueue() {
                     if (httpCode > 0) {
                         snprintf(errBuf, sizeof(errBuf), "HTTP %d", httpCode);
                     } else {
-                        snprintf(errBuf, sizeof(errBuf), "HTTP err: %s", http.errorToString(httpCode).c_str());
+                        snprintf(errBuf, sizeof(errBuf), "HTTP err: %s", _liveHttp.errorToString(httpCode).c_str());
                     }
                     logError(errBuf);
                 }
