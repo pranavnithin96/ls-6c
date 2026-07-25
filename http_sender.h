@@ -976,6 +976,7 @@ void queueReading(const String& deviceId, const String& location, const String& 
 // the next begin()/POST reuses it via connect()'s already-connected fast path.
 static int _livePost(const char* body, uint16_t len) {
     for (int attempt = 0; attempt < 2; attempt++) {
+        feedWatchdog();   // each attempt can block ~20s on a stalled peer
         _liveHttp.begin(_liveClient, _httpServerUrl);
         _liveHttp.addHeader("Content-Type", "application/json");
         int code = _liveHttp.POST((uint8_t*)body, len);

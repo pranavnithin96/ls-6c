@@ -61,9 +61,21 @@ void networkTask(void* param) {
         wifiConnected = isWiFiConnected();
 
         if (wifiConnected) {
+            // Feed the WDT BETWEEN subsystems, not just at the top of the
+            // cycle. Under a stalled router every endpoint stalls at once,
+            // and the serialized worst cases stack: _livePost ~40s (2
+            // attempts x connect 5s + write 10 retries x 1s select + read
+            // 5s, measured from the 2.0.17 core) + heartbeat ~20s + drain
+            // ~20s > the 60s WDT — the reboot-every-~100s loop observed at
+            // Meton 2026-07-25. No SINGLE call can reach 60s, so feeding
+            // between calls removes the accumulation trip while a genuine
+            // hang inside one call still resets, as a watchdog should.
             processSendQueue();   // Data POST — highest priority
+            esp_task_wdt_reset();
             heartbeatLoop();      // Heartbeat — every 60s
+            esp_task_wdt_reset();
             otaLoop();            // OTA check — every 1h
+            esp_task_wdt_reset();
         }
 
         // Buffer save runs ALWAYS, even when WiFi is down
