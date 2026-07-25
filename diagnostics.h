@@ -43,18 +43,28 @@ RTC_NOINIT_ATTR uint8_t _wdtCheckpointValid;   // 0xA5 = checkpoint is real
 #define WDT_CP_OTA         3
 #define WDT_CP_BUFSAVE     4
 #define WDT_CP_WIFI        5
+// Sub-sites inside processSendQueue — "during: processSendQueue" (meton_01,
+// 2026-07-25 08:10) left two suspects standing: the live POST's per-byte
+// response timeout and the backlog upload's unbounded streaming write. These
+// distinguish them.
+#define WDT_CP_LIVEPOST    6
+#define WDT_CP_OFFLINE_UP  7
+#define WDT_CP_REJ_DRAIN   8
 static inline void wdtCheckpoint(uint8_t cp) {
     _wdtCheckpoint = cp;
     _wdtCheckpointValid = 0xA5;
 }
 static const char* _wdtCheckpointName(uint8_t cp) {
     switch (cp) {
-        case WDT_CP_SENDQUEUE: return "processSendQueue";
-        case WDT_CP_HEARTBEAT: return "heartbeatLoop";
-        case WDT_CP_OTA:       return "otaLoop";
-        case WDT_CP_BUFSAVE:   return "periodicBufferSave";
-        case WDT_CP_WIFI:      return "wifi check";
-        default:               return "idle/unknown";
+        case WDT_CP_SENDQUEUE:  return "processSendQueue";
+        case WDT_CP_HEARTBEAT:  return "heartbeatLoop";
+        case WDT_CP_OTA:        return "otaLoop";
+        case WDT_CP_BUFSAVE:    return "periodicBufferSave";
+        case WDT_CP_WIFI:       return "wifi check";
+        case WDT_CP_LIVEPOST:   return "livePost";
+        case WDT_CP_OFFLINE_UP: return "offline upload";
+        case WDT_CP_REJ_DRAIN:  return "rejected drain";
+        default:                return "idle/unknown";
     }
 }
 

@@ -1010,7 +1010,9 @@ void processSendQueue() {
         unsigned long now = millis();
         if (now - _lastSendAttempt < 10000) return;
         // Probe with a minimal POST, over the same pooled connection.
+        wdtCheckpoint(WDT_CP_LIVEPOST);
         int code = _livePost("{}", 2);
+        wdtCheckpoint(WDT_CP_SENDQUEUE);
         _lastSendAttempt = millis();
         if (code > 0) {  // Server responded (even 400 means it's reachable)
             Serial.printf("[HTTP] Server back (HTTP %d) — exiting offline mode\n", code);
@@ -1045,8 +1047,10 @@ void processSendQueue() {
                 continue;
             }
 
+            wdtCheckpoint(WDT_CP_LIVEPOST);
             int httpCode = _livePost(_sendBuffer[_bufferTail].json,
                                      _sendBuffer[_bufferTail].len);
+            wdtCheckpoint(WDT_CP_SENDQUEUE);
             _lastSendAttempt = millis();
             _lastHttpCode = httpCode;
 
@@ -1175,12 +1179,16 @@ void processSendQueue() {
     }
 
     if (_uploadPending && ringQuiet && (now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS)) {
+        wdtCheckpoint(WDT_CP_OFFLINE_UP);
         uploadOfflineFile(_httpDeviceId);
+        wdtCheckpoint(WDT_CP_SENDQUEUE);
     } else if (_rejectedDrainPending && ringQuiet &&
                (_lastUploadAttempt == 0 || now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS)) {
         // Rejected-log drain: one immutable file per tick — offline backlog (raw
         // readings) always takes priority via the else-if.
+        wdtCheckpoint(WDT_CP_REJ_DRAIN);
         drainOneRejectedFile();
+        wdtCheckpoint(WDT_CP_SENDQUEUE);
     }
 }
 
