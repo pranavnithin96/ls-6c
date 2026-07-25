@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.11.0"
+#define FIRMWARE_VERSION "2.11.1"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -36,11 +36,18 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define MAX_BACKOFF_MS            5000    // Cap at 5s (was 30s — caused death spiral)
 #define MAX_SENDS_PER_LOOP        3
 #define DNS_CACHE_TTL_MS          300000  // 5 minutes
-// Total-deadline for one bulk POST (headers+body+status line). HTTPClient's
-// own guards bound INACTIVITY, not total time — a trickling uplink resets
-// them forever (Meton: one 64KB upload blocked >60s, "WDT during: offline
-// upload"). Must stay well under WDT_TIMEOUT_S; asserted in http_sender.h.
-#define BULK_POST_DEADLINE_MS     45000UL
+// Bulk POST guards. The watchdog is fed INSIDE the bounded loops, so the
+// total cap does NOT need to sit under WDT_TIMEOUT_S — only the stall abort
+// does (asserted in http_sender.h). v2.11.0's flat 45s deadline proved too
+// short in the field: a 50-64KB backlog file over Meton's ~600B/s trickle
+// needs ~85-110s, so every attempt aborted at 45s, delivered nothing (nginx
+// logged the premature closes as 400), and starved the live stream for the
+// full deadline. Abort only on a genuine stall — zero bytes accepted for
+// BULK_POST_STALL_MS — and cap the whole request at BULK_POST_MAX_MS, sized
+// so legacy 50KB rejected archives and 64KB offline chunks still complete
+// at trickle rates while bounding live-stream starvation.
+#define BULK_POST_STALL_MS        12000UL
+#define BULK_POST_MAX_MS          150000UL
 
 // --- Send Mode ---
 #define DEFAULT_SEND_INTERVAL    1  // seconds

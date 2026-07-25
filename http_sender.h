@@ -190,8 +190,13 @@ static inline void bufCountDec() {
 // ~301KB the fleet reports. REJECTED_MAX_BYTES is PER FILE, not a total cap — size
 // any alert threshold off ~300KB total, not 50KB.
 #define REJECTED_LOG "/rejected.log"
-#define REJECTED_MAX_BYTES 50000      // per-file rotate threshold (active hard-drops at 2×)
-#define REJECTED_ARCHIVE_MAX 4        // /rejected.1.log .. /rejected.4.log (~300KB total budget)
+// Rotate small: each archive is one drain unit, and a unit must be a bite a
+// trickling uplink can finish inside the stall/cap guards (8KB at Meton's
+// ~600B/s ≈ 14s). The old 50KB units needed ~85s and, under v2.11.0's flat
+// 45s deadline, could never complete — the drain wedged at 100% kept files.
+// Same ~300KB worst-case budget as before, split across more, smaller files.
+#define REJECTED_MAX_BYTES 8192       // per-file rotate threshold (active hard-drops at 2×)
+#define REJECTED_ARCHIVE_MAX 36       // /rejected.1.log .. /rejected.36.log (~300KB total budget)
 
 // Rotate the ACTIVE rejected.log into a FREE archive slot. Archives are
 // IMMUTABLE once created — never renamed, shifted, or overwritten; only the
@@ -681,24 +686,37 @@ static String _sessionLegacyPath = "";
 // keeps one 64KB sendRequest alive past the 60s task watchdog, and the
 // reboot manufactures more backlog for the next attempt (self-feeding).
 // This helper owns the socket directly: every wait is a 200ms select with
-// a WDT feed, every send is MSG_DONTWAIT (never blocks), and one deadline
-// covers the whole request. On deadline the file is simply kept for the
-// next tick — bounded latency, zero data loss.
-static_assert(BULK_POST_DEADLINE_MS < WDT_TIMEOUT_S * 1000UL,
-              "bulk POST deadline must finish (or abort) before the task WDT fires");
+// a WDT feed, every send is MSG_DONTWAIT (never blocks). Two guards, both
+// progress-based (v2.11.0's flat total deadline aborted every attempt on a
+// link slower than filesize/deadline — delivering nothing, forever): a
+// STALL abort when zero bytes move for BULK_POST_STALL_MS, and a generous
+// total cap that bounds live-stream starvation. On abort the file is kept
+// for the next tick — bounded latency, zero data loss. The WDT only needs
+// the stall bound: it is fed every 200ms round while anything moves.
+static_assert(BULK_POST_STALL_MS < WDT_TIMEOUT_S * 1000UL,
+              "a stalled bulk POST must abort before the task WDT fires");
+
+// Bytes the socket accepted (or response bytes received) during the current
+// _boundedBulkPost. Callers use it to distinguish "slow link, real progress"
+// from "wedged": a partial delivery must pacify the dispose backstop and the
+// drain's give-up counter, or a merely-slow link gets treated as stuck.
+static uint32_t _bpBytesMoved = 0;
 
 static bool _bpSendAll(int fd, const uint8_t* buf, size_t len, unsigned long startMs) {
     size_t off = 0;
+    unsigned long lastProgress = millis();
     while (off < len) {
-        if (millis() - startMs >= BULK_POST_DEADLINE_MS) return false;
+        unsigned long now = millis();
+        if (now - startMs >= BULK_POST_MAX_MS) return false;
+        if (now - lastProgress >= BULK_POST_STALL_MS) return false;
         fd_set w; FD_ZERO(&w); FD_SET(fd, &w);
         struct timeval tv = {0, 200000};   // 200ms writability wait per round
         int s = select(fd + 1, NULL, &w, NULL, &tv);
         feedWatchdog();
         if (s < 0) return false;
-        if (s == 0) continue;              // not writable yet — deadline still runs
+        if (s == 0) continue;              // not writable yet — stall clock runs
         int n = send(fd, buf + off, len - off, MSG_DONTWAIT);
-        if (n > 0) { off += (size_t)n; continue; }
+        if (n > 0) { off += (size_t)n; _bpBytesMoved += (uint32_t)n; lastProgress = millis(); continue; }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         return false;                      // peer reset / socket error
     }
@@ -710,6 +728,7 @@ static bool _bpSendAll(int fd, const uint8_t* buf, size_t len, unsigned long sta
 // request line are built here). Returns the HTTP status code, or a negative
 // HTTPClient-style error so callers' existing handling applies unchanged.
 static int _boundedBulkPost(File* body, size_t bodyLen, const char* extraHeaders) {
+    _bpBytesMoved = 0;
     WiFiClient c;
     if (!c.connect("46.224.90.187", 80, 5000)) return HTTPC_ERROR_CONNECTION_REFUSED;
     int fd = c.fd();
@@ -739,10 +758,14 @@ static int _boundedBulkPost(File* body, size_t bodyLen, const char* extraHeaders
     }
 
     // Status line only ("HTTP/1.1 200 OK") — we close the connection anyway,
-    // so the body is irrelevant. Same total deadline, no per-byte reset.
+    // so the body is irrelevant. Same stall/cap guards; a byte received is
+    // progress for the stall clock but resets it only on actual arrival.
     char line[64]; size_t ll = 0;
+    unsigned long lastRecv = millis();
     while (true) {
-        if (millis() - start >= BULK_POST_DEADLINE_MS) { c.stop(); return HTTPC_ERROR_READ_TIMEOUT; }
+        unsigned long now = millis();
+        if (now - start >= BULK_POST_MAX_MS) { c.stop(); return HTTPC_ERROR_READ_TIMEOUT; }
+        if (now - lastRecv >= BULK_POST_STALL_MS) { c.stop(); return HTTPC_ERROR_READ_TIMEOUT; }
         fd_set rf; FD_ZERO(&rf); FD_SET(fd, &rf);
         struct timeval tv = {0, 200000};
         int s = select(fd + 1, &rf, NULL, NULL, &tv);
@@ -755,6 +778,7 @@ static int _boundedBulkPost(File* body, size_t bodyLen, const char* extraHeaders
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
             c.stop(); return HTTPC_ERROR_READ_TIMEOUT;   // closed before status line
         }
+        _bpBytesMoved++; lastRecv = millis();
         if (ch == '\n') break;
         if (ll < sizeof(line) - 1) line[ll++] = ch;
     }
@@ -1459,9 +1483,16 @@ static void drainOneRejectedFile() {
             _rejLastProgressMs = millis();   // delivered a file — restart the stall clock
         } else {
             _lastUploadAttempt = millis();
-            if (++drainFails >= 10) {
+            if (_bpBytesMoved > 0) {
+                // Partial delivery: the link is slow, not wedged. Pacify the
+                // dispose backstop and the give-up counter — a merely-slow
+                // link must never get its backlog binned or its drain parked.
+                _rejLastProgressMs = millis();
+                drainFails = 0;
+            } else if (++drainFails >= 10) {
                 drainFails = 0;
                 _rejectedDrainPending = false;
+                _rejRecoveryArmed = false;   // let the next live 200 re-arm the drain
                 logError("rejected drain aborted after 10 failures — files kept");
             }
         }
