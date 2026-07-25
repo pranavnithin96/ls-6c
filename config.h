@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.9.0"
+#define FIRMWARE_VERSION "2.10.0"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -94,6 +94,13 @@ static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
               "REJECTED_STALL_MS must outlast BG_UPLOAD_STARVE_MS, or a ring-blocked "
               "drain is disposed before the starvation escape ever lets it run");
 #define BUFFER_SAVE_INTERVAL_MS  60000   // 60 seconds (minimize power-loss data window)
+// Trouble cadence for the same save: while sending is failing (or WiFi is
+// down) the RAM ring flushes to flash every 5 s instead of 60 s. A network
+// bad enough to starve the watchdog reboots the device before the healthy
+// cadence ever fires — Meton 2026-07-25: ~100 s reboot loop x 60 s cadence
+// ate ~50% of a day's readings, all of it RAM-only ring. Healthy devices
+// never take this path, so steady-state flash wear is unchanged.
+#define TROUBLE_SAVE_INTERVAL_MS 5000
 
 // --- Heartbeat ---
 #define HEARTBEAT_INTERVAL_MS 60000

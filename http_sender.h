@@ -116,6 +116,7 @@ static unsigned long _lastSuccessMs = 0;
 // Rejected-log drain state (machinery defined below processSendQueue)
 static volatile bool _rejectedDrainPending = false;
 static void drainOneRejectedFile();
+static void troubleSave();               // defined below; called from processSendQueue
 uint32_t getRejectedLogBytes();          // defined below; used by first-boot recovery backstop
 static void clearAllRejected();          // defined below; used by first-boot recovery backstop
 
@@ -997,6 +998,7 @@ static int _livePost(const char* body, uint16_t len) {
 void processSendQueue() {
     if (WiFi.status() != WL_CONNECTED) {
         if (_wifiDownSince == 0) _wifiDownSince = millis();
+        troubleSave();   // ring -> flash while the link is down (<=5 s exposure)
         return;
     }
     _wifiDownSince = 0;
@@ -1155,6 +1157,11 @@ void processSendQueue() {
     // blocked for BG_UPLOAD_STARVE_MS. Still one file per tick, still rate-limited
     // by OFFLINE_UPLOAD_RETRY_MS, so Core-0 hold stays bounded. Fresh readings keep
     // priority up to the low-water mark; the forced path costs ~1 send slot/2min.
+    // Send trouble (failing/backing off with data still queued): get the ring
+    // onto flash NOW rather than at the healthy 60 s cadence — the reboot
+    // that a hostile network can trigger never waits for the schedule.
+    if (_consecutiveFailures > 0) troubleSave();
+
     bool ringQuiet = (bufCount() <= BG_UPLOAD_LOWATER);
     if (!ringQuiet && (_uploadPending || _rejectedDrainPending)) {
         if (_bgUploadBlockedSince == 0) _bgUploadBlockedSince = now;
@@ -1174,6 +1181,26 @@ void processSendQueue() {
         // readings) always takes priority via the else-if.
         drainOneRejectedFile();
     }
+}
+
+// Trouble save — the crash-proofing half of the buffer story. The healthy
+// 60 s periodicBufferSave cadence assumed the device stays up between saves;
+// a network bad enough to starve the watchdog breaks that assumption by
+// rebooting the device every ~100 s, and each reset ate the RAM-only ring
+// (~30 s of readings) — measured at Meton as ~50% of a day's data across
+// ~850 resets. So during ANY send trouble the ring flushes to flash every
+// TROUBLE_SAVE_INTERVAL_MS: a watchdog reset now costs <=5 s of readings,
+// which boot's loadBufferFromFlash() + the server's idempotent ingest
+// (double-sends dedup on the unique index) turn into zero net loss.
+// Healthy paths never call this, so steady-state flash wear is unchanged;
+// during trouble it is one bounded temp-file write per 5 s.
+static unsigned long _lastTroubleSave = 0;
+static void troubleSave() {
+    if (bufCount() == 0) return;
+    unsigned long now = millis();
+    if (now - _lastTroubleSave < TROUBLE_SAVE_INTERVAL_MS) return;
+    _lastTroubleSave = now;
+    saveBufferToFlash();
 }
 
 // Periodic buffer save — must be called from Core 0 regardless of WiFi state
