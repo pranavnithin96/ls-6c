@@ -7,6 +7,7 @@
 #include "ct_sensor.h"
 
 #include <esp32/rom/miniz.h>
+#include <lwip/sockets.h>
 
 // Forward declarations
 void logError(const String& message);
@@ -670,6 +671,101 @@ static bool _offline422Retried = false;
 // correctly demotes it to anchor-stale. Cleared when the file is removed/renamed.
 static String _sessionLegacyPath = "";
 
+// ====================================================================
+// BOUNDED BULK POST — total-deadline HTTP for the backlog paths
+// ====================================================================
+// Convicted by the WDT breadcrumb ("WDT during: offline upload", meton_01
+// 2026-07-25): HTTPClient bounds INACTIVITY, not total time. Its response
+// wait resets on every received byte, and WiFiClient::write's retry
+// counter resets whenever any bytes go out — so an uplink that trickles
+// keeps one 64KB sendRequest alive past the 60s task watchdog, and the
+// reboot manufactures more backlog for the next attempt (self-feeding).
+// This helper owns the socket directly: every wait is a 200ms select with
+// a WDT feed, every send is MSG_DONTWAIT (never blocks), and one deadline
+// covers the whole request. On deadline the file is simply kept for the
+// next tick — bounded latency, zero data loss.
+static_assert(BULK_POST_DEADLINE_MS < WDT_TIMEOUT_S * 1000UL,
+              "bulk POST deadline must finish (or abort) before the task WDT fires");
+
+static bool _bpSendAll(int fd, const uint8_t* buf, size_t len, unsigned long startMs) {
+    size_t off = 0;
+    while (off < len) {
+        if (millis() - startMs >= BULK_POST_DEADLINE_MS) return false;
+        fd_set w; FD_ZERO(&w); FD_SET(fd, &w);
+        struct timeval tv = {0, 200000};   // 200ms writability wait per round
+        int s = select(fd + 1, NULL, &w, NULL, &tv);
+        feedWatchdog();
+        if (s < 0) return false;
+        if (s == 0) continue;              // not writable yet — deadline still runs
+        int n = send(fd, buf + off, len - off, MSG_DONTWAIT);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        return false;                      // peer reset / socket error
+    }
+    return true;
+}
+
+// POST a LittleFS file to the bulk endpoint under one total deadline.
+// extraHeaders: fully formed "Name: value\r\n" lines (Content-Length and the
+// request line are built here). Returns the HTTP status code, or a negative
+// HTTPClient-style error so callers' existing handling applies unchanged.
+static int _boundedBulkPost(File* body, size_t bodyLen, const char* extraHeaders) {
+    WiFiClient c;
+    if (!c.connect("46.224.90.187", 80, 5000)) return HTTPC_ERROR_CONNECTION_REFUSED;
+    int fd = c.fd();
+    unsigned long start = millis();
+
+    char hdr[640];
+    int hl = snprintf(hdr, sizeof(hdr),
+        "POST /api/data/bulk HTTP/1.1\r\n"
+        "Host: 46.224.90.187\r\n"
+        "Connection: close\r\n"
+        "Content-Length: %u\r\n"
+        "%s\r\n",
+        (unsigned)bodyLen, extraHeaders);
+    if (hl <= 0 || hl >= (int)sizeof(hdr)) { c.stop(); return HTTPC_ERROR_SEND_HEADER_FAILED; }
+    if (!_bpSendAll(fd, (const uint8_t*)hdr, (size_t)hl, start)) {
+        c.stop(); return HTTPC_ERROR_SEND_HEADER_FAILED;
+    }
+
+    uint8_t chunk[1024];
+    size_t remaining = bodyLen;
+    while (remaining > 0) {
+        size_t want = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+        size_t r = body->read(chunk, want);
+        if (r == 0) { c.stop(); return HTTPC_ERROR_SEND_PAYLOAD_FAILED; }
+        if (!_bpSendAll(fd, chunk, r, start)) { c.stop(); return HTTPC_ERROR_SEND_PAYLOAD_FAILED; }
+        remaining -= r;
+    }
+
+    // Status line only ("HTTP/1.1 200 OK") — we close the connection anyway,
+    // so the body is irrelevant. Same total deadline, no per-byte reset.
+    char line[64]; size_t ll = 0;
+    while (true) {
+        if (millis() - start >= BULK_POST_DEADLINE_MS) { c.stop(); return HTTPC_ERROR_READ_TIMEOUT; }
+        fd_set rf; FD_ZERO(&rf); FD_SET(fd, &rf);
+        struct timeval tv = {0, 200000};
+        int s = select(fd + 1, &rf, NULL, NULL, &tv);
+        feedWatchdog();
+        if (s < 0) { c.stop(); return HTTPC_ERROR_READ_TIMEOUT; }
+        if (s == 0) continue;
+        char ch;
+        int n = recv(fd, &ch, 1, MSG_DONTWAIT);
+        if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+            c.stop(); return HTTPC_ERROR_READ_TIMEOUT;   // closed before status line
+        }
+        if (ch == '\n') break;
+        if (ll < sizeof(line) - 1) line[ll++] = ch;
+    }
+    line[ll] = 0;
+    c.stop();
+
+    const char* sp = strchr(line, ' ');
+    int code = sp ? atoi(sp + 1) : 0;
+    return code > 0 ? code : HTTPC_ERROR_READ_TIMEOUT;
+}
+
 bool uploadOfflineFile(const String& deviceId) {
     if (!_fsReady) { _uploadPending = false; return true; }
 
@@ -724,34 +820,32 @@ bool uploadOfflineFile(const String& deviceId) {
     // reading_epoch = boot_epoch + block.start_millis/1000 + reading_index.
     uint32_t ntpEpoch; bool ntpValid = currentEpoch(ntpEpoch);
 
-    HTTPClient http;
-    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    http.begin(_bulkUploadUrl);
-    http.addHeader("Content-Type", "application/octet-stream");
-    http.addHeader("X-Device-Id", deviceId);
-    http.addHeader("X-Format", "ls02-blocked");           // advisory only; server dispatches on body magic
-    http.addHeader("X-Ntp-Epoch", String(ntpEpoch));
-    http.addHeader("X-Ntp-Millis", String(millis()));
-    http.addHeader("X-Ntp-Valid", ntpValid ? "1" : "0");
     // Anchor validity: the millis-based re-stamp formula only holds when the
     // blocks were written THIS boot session — i.e. only for the slot we rotated
     // at upload time above. Boot-rotated/recovered files carry start_millis from
     // an earlier session and must be staged, not re-stamped.
     bool sameSession = (target == _sessionLegacyPath) && _anchorSameSession;
-    http.addHeader("X-Anchor-Valid", (sameSession && ntpValid) ? "1" : "0");
-    // Positional stamping is interval-relative, not 1Hz: readings within a block
-    // are getSendInterval() seconds apart (runtime-configurable 1-60s via portal
-    // or heartbeat set_interval). Decoder multiplies the index by this. Best-effort:
-    // exact unless the interval changed while this file was being written.
-    http.addHeader("X-Interval", String(getSendInterval()));
-    // NO manual Content-Length: sendRequest(type, Stream*, size) emits its own,
-    // and addHeader doesn't dedupe it — two Content-Length headers get the whole
-    // upload 400'd by strict proxies (request-smuggling defense) → quarantine loop.
-    http.setTimeout(30000);
+    // X-Interval: positional stamping is interval-relative, not 1Hz — readings
+    // within a block are getSendInterval() seconds apart (runtime-configurable
+    // 1-60s via portal or heartbeat set_interval). Decoder multiplies the index
+    // by this. Best-effort: exact unless the interval changed mid-file.
+    char xhdrs[384];
+    snprintf(xhdrs, sizeof(xhdrs),
+        "Content-Type: application/octet-stream\r\n"
+        "X-Device-Id: %s\r\n"
+        "X-Format: ls02-blocked\r\n"
+        "X-Ntp-Epoch: %u\r\n"
+        "X-Ntp-Millis: %lu\r\n"
+        "X-Ntp-Valid: %s\r\n"
+        "X-Anchor-Valid: %s\r\n"
+        "X-Interval: %d\r\n",
+        deviceId.c_str(), (unsigned)ntpEpoch, (unsigned long)millis(),
+        ntpValid ? "1" : "0",
+        (sameSession && ntpValid) ? "1" : "0",
+        getSendInterval());
 
-    int httpCode = http.sendRequest("POST", &uf, fileSize);
+    int httpCode = _boundedBulkPost(&uf, fileSize, xhdrs);
     uf.close();
-    http.end();
     _lastUploadAttempt = millis();
     _lastHttpCode = httpCode;
     if (httpCode == 200) _lastSuccessMs = millis();
@@ -1304,16 +1398,14 @@ static bool _postRejectedFile(const char* path) {
     size_t sz = f.size();
     if (sz == 0) { f.close(); LittleFS.remove(path); return true; }
 
-    HTTPClient http;
-    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    http.begin(_bulkUploadUrl);
-    http.addHeader("Content-Type", "application/x-ndjson");
-    http.addHeader("X-Device-Id", _httpDeviceId);
-    http.addHeader("X-Format", "rejected-ndjson");
-    http.setTimeout(30000);
-    int code = http.sendRequest("POST", &f, sz);
+    char xhdrs[192];
+    snprintf(xhdrs, sizeof(xhdrs),
+        "Content-Type: application/x-ndjson\r\n"
+        "X-Device-Id: %s\r\n"
+        "X-Format: rejected-ndjson\r\n",
+        _httpDeviceId.c_str());
+    int code = _boundedBulkPost(&f, sz, xhdrs);
     f.close();
-    http.end();
     if (code == 200) {
         Serial.printf("[REJECTED] Uploaded %s (%u bytes)\n", path, (unsigned)sz);
         LittleFS.remove(path);

@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.10.3"
+#define FIRMWARE_VERSION "2.11.0"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -36,6 +36,11 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define MAX_BACKOFF_MS            5000    // Cap at 5s (was 30s — caused death spiral)
 #define MAX_SENDS_PER_LOOP        3
 #define DNS_CACHE_TTL_MS          300000  // 5 minutes
+// Total-deadline for one bulk POST (headers+body+status line). HTTPClient's
+// own guards bound INACTIVITY, not total time — a trickling uplink resets
+// them forever (Meton: one 64KB upload blocked >60s, "WDT during: offline
+// upload"). Must stay well under WDT_TIMEOUT_S; asserted in http_sender.h.
+#define BULK_POST_DEADLINE_MS     45000UL
 
 // --- Send Mode ---
 #define DEFAULT_SEND_INTERVAL    1  // seconds
