@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.11.1"
+#define FIRMWARE_VERSION "2.11.2"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -47,7 +47,19 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 // so legacy 50KB rejected archives and 64KB offline chunks still complete
 // at trickle rates while bounding live-stream starvation.
 #define BULK_POST_STALL_MS        12000UL
-#define BULK_POST_MAX_MS          150000UL
+// Response wait is a SEPARATE, longer guard: send() success only means bytes
+// entered the device's ~5.7KB TCP send buffer, not that they reached the
+// server — after the "last" send, that tail still needs 10-60s to crawl out
+// over a trickling uplink, and the server cannot respond until it has every
+// byte. v2.11.1 reused the 12s stall here and hung up on its own uploads
+// (nginx 499s, zero deliveries, bandwidth fully wasted). 60s covers the tail
+// at ≥100B/s; the server itself answers in ~11ms.
+#define BULK_RESPONSE_WAIT_MS     60000UL
+// Total cap: worst-case send at trickle + tail drain + response. Legacy
+// 50-100KB archives (pre-8KB rotation) need most of this once; steady-state
+// 8KB units finish in seconds. WDT is fed throughout — the cap bounds live-
+// stream starvation, not the watchdog.
+#define BULK_POST_MAX_MS          300000UL
 
 // --- Send Mode ---
 #define DEFAULT_SEND_INTERVAL    1  // seconds

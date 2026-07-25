@@ -758,14 +758,17 @@ static int _boundedBulkPost(File* body, size_t bodyLen, const char* extraHeaders
     }
 
     // Status line only ("HTTP/1.1 200 OK") — we close the connection anyway,
-    // so the body is irrelevant. Same stall/cap guards; a byte received is
-    // progress for the stall clock but resets it only on actual arrival.
+    // so the body is irrelevant. The wait uses BULK_RESPONSE_WAIT_MS, not the
+    // send-side stall: our "sent" body may still be draining out of the ~5.7KB
+    // TCP send buffer for tens of seconds on a trickling uplink, and the
+    // server cannot answer until the last byte lands. Hanging up early here
+    // wastes the ENTIRE upload (v2.11.1: nginx 499s, zero deliveries).
     char line[64]; size_t ll = 0;
     unsigned long lastRecv = millis();
     while (true) {
         unsigned long now = millis();
         if (now - start >= BULK_POST_MAX_MS) { c.stop(); return HTTPC_ERROR_READ_TIMEOUT; }
-        if (now - lastRecv >= BULK_POST_STALL_MS) { c.stop(); return HTTPC_ERROR_READ_TIMEOUT; }
+        if (now - lastRecv >= BULK_RESPONSE_WAIT_MS) { c.stop(); return HTTPC_ERROR_READ_TIMEOUT; }
         fd_set rf; FD_ZERO(&rf); FD_SET(fd, &rf);
         struct timeval tv = {0, 200000};
         int s = select(fd + 1, &rf, NULL, NULL, &tv);
