@@ -70,17 +70,22 @@ void networkTask(void* param) {
             // Meton 2026-07-25. No SINGLE call can reach 60s, so feeding
             // between calls removes the accumulation trip while a genuine
             // hang inside one call still resets, as a watchdog should.
+            wdtCheckpoint(WDT_CP_SENDQUEUE);
             processSendQueue();   // Data POST — highest priority
             esp_task_wdt_reset();
+            wdtCheckpoint(WDT_CP_HEARTBEAT);
             heartbeatLoop();      // Heartbeat — every 60s
             esp_task_wdt_reset();
+            wdtCheckpoint(WDT_CP_OTA);
             otaLoop();            // OTA check — every 1h
             esp_task_wdt_reset();
         }
 
         // Buffer save runs ALWAYS, even when WiFi is down
         // (processSendQueue skips this when disconnected)
+        wdtCheckpoint(WDT_CP_BUFSAVE);
         periodicBufferSave();
+        wdtCheckpoint(WDT_CP_IDLE);
 
         diagnosticsLoop();
         scheduledRebootLoop();    // 7-day maintenance reboot, safe-gated

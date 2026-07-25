@@ -28,6 +28,36 @@ bool isRejectedDrainPending();
 
 static uint32_t _crashCount = 0;
 
+// WDT breadcrumb: which network call was executing when the task watchdog
+// fired. RTC_NOINIT survives every reset except full power loss, so the
+// post-reboot boot can NAME the blocking site instead of us theorizing
+// about it (the 2.10.1 inter-call feeds disproved the accumulation theory
+// at Meton — a SINGLE call blocks >60s; this instrument identifies which).
+// Written by the network task around each subsystem call; reported through
+// logError -> device_error_log on the next boot after a task-WDT reset.
+RTC_NOINIT_ATTR uint8_t _wdtCheckpoint;
+RTC_NOINIT_ATTR uint8_t _wdtCheckpointValid;   // 0xA5 = checkpoint is real
+#define WDT_CP_IDLE        0
+#define WDT_CP_SENDQUEUE   1
+#define WDT_CP_HEARTBEAT   2
+#define WDT_CP_OTA         3
+#define WDT_CP_BUFSAVE     4
+#define WDT_CP_WIFI        5
+static inline void wdtCheckpoint(uint8_t cp) {
+    _wdtCheckpoint = cp;
+    _wdtCheckpointValid = 0xA5;
+}
+static const char* _wdtCheckpointName(uint8_t cp) {
+    switch (cp) {
+        case WDT_CP_SENDQUEUE: return "processSendQueue";
+        case WDT_CP_HEARTBEAT: return "heartbeatLoop";
+        case WDT_CP_OTA:       return "otaLoop";
+        case WDT_CP_BUFSAVE:   return "periodicBufferSave";
+        case WDT_CP_WIFI:      return "wifi check";
+        default:               return "idle/unknown";
+    }
+}
+
 void initDiagnostics() {
     _bootTime = millis();
 
@@ -63,6 +93,17 @@ void initDiagnostics() {
 
     Serial.printf("[DIAG] Boot: %s | Crashes: %u | Heap: %u\n",
         _bootReasonStr.c_str(), _crashCount, ESP.getFreeHeap());
+
+    // Report the WDT breadcrumb from the PREVIOUS boot, then clear it. Queued
+    // via logError so it reaches device_error_log on the first heartbeat.
+    if (reason == ESP_RST_TASK_WDT && _wdtCheckpointValid == 0xA5) {
+        char cpMsg[48];
+        snprintf(cpMsg, sizeof(cpMsg), "WDT during: %s",
+                 _wdtCheckpointName(_wdtCheckpoint));
+        logError(cpMsg);
+    }
+    _wdtCheckpoint = WDT_CP_IDLE;
+    _wdtCheckpointValid = 0xA5;
 }
 
 void feedWatchdog() { esp_task_wdt_reset(); }
