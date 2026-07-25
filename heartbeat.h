@@ -200,6 +200,12 @@ void processCommands(const String& responseBody) {
             recoverRejectedFiles();          // re-queue quarantined offline files
         } else if (action == "upload_rejected_log") {
             requestRejectedDrain();          // drained one file per tick by processSendQueue
+        } else if (action == "pause_drain") {
+            setDrainEnabled(false);          // keep backlog on flash, stop spending uplink on it
+        } else if (action == "resume_drain") {
+            setDrainEnabled(true);
+        } else if (action == "clear_rejected") {
+            clearRejectedStore();            // DESTRUCTIVE: discards parked backlog
         } else if (action == "set_reboot_days") {
             int val = cmd["value"] | -1;     // 0 disables; max 45 (millis rollover at 49.7d)
             if (val >= 0 && val <= 45) {

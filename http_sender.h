@@ -116,8 +116,12 @@ static int _lastHttpCode = 0;
 static unsigned long _lastSuccessMs = 0;
 // Rejected-log drain state (machinery defined below processSendQueue)
 static volatile bool _rejectedDrainPending = false;
+// Operator drain-pause (see setDrainEnabled below): declared here because
+// processSendQueue gates on it long before those helpers are defined.
+static bool _drainEnabled = true;
 static void drainOneRejectedFile();
 static void troubleSave();               // defined below; called from processSendQueue
+void loadDrainEnabled();                 // defined below; restores the operator drain-pause flag
 uint32_t getRejectedLogBytes();          // defined below; used by first-boot recovery backstop
 static void clearAllRejected();          // defined below; used by first-boot recovery backstop
 
@@ -928,6 +932,7 @@ void initHTTPSender(const String& serverUrl, const String& deviceId) {
     _httpServerUrl = "http://46.224.90.187/api/data";
     _bulkUploadUrl = "http://46.224.90.187/api/data/bulk";
     _httpDeviceId = deviceId;
+    loadDrainEnabled();   // operator pause survives reboots and OTAs
 
     // Set once: begin() does not touch _reuse, so this survives every request.
     _liveHttp.setReuse(true);
@@ -1256,7 +1261,10 @@ void processSendQueue() {
     // The online test is unchanged: dispose requires a live 200 inside the window,
     // so a genuine outage never costs parked rows — going offline parks the clock
     // and it restarts on reconnect.
-    if (_rejRecoveryArmed) {
+    // Paused drain must also pause the dispose backstop: with no drain running
+    // there is trivially "no progress", and the backstop would bin the very
+    // backlog the pause exists to preserve.
+    if (_rejRecoveryArmed && _drainEnabled) {
         bool online = (_lastSuccessMs != 0 &&
                        (now - _lastSuccessMs) < REJECTED_ONLINE_WINDOW_MS);
         if (!online) {
@@ -1303,7 +1311,7 @@ void processSendQueue() {
         wdtCheckpoint(WDT_CP_OFFLINE_UP);
         uploadOfflineFile(_httpDeviceId);
         wdtCheckpoint(WDT_CP_SENDQUEUE);
-    } else if (_rejectedDrainPending && ringQuiet &&
+    } else if (_drainEnabled && _rejectedDrainPending && ringQuiet &&
                (_lastUploadAttempt == 0 || now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS)) {
         // Rejected-log drain: one immutable file per tick — offline backlog (raw
         // readings) always takes priority via the else-if.
@@ -1450,6 +1458,36 @@ static bool _postRejectedFile(const char* path) {
 // Only immutable archives are ever streamed; the active file is rotated first.
 void requestRejectedDrain() { _rejectedDrainPending = true; }
 bool isRejectedDrainPending() { return _rejectedDrainPending; }
+
+// Operator escape hatches for a site whose uplink cannot carry live data AND
+// backlog recovery at the same time. PC Sons 2026-07-25: 19 devices, 8.7MB of
+// parked backlog, drain delivering ~4.5MB/h while overflow created ~4.8MB/h —
+// a stable equilibrium that never resolves and holds live capture at ~80%
+// (the same link had run 99.9% for the previous 22 hours). The dispose
+// backstop cannot break it: the drain IS making progress, just not enough.
+//
+// setDrainEnabled(false) keeps the data on flash but stops spending uplink on
+// it, which hands the bandwidth back to live capture — reversible, lossless,
+// and the right first move. clearRejectedStore() is the deliberate discard for
+// when that backlog is known to be unrecoverable; it is destructive, so it
+// exists only as an explicit operator command and is never self-triggered.
+void setDrainEnabled(bool on) {
+    _drainEnabled = on;
+    Preferences p; p.begin("lscfg", false); p.putBool("drainen", on); p.end();
+    logError(on ? "rejected drain ENABLED by operator" : "rejected drain PAUSED by operator");
+}
+bool isDrainEnabled() { return _drainEnabled; }
+void loadDrainEnabled() {
+    Preferences p; p.begin("lscfg", true); _drainEnabled = p.getBool("drainen", true); p.end();
+}
+void clearRejectedStore() {
+    uint32_t left = getRejectedLogBytes();
+    clearAllRejected();
+    char msg[64];
+    snprintf(msg, sizeof(msg), "rejected store cleared by operator (%u bytes)", left);
+    logError(msg);
+    Serial.printf("[FS] %s\n", msg);
+}
 
 // Unconditional wipe of the entire rejected store (active + archives). Only ever
 // called by the first-boot recovery backstop below, AFTER the lossless drain has
