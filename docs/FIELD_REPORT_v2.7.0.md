@@ -298,3 +298,55 @@ log locally rather than uploading it, so those parked readings are being
 discarded rather than recovered. That is the accepted trade (Pranav: recovery
 must be certain), but worth stating plainly: **the drain path remains unproven in
 production.**
+
+---
+
+# Resolution — 2026-07-26
+
+Both open questions above are now answered with measurements.
+
+## "PC Sons carries an additional penalty ... still unexplained"
+
+It is **latency**, and the site is not bandwidth-constrained in any sense.
+
+- Whole site consumes **75 kbps** across 19 devices (live + drain) — about 1% of
+  the link. Adding bandwidth would change nothing.
+- Kernel TCP stats to their gateway: **RTT 500–800 ms, rttvar 170–590 ms**
+  (healthy is 20–50 ms). High and very jittery.
+- The live path sends **one reading per HTTP request**, serialised on the pooled
+  connection, so each device is capped at one reading per round trip. All 19
+  devices converge on **0.589–0.600 readings/s** — a 2% spread, which is the
+  signature of a deterministic shared limit rather than congestion.
+
+So the per-site "delivery capacity" the report identified is really
+round-trips-per-second, not throughput. That is why a single-device site can be
+slow while another single-device site is fast: it tracks path latency, not load.
+
+## "The drain path remains unproven in production"
+
+Comprehensively proven, and load-bearing. On the same link, same hour:
+
+| Transport | Readings per request | Share of PC Sons' data |
+|---|---|---|
+| live | 1 | ~60% |
+| bulk drain | 91 | ~40% |
+
+Those sum to 1.0 readings/s/device — the 99.9% the site was achieving. The drain
+was never a safety net there; it was carrying 40% of production using 0.7% of
+the requests, precisely because it batches.
+
+That also made the site fragile in a way nobody could see. 2.11.1 shrank the
+rejected-log rotation 50KB → 8KB (to fit units inside a since-removed flat
+deadline), and because **the drain is rate-limited per FILE**, recovery
+throughput fell with file size: readings-per-file 91 → 35, recovery 27k → 19.3k
+readings/h, and site delivery 99.9% → 88%. Reverting the constant in 2.12.0
+restored it (per-file back to ~95, delivery ~99.3%). The invariant is now
+documented at the constant itself.
+
+## Consequence for the batching proposal
+
+The recommendation above — N readings per live POST — is correct and is now
+quantified: at 10 readings/request a device delivers ~6 readings/s against the
+1/s it needs, so a 600 ms RTT stops mattering entirely. This is the difference
+between PC Sons balancing on a knife edge at 99.9% and having six times the
+headroom it needs. Sampling stays 1 Hz; only delivery is grouped.
