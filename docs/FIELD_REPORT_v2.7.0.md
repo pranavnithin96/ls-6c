@@ -196,3 +196,105 @@ clears `/rejected.log` (or fixes the gate so the existing drain can).
 fields/commands are deployed and tested; 2.8's fixes are internal to the
 firmware. If 2.8 changes the wire format or adds heartbeat fields, say so and the
 server side will follow.
+
+---
+
+# 2.8.0 follow-up — 2026-07-21, after rollout
+
+**The 2.8 backstop works. The underlying cause was misdiagnosed (by me, in the
+section above) and is still open.**
+
+## What 2.8 fixed — confirmed in the field
+
+The first-boot recovery backstop does exactly what it promised. Devices that
+took 2.8 and can keep up are now clean:
+
+| Device | fw | `rejected_log_bytes` | sent/h | dropped/h |
+|---|---|---:|---:|---:|
+| mark_pdc | 2.8.0 | **0** | 3,593 | 0 |
+| mark_new_pdc | 2.8.0 | **0** | 3,621 | 1 |
+| mark_new_1 | 2.8.0 | **0** | 3,621 | 1 |
+| meton_04 | 2.8.0 | 462 | 3,595 | 7 |
+
+## What is still broken — corrected analysis
+
+**Retraction:** an earlier revision of this section claimed the full
+`/rejected.log` was only a symptom, citing Vasa as a single-device site that was
+also slow. **Vasa does not run this hardware** — it has no ESP32 telemetry at all
+and should never have been in the comparison. With ESP32-only devices, the
+evidence points the other way.
+
+**Within a single site, with the network held constant and all units on 2.8.0,
+throughput tracks `rejected_log_bytes` monotonically:**
+
+| Mark device | RSSI | `rejected_log_bytes` | sent/h |
+|---|---:|---:|---:|
+| mark_new_pdc | −52 | **0** | **3,620** |
+| mark_new_1 | −76 | **0** | **3,620** |
+| mark_pdc | −53 | **0** | 3,594 |
+| mark_04 | −72 | 262,862 | 3,270 |
+| mark_pdc1 | −76 | 300,341 | 2,950 |
+
+Same gradient at Aravind (61 KB → 3,528; 70 KB → 3,508; 187 KB → 3,359).
+
+Crucially this is **not signal strength**: mark_new_1 at −76 dBm matches
+mark_new_pdc at −52 dBm exactly, and the PC Sons units span −46 to −76 dBm while
+all sitting at ~1,700/h. A full log slows the device; a cleared one does not.
+
+**So 2.8's backstop worked, and the devices that could keep up stayed clean.**
+The three Mark units at 0 bytes are the proof. The open question is narrower than
+I framed it: **why do some units overflow in the first place**, refilling the log
+the backstop cleared?
+
+Two things the data shows and one it does not:
+
+- **Shown:** PC Sons carries an *additional* penalty beyond log size — its units
+  sit at ~1,700/h while mark_pdc1 and sb1 manage 2,950 and 2,697 at the same
+  ~301 KB. Something site-specific compounds it (15 devices is the obvious
+  candidate, though this is not proven).
+- **Shown:** two units are separately sick on weak signal — aravind_03 (−90 dBm,
+  547/h) and sb2 (−87 dBm, 537/h, still on 2.6). Those are a different problem.
+- **Not shown:** a single isolated root cause for the initial overflow. I do not
+  have RTT-per-site measurements from the device side, and the server cannot see
+  them.
+
+## Root cause: no HTTP connection reuse
+
+`http_sender.h` opens and tears down a TCP connection for **every single
+reading**:
+
+```
+:982   http.begin(_httpServerUrl);   ... POST ...
+:986   http.end();
+:1023  http.begin(_httpServerUrl);   ... POST ...
+:1027  http.end();
+```
+
+There is **no `http.setReuse(true)`** anywhere in the file. So each 1 Hz reading
+pays a full TCP handshake + POST + response + teardown. On a site with ~200 ms
+RTT that is ~500–600 ms of the 1 s budget spent on connection setup, and any
+jitter pushes it over — the ring backs up, overflow lands in `/rejected.log`, the
+log fills, and the amplifier described above kicks in.
+
+Sites with a fast path to the server (Mark, Meton) stay under budget and run
+clean at 3,600/h. Sites with a slower path never do.
+
+**Suggested fix: `http.setReuse(true)`** on the live-POST client so the TCP
+connection persists across readings. This removes one full round-trip per reading
+and is the cheapest available headroom — it does not depend on which of the
+theories above is right, because every device pays this cost on every reading. The server supports keep-alive (nginx
+upstream keepalive is already deployed).
+
+If that is not sufficient on the slowest sites, the structural fix is to **batch
+N readings per live POST** (the LS02 bulk path already proves the server accepts
+batches), rather than one HTTP request per second per device.
+
+## Server side
+
+Unchanged and healthy: 6–8 ms ingest, `last_http_code: 200` fleet-wide, no rate
+limiting in nginx, idempotent ingest live. The `rejected-ndjson` drain endpoint
+has still never been exercised by a real device — the 2.8 backstop clears the
+log locally rather than uploading it, so those parked readings are being
+discarded rather than recovered. That is the accepted trade (Pranav: recovery
+must be certain), but worth stating plainly: **the drain path remains unproven in
+production.**
