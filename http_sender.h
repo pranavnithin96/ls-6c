@@ -194,13 +194,19 @@ static inline void bufCountDec() {
 // ~301KB the fleet reports. REJECTED_MAX_BYTES is PER FILE, not a total cap — size
 // any alert threshold off ~300KB total, not 50KB.
 #define REJECTED_LOG "/rejected.log"
-// Rotate small: each archive is one drain unit, and a unit must be a bite a
-// trickling uplink can finish inside the stall/cap guards (8KB at Meton's
-// ~600B/s ≈ 14s). The old 50KB units needed ~85s and, under v2.11.0's flat
-// 45s deadline, could never complete — the drain wedged at 100% kept files.
-// Same ~300KB worst-case budget as before, split across more, smaller files.
-#define REJECTED_MAX_BYTES 8192       // per-file rotate threshold (active hard-drops at 2×)
-#define REJECTED_ARCHIVE_MAX 36       // /rejected.1.log .. /rejected.36.log (~300KB total budget)
+// File size IS drain throughput. The drain delivers ONE FILE PER TICK, gated by
+// OFFLINE_UPLOAD_RETRY_MS — so recovery rate is (files/sec × readings/file), and
+// shrinking the file shrinks recovery proportionally. 2.11.1 cut this to 8KB so
+// units would fit inside v2.11.0's flat 45s deadline; measured cost at PC Sons,
+// where the drain is load-bearing (their link carries only ~60% of 19 devices
+// live, and the drain recovered the other 40%): readings/file fell 91 -> 35 and
+// site delivery fell 99.9% -> 88%. That deadline is gone — 2.11.2 replaced it
+// with progress-based guards and a 300s cap, under which a 50KB file at trickle
+// rates (~85s) completes fine. So this returns to the size that measurably
+// delivered 99.9% for months. Do not shrink it again without re-measuring
+// readings-per-file at a drain-dependent site.
+#define REJECTED_MAX_BYTES 50000      // per-file rotate threshold (active hard-drops at 2×)
+#define REJECTED_ARCHIVE_MAX 4        // /rejected.1.log .. /rejected.4.log (~300KB total budget)
 
 // Rotate the ACTIVE rejected.log into a FREE archive slot. Archives are
 // IMMUTABLE once created — never renamed, shifted, or overwritten; only the
