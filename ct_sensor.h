@@ -42,8 +42,10 @@ static portMUX_TYPE _calMux = portMUX_INITIALIZER_UNLOCKED;
 static CalPoint _calPoints[NUM_CT_CHANNELS][CAL_POINTS];
 static bool _multiCalLoaded = false;
 
-// Forward declaration
+// Forward declarations
 void feedWatchdog();
+static void loadChannelSlopes();   // defined below; called from initCTSensors
+float getChannelSlope(int ch);
 
 // --- Waveform-stats feature flag (cached in RAM; NEVER read NVS in the 1Hz path) ---
 static bool _wfStatsEnabled = (FEATURE_WAVEFORM_STATS != 0);
@@ -64,6 +66,7 @@ void initCTSensors() {
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
     loadWaveformStatsPref();
+    loadChannelSlopes();
 
     // Multi-cal load is kept for future use — default path doesn't touch _calPoints
     Preferences calPrefs;
@@ -84,7 +87,7 @@ void initCTSensors() {
 
     Serial.printf("[CT] %d channels | %d samples | %dms window\n",
         NUM_CT_CHANNELS, ADC_SAMPLES_PER_CH, (ADC_SAMPLES_PER_CH * SAMPLE_INTERVAL_US) / 1000);
-    Serial.println("[CT] Rating-aware cal: 50A=0.0090/ct, 100A=0.0327/ct, else legacy 0.0123+0.13");
+    Serial.println("[CT] Cal: per-channel slope if set, else 50A=0.0421 100A=0.0327 legacy 0.0123+0.13");
 }
 
 // Multi-point calibration recording — kept as future option, not used by default readAllCT path.
@@ -123,31 +126,75 @@ void setCalPoint(int ch, int pt, float knownAmps) {
 }
 
 // ---------------------------------------------------------------------------
-// Rating-aware CT calibration (2.9.0). One formula never fit both sensor types:
-// the legacy 0.0123*count+0.13 sat BETWEEN them, so 50A CTs overread ~40% and
-// 100A CTs underread ~2.6x on the same firmware. Each channel's rating is set by
-// the installer at setup (getCtRating), so we select the empirically-fit slope
-// per rating. Fit against a multimeter clamp on PRODUCTION sensors 2026-07-21;
-// these CTs read 0 count at 0A, so no +0.13 floor. Fix-forward: readings from
-// firmware >= 2.9.0 use these — firmware_version is the calibration stamp.
-//   100A : 0.0327 A/count  — solid (resistive furnace, verified 0-35A)
-//   50A  : 0.0090 A/count  — PROVISIONAL (verified only to 3.5A, on a motor)
-//   150A / unset : legacy manufacturer formula, unchanged (not yet calibrated)
+// Rating-default CT calibration (2.9.0, defaults corrected 2.13.0). One formula
+// never fit every sensor: the legacy 0.0123*count+0.13 sat between real builds.
+// Each channel's rating is set by the installer (getCtRating); the table below
+// maps rating -> empirically-fit slope. All fits are against a multimeter clamp
+// on PRODUCTION sensors; these CTs read 0 count at 0A, so no +0.13 floor.
+// firmware_version remains the calibration-era stamp for the server.
+//   100A : 0.0327 A/count — furnace, verified 0-35A (2026-07-21)
+//   50A  : 0.0421 A/count — furnace, 10 clamp points ±1% (2026-07-23, below)
+//   150A / unset : legacy manufacturer formula (never calibrated)
 // ---------------------------------------------------------------------------
-#define CT_SLOPE_50A     0.0090f
+// 50A default corrected 2026-07-23: 0.0421 measured+verified on a standard 50A
+// CT (furnace, 10 clamp readings ±1%, zero-anchored, re-verified across a power
+// cycle). The old 0.0090 came from a known fewer-turns odd unit and would
+// misread standard 50A sensors ~4.7x.
+#define CT_SLOPE_50A     0.0421f
 #define CT_SLOPE_100A    0.0327f
 #define CT_SLOPE_LEGACY  0.0123f
 #define CT_OFFSET_LEGACY 0.13f
 
-static inline float ctSlope(int rating) {
+// ---------------------------------------------------------------------------
+// Per-channel measured slope (2.13.0). Field calibration proved same-rating CTs
+// are NOT interchangeable — two "50A" sensors measured 5x apart (23.8 vs 115
+// counts/A, both live-clamped). The rating table above is only a DEFAULT to get
+// a unit through install; the per-SENSOR slope, measured in place with a clamp
+// meter, is the trustworthy number. 0 = uncalibrated -> rating fallback.
+// Persisted in Preferences("ctcal") keys "s0".."s5"; survives reboot and OTA.
+// Set via serial "setslope <ch> <slope>" or heartbeat command "set_ct_slope".
+// ---------------------------------------------------------------------------
+static float _chSlope[NUM_CT_CHANNELS] = {0};
+
+static void loadChannelSlopes() {
+    Preferences p; p.begin("ctcal", true);
+    for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
+        char k[4]; snprintf(k, sizeof(k), "s%d", ch);
+        _chSlope[ch] = p.getFloat(k, 0.0f);
+        if (_chSlope[ch] > 0.0f)
+            Serial.printf("[CT] CH%d calibrated slope: %.5f A/count\n", ch + 1, _chSlope[ch]);
+    }
+    p.end();
+}
+
+// Set (or clear with 0) a channel's measured slope — live AND persisted, no
+// reboot needed (mirrors setSendInterval). Sanity range covers every plausible
+// CT build seen so far: 0.001 (1000 counts/A) .. 0.5 (2 counts/A).
+bool setChannelSlope(int ch, float aPerCount) {
+    if (ch < 0 || ch >= NUM_CT_CHANNELS) return false;
+    if (aPerCount != 0.0f && (aPerCount < 0.001f || aPerCount > 0.5f)) return false;
+    _chSlope[ch] = aPerCount;
+    Preferences p; p.begin("ctcal", false);
+    char k[4]; snprintf(k, sizeof(k), "s%d", ch);
+    p.putFloat(k, aPerCount);
+    p.end();
+    Serial.printf("[CT] CH%d slope %s: %.5f A/count\n", ch + 1,
+                  aPerCount == 0.0f ? "cleared -> rating fallback" : "set", aPerCount);
+    return true;
+}
+float getChannelSlope(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _chSlope[ch] : 0.0f; }
+
+static inline float ctSlope(int ch, int rating) {
+    if (_chSlope[ch] > 0.0f) return _chSlope[ch];    // measured per-sensor slope wins
     switch (rating) {
         case 100: return CT_SLOPE_100A;
         case 50:  return CT_SLOPE_50A;
         default:  return CT_SLOPE_LEGACY;
     }
 }
-// count -> amps for a channel of the given CT rating.
-static inline float ctCountToAmps(int rating, float count) {
+// count -> amps for a channel: measured slope if calibrated, else rating default.
+static inline float ctCountToAmps(int ch, int rating, float count) {
+    if (_chSlope[ch] > 0.0f) return _chSlope[ch] * count;               // through origin
     switch (rating) {
         case 100: return CT_SLOPE_100A * count;                          // through origin
         case 50:  return CT_SLOPE_50A  * count;                          // through origin
@@ -202,7 +249,7 @@ AllCTReadings readAllCT(float grid_voltage) {
 
         // Rating-aware calibration (2.9.0) — formula chosen by the channel's CT type
         int rating = getCtRating(ch);
-        float amps = ctCountToAmps(rating, avgCount);
+        float amps = ctCountToAmps(ch, rating, avgCount);
 
         // Guard against NaN/Inf only
         if (isnan(amps) || isinf(amps)) amps = 0.0f;
@@ -217,8 +264,8 @@ AllCTReadings readAllCT(float grid_voltage) {
         // Computed unconditionally (tens of us total); emitted only when the flag
         // is on (see queueReading). Saturates with the ADC at ~50.5A: on a pinned
         // channel max≈avg → ratio→1, ripple→0 (expected, documented).
-        r.peak_amps = ctCountToAmps(rating, maxCount[ch]);
-        r.min_amps  = ctCountToAmps(rating, minCount[ch]);
+        r.peak_amps = ctCountToAmps(ch, rating, maxCount[ch]);
+        r.min_amps  = ctCountToAmps(ch, rating, minCount[ch]);
 
         // Within-second std in counts. Compute E[X^2]-E[X]^2 in DOUBLE: the terms
         // are close at ~1e6-1e7 magnitudes and float32 loses the difference to
@@ -227,7 +274,7 @@ AllCTReadings readAllCT(float grid_voltage) {
         double meanSq = (double)sumSq[ch] / ADC_SAMPLES_PER_CH;
         double var    = meanSq - meanC * meanC;
         if (var < 0.0) var = 0.0;                  // guard tiny negative from rounding
-        r.ripple_amps = ctSlope(rating) * (float)sqrt(var);  // spread scaled by channel slope, no offset
+        r.ripple_amps = ctSlope(ch, rating) * (float)sqrt(var);  // spread scaled by channel slope, no offset
 
         // env_peak_ratio: within-second max/mean of the rectified envelope.
         // NOT electrical crest factor (no waveform access; +0.13 offset means
@@ -241,7 +288,7 @@ AllCTReadings readAllCT(float grid_voltage) {
         const int subN = ADC_SAMPLES_PER_CH / 5;
         for (int k = 0; k < 5; k++) {
             float subAvg = (float)subSum[ch][k] / subN;
-            r.env5[k] = ctCountToAmps(rating, subAvg);
+            r.env5[k] = ctCountToAmps(ch, rating, subAvg);
         }
 
         all.ct[ch] = r;

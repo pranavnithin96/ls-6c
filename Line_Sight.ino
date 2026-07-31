@@ -191,7 +191,7 @@ void setup() {
     Serial.printf("  Server:    %s\n", getServerUrl().c_str());
     Serial.printf("  Voltage:   %.0fV | Interval: %ds\n", getGridVoltage(), getSendInterval());
     Serial.println("---------------------");
-    Serial.println("Commands: status | calpoint | debug | reset | update");
+    Serial.println("Commands: status | setslope | slopes | calpoint | debug | reset | update");
     Serial.println("Monitoring started...\n");
 }
 
@@ -233,6 +233,21 @@ void loop() {
                 setCalPoint(ch - 1, pt, amps);
             } else {
                 Serial.println("Usage: calpoint <ch 1-6> <point 0-2> <amps>");
+            }
+        } else if (cmd.startsWith("setslope ")) {
+            int ch = 0; float slope = -1;
+            if (sscanf(cmd.c_str(), "setslope %d %f", &ch, &slope) == 2 &&
+                setChannelSlope(ch - 1, slope)) {
+                // setChannelSlope prints the confirmation
+            } else {
+                Serial.println("Usage: setslope <ch 1-6> <A/count, 0 clears>  e.g. setslope 1 0.0421");
+            }
+        } else if (cmd == "slopes") {
+            Serial.println("Per-channel CT slopes (0 = rating default):");
+            for (int i = 0; i < NUM_CT_CHANNELS; i++) {
+                float s = getChannelSlope(i);
+                if (s > 0) Serial.printf("  CH%d: %.5f A/count (calibrated)\n", i + 1, s);
+                else       Serial.printf("  CH%d: rating default (%dA)\n", i + 1, getCtRating(i));
             }
         } else if (cmd == "test_offline") {
             int testSecs = 25;  // 25 readings = 2 full blocks (10 each) + 5 partial
