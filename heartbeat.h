@@ -271,6 +271,25 @@ void sendHeartbeat() {
     doc["build"] = __DATE__ " " __TIME__;             // exact build, beyond version string
     doc["ntp_sync_age_s"] = getNtpSyncAgeS();         // seconds since last SNTP sync (-1 never)
 
+    // --- Per-channel CT calibration state (2.13.0) ---
+    // The rating lives only in device NVS and was never reported, so the server
+    // could not tell which channels use which slope. That made a calibration
+    // change unverifiable and its blast radius unknowable: when the 50A default
+    // moved 0.0090 -> 0.0421, nothing server-side could say which channels would
+    // shift 4.7x. ct_slopes is the EFFECTIVE A/count actually applied (measured
+    // per-channel slope if calibrated, else the rating default), so the server
+    // can confirm an OTA landed and recompute thresholds for exactly the
+    // channels that moved. ~90 bytes on a 5-minute heartbeat.
+    JsonArray _ctRat = doc["ct_ratings"].to<JsonArray>();
+    JsonArray _ctSlp = doc["ct_slopes"].to<JsonArray>();
+    JsonArray _ctCal = doc["ct_slope_calibrated"].to<JsonArray>();
+    for (int _c = 0; _c < NUM_CT_CHANNELS; _c++) {
+        int _r = getCtRating(_c);
+        _ctRat.add(_r);
+        _ctSlp.add(serialized(String(ctSlope(_c, _r), 5)));
+        _ctCal.add(getChannelSlope(_c) > 0.0f);       // false = running on the rating default
+    }
+
     // Snapshot errors under spinlock — only fixed-size char copies
     char snapTs[MAX_ERROR_LOG][32];
     char snapMsg[MAX_ERROR_LOG][128];

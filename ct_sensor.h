@@ -19,9 +19,12 @@ struct CTReading {
     // --- Waveform features (FEATURE_WAVEFORM_STATS, live payload only) ---
     // Derived per 500ms window from the same samples readAllCT already takes.
     // Populated unconditionally (cost is tens of us); emitted only when the
-    // flag is on. peak/min via the manufacturer formula on max/min count;
-    // env_peak_ratio is max/mean of counts (NOT electrical crest factor);
-    // ripple is the within-second std in amps; env5 is the 5Hz envelope.
+    // flag is on. ALL of these are computed on the ENVELOPE (20ms sub-window
+    // means, one mains cycle each) as of 2.13.0 — never on raw ADC samples,
+    // which measured the 50Hz carrier rather than the load. peak/min are the
+    // envelope's max/min load; ripple is the envelope std (genuine load
+    // variation, 0 for a perfectly steady load); env_peak_ratio is envelope
+    // max/mean; env5 is the same envelope aggregated to 5 x 100ms.
     float peak_amps;
     float min_amps;
     float env_peak_ratio;
@@ -202,6 +205,30 @@ static inline float ctCountToAmps(int ch, int rating, float count) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Envelope resolution for the waveform features. 25 sub-windows over the 500ms
+// sampling window = 20ms each = exactly ONE 50Hz mains cycle per sub-window, so
+// each sub-window mean cancels the AC carrier and reports load. Must divide
+// ADC_SAMPLES_PER_CH evenly, and must be a multiple of 5 so env5 (the 5 x 100ms
+// payload envelope) can be aggregated from it exactly.
+// NOTE: sized for 50Hz mains (India). Grid frequency drift leaves a small
+// residual because a 20ms window then spans slightly more or less than one full
+// cycle. Simulated ripple/mean floor on a perfectly steady load:
+//     49.5Hz 0.5%   50.0Hz 0.0%   50.5Hz 0.6%   49/51Hz 1.0%   48/52Hz 2.0%
+// Genuine load variation reads 8-32% of mean, so the floor is ~1/15th of the
+// smallest real signal — but any downstream "is this load steady" threshold
+// should sit above ~2% rather than at zero.
+// On a 60Hz supply a 20ms window spans 1.2 cycles and the floor is much larger.
+// If the fleet ever runs on 60Hz, use ENV_SUBWIN 10: 50 samples = 50ms = exactly
+// 3 mains cycles at 60Hz, and it satisfies both asserts below. (30 does NOT —
+// 500/30 is not an integer, so 16.67ms sub-windows are not reachable at 1kHz.)
+// ---------------------------------------------------------------------------
+#define ENV_SUBWIN 25
+static_assert(ADC_SAMPLES_PER_CH % ENV_SUBWIN == 0,
+              "ENV_SUBWIN must divide ADC_SAMPLES_PER_CH evenly");
+static_assert(ENV_SUBWIN % 5 == 0,
+              "ENV_SUBWIN must be a multiple of 5 so env5 aggregates exactly");
+
 // Read all CT channels — per-rating calibration on raw ADC counts (see above).
 // Legacy fallback keeps the +0.13 floor; the 50A/100A fits are through-origin.
 AllCTReadings readAllCT(float grid_voltage) {
@@ -210,13 +237,20 @@ AllCTReadings readAllCT(float grid_voltage) {
     all.total_watts = 0;
 
     uint32_t sumCounts[NUM_CT_CHANNELS] = {0};
-    // Waveform accumulators — O(1) integer ops per sample, no extra analogRead().
-    // sumSq needs u64: 500 * 4095^2 = 8.4e9 overflows u32.
-    uint16_t maxCount[NUM_CT_CHANNELS];
-    uint16_t minCount[NUM_CT_CHANNELS];
-    uint64_t sumSq[NUM_CT_CHANNELS] = {0};
-    uint32_t subSum[NUM_CT_CHANNELS][5] = {{0}};
-    for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) { maxCount[ch] = 0; minCount[ch] = 4095; }
+    // Envelope accumulator — ENV_SUBWIN sub-windows, 20ms each = exactly one
+    // 50Hz mains cycle, so each sub-window mean averages the AC carrier out and
+    // leaves the LOAD level. O(1) integer ops per sample, no extra analogRead().
+    // The raw max/min/sumSq accumulators were REMOVED in 2.13.0: features
+    // computed on raw samples measured the carrier, not the load (see below).
+    // Worst case per sub-window: 20 * 4095 = 81,900 — fits u32 with room.
+    //
+    // static, not stack: at 6 x 25 x u32 this is 600B, and the Arduino loopTask
+    // stack is only 8KB (networkTask's 16KB is a different task). readAllCT is
+    // called ONLY from loop() — both call sites are in Line_Sight.ino — so one
+    // shared instance is safe. If it ever gains a second calling task, this must
+    // move back onto the stack or take a lock.
+    static uint32_t subSum[NUM_CT_CHANNELS][ENV_SUBWIN];
+    memset(subSum, 0, sizeof(subSum));
 
     unsigned long t0 = micros();
 
@@ -225,13 +259,10 @@ AllCTReadings readAllCT(float grid_voltage) {
     // 0.0123 coefficient was empirically fit against raw counts; switching to mV
     // breaks the fit because the count→mV relationship is not constant.
     for (int s = 0; s < ADC_SAMPLES_PER_CH; s++) {
-        int sw = (s * 5) / ADC_SAMPLES_PER_CH;        // even 100ms sub-window 0..4
+        int sw = (s * ENV_SUBWIN) / ADC_SAMPLES_PER_CH;   // 20ms sub-window 0..ENV_SUBWIN-1
         for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
             uint16_t v = (uint16_t)analogRead(CT_PINS[ch]);   // single read, reused
             sumCounts[ch] += v;
-            if (v > maxCount[ch]) maxCount[ch] = v;
-            if (v < minCount[ch]) minCount[ch] = v;
-            sumSq[ch] += (uint32_t)v * v;
             subSum[ch][sw] += v;
         }
         unsigned long target = t0 + (unsigned long)((s + 1) * SAMPLE_INTERVAL_US);
@@ -260,35 +291,59 @@ AllCTReadings readAllCT(float grid_voltage) {
         r.watts = power;
         r.pf = DEFAULT_PF;
 
-        // --- Waveform features (same manufacturer formula on each statistic) ---
-        // Computed unconditionally (tens of us total); emitted only when the flag
-        // is on (see queueReading). Saturates with the ADC at ~50.5A: on a pinned
-        // channel max≈avg → ratio→1, ripple→0 (expected, documented).
-        r.peak_amps = ctCountToAmps(ch, rating, maxCount[ch]);
-        r.min_amps  = ctCountToAmps(ch, rating, minCount[ch]);
+        // --- Waveform features, computed on the ENVELOPE (2.13.0) ---
+        // These were previously computed on RAW ADC samples, which measured the
+        // 50Hz carrier instead of the load and made three of the four fields
+        // useless. Verified against production data (mark_pdc, 2026-07-31, 408
+        // readings): peak_amps sat pinned at 36.9A (= 4095 counts, the ADC rail)
+        // in 408/408 readings, and ripple/amps was a near-constant 1.39-1.63
+        // across an 11x load range — i.e. a scaled copy of current, carrying no
+        // information about how steady the load was. The cause is physical: the
+        // CT signal is an AC sine biased mid-scale, so its peaks clip the ADC and
+        // its sample-std is inherently proportional to amplitude.
+        //
+        // Averaging each 20ms sub-window (one full mains cycle) removes the
+        // carrier, so max/min/std over those means describe the LOAD. env5 was
+        // always correct precisely because it was already a sub-window mean.
+        const int subN = ADC_SAMPLES_PER_CH / ENV_SUBWIN;
+        float env[ENV_SUBWIN];
+        float envSum = 0.0f, envMax = 0.0f, envMin = 3.4e38f;
+        for (int k = 0; k < ENV_SUBWIN; k++) {
+            env[k] = ctCountToAmps(ch, rating, (float)subSum[ch][k] / subN);
+            if (isnan(env[k]) || isinf(env[k])) env[k] = 0.0f;
+            envSum += env[k];
+            if (env[k] > envMax) envMax = env[k];
+            if (env[k] < envMin) envMin = env[k];
+        }
+        float envMean = envSum / ENV_SUBWIN;
 
-        // Within-second std in counts. Compute E[X^2]-E[X]^2 in DOUBLE: the terms
-        // are close at ~1e6-1e7 magnitudes and float32 loses the difference to
-        // catastrophic cancellation (you'd read zero ripple under load).
-        double meanC  = (double)sumCounts[ch] / ADC_SAMPLES_PER_CH;
-        double meanSq = (double)sumSq[ch] / ADC_SAMPLES_PER_CH;
-        double var    = meanSq - meanC * meanC;
-        if (var < 0.0) var = 0.0;                  // guard tiny negative from rounding
-        r.ripple_amps = ctSlope(ch, rating) * (float)sqrt(var);  // spread scaled by channel slope, no offset
+        r.peak_amps = envMax;      // highest 20ms load in the window
+        r.min_amps  = envMin;      // lowest 20ms load in the window
 
-        // env_peak_ratio: within-second max/mean of the rectified envelope.
-        // NOT electrical crest factor (no waveform access; +0.13 offset means
-        // count-ratio != amp-ratio). Computed on counts; clamped [1,20].
-        float ratio = (float)maxCount[ch] / (avgCount > 1.0f ? avgCount : 1.0f);
+        // Load-variation std over the envelope, in amps. Two-pass about the
+        // mean: these are small floats (not the ~1e7 sums the raw-count path
+        // used), so there is no catastrophic-cancellation risk here.
+        float acc = 0.0f;
+        for (int k = 0; k < ENV_SUBWIN; k++) { float d = env[k] - envMean; acc += d * d; }
+        r.ripple_amps = sqrtf(acc / ENV_SUBWIN);
+
+        // env_peak_ratio: envelope max/mean — burstiness of the LOAD.
+        // 1.0 = perfectly steady. Clamped [1,20]. The 0.05A divisor guard keeps
+        // a dead/unplugged channel from dividing by ~0 and reporting a bogus 20.
+        float ratio = envMax / (envMean > 0.05f ? envMean : 0.05f);
         if (ratio < 1.0f)  ratio = 1.0f;
         if (ratio > 20.0f) ratio = 20.0f;
         r.env_peak_ratio = ratio;
 
-        // env5: five 100ms sub-window means -> 5Hz envelope, in amps.
-        const int subN = ADC_SAMPLES_PER_CH / 5;
+        // env5: five 100ms means -> 5Hz envelope, in amps. Unchanged contract —
+        // built by aggregating the finer sub-windows so there is one source of
+        // truth. Exactly equal to the old value: count->amps is affine, so the
+        // mean of converted sub-windows equals the conversion of their mean.
+        const int per5 = ENV_SUBWIN / 5;
         for (int k = 0; k < 5; k++) {
-            float subAvg = (float)subSum[ch][k] / subN;
-            r.env5[k] = ctCountToAmps(ch, rating, subAvg);
+            float s5 = 0.0f;
+            for (int j = 0; j < per5; j++) s5 += env[k * per5 + j];
+            r.env5[k] = s5 / per5;
         }
 
         all.ct[ch] = r;

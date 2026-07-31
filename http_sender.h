@@ -1052,12 +1052,19 @@ void queueReading(const String& deviceId, const String& location, const String& 
         ct["amps"] = serialized(String(a, 3));
         ct["pf"] = serialized(String(readings[i].pf, 3));
         // Half-B waveform features — LIVE payload only (D3), flag-gated. Off => byte-identical to v2.6.
+        // Precision widened in 2.13.0 to match the new dynamic range: these are
+        // now ENVELOPE statistics, so ripple collapsed from 2.5-15A (the carrier
+        // amplitude) to 0.05-0.2A (real load variation). At the old 2 decimals a
+        // steady small load quantized to 0.00-0.01 and the signal was destroyed;
+        // 4 decimals keeps resolution down to the ~0.5% mains-drift floor.
+        // Worst-case payload (6 CTs at the 172A rail) is 1196B of the 1536B
+        // buffer below — 340B headroom, verified before changing these.
         if (wf) {
-            ct["peak_amps"]      = serialized(String(readings[i].peak_amps, 1));
-            ct["env_peak_ratio"] = serialized(String(readings[i].env_peak_ratio, 2));
-            ct["ripple_amps"]    = serialized(String(readings[i].ripple_amps, 2));
+            ct["peak_amps"]      = serialized(String(readings[i].peak_amps, 2));
+            ct["env_peak_ratio"] = serialized(String(readings[i].env_peak_ratio, 3));
+            ct["ripple_amps"]    = serialized(String(readings[i].ripple_amps, 4));
             JsonArray e5 = ct["env5"].to<JsonArray>();
-            for (int k = 0; k < 5; k++) e5.add(serialized(String(readings[i].env5[k], 1)));
+            for (int k = 0; k < 5; k++) e5.add(serialized(String(readings[i].env5[k], 2)));
         }
     }
     doc["readings"]["voltage_rms"] = serialized(String(gridVoltage, 1));
