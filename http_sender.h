@@ -1057,10 +1057,20 @@ void queueReading(const String& deviceId, const String& location, const String& 
         // amplitude) to 0.05-0.2A (real load variation). At the old 2 decimals a
         // steady small load quantized to 0.00-0.01 and the signal was destroyed;
         // 4 decimals keeps resolution down to the ~0.5% mains-drift floor.
-        // Worst-case payload (6 CTs at the 172A rail) is 1196B of the 1536B
-        // buffer below — 340B headroom, verified before changing these.
+        // min_amps is NEW on the wire in 2.13.0. It was computed on-device from
+        // 2.7 but never transmitted, which left the load band half-observed:
+        // peak gave the top, nothing gave the bottom. It is not redundant with
+        // ripple — ripple is an RMS spread and averages brief excursions away,
+        // whereas min is the actual floor the load touched inside the window.
+        // That distinction is the useful one: min ~= 0 while the mean is high
+        // means the load PULSED within the second (a contactor cycling, a tool
+        // disengaging) rather than sat steady, and a 1Hz mean cannot show that.
+        //
+        // Worst-case payload (6 CTs simultaneously at the 172A rail) is 1304B
+        // of the 1536B buffer below — 232B headroom, verified before adding it.
         if (wf) {
             ct["peak_amps"]      = serialized(String(readings[i].peak_amps, 2));
+            ct["min_amps"]       = serialized(String(readings[i].min_amps, 2));
             ct["env_peak_ratio"] = serialized(String(readings[i].env_peak_ratio, 3));
             ct["ripple_amps"]    = serialized(String(readings[i].ripple_amps, 4));
             JsonArray e5 = ct["env5"].to<JsonArray>();
