@@ -204,6 +204,13 @@ void processCommands(const String& responseBody) {
             setDrainEnabled(false);          // keep backlog on flash, stop spending uplink on it
         } else if (action == "resume_drain") {
             setDrainEnabled(true);
+        } else if (action == "set_ct_slope") {
+            // Remote per-sensor calibration: {"action":"set_ct_slope","channel":1-6,"value":<A/count>}
+            // value 0 clears back to the rating default. Live + persisted (survives OTA).
+            int ch = cmd["channel"] | -1;
+            float val = cmd["value"] | -1.0f;
+            if (!setChannelSlope(ch - 1, val))
+                logError("set_ct_slope rejected: bad channel/slope");
         } else if (action == "clear_rejected") {
             clearRejectedStore();            // DESTRUCTIVE: discards parked backlog
         } else if (action == "set_reboot_days") {
