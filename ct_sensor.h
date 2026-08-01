@@ -308,6 +308,7 @@ AllCTReadings readAllCT(float grid_voltage) {
     bool above = false;
     int nCross = 0;
     float firstX = 0.0f, lastX = 0.0f;
+    float maxIv = 0.0f, minIv = 1e9f;   // interval consistency guard (2.14.2)
     uint16_t prevV = 0;
 
     unsigned long t0 = micros();
@@ -336,6 +337,11 @@ AllCTReadings readAllCT(float grid_voltage) {
                         float x = (float)(s - 1) + frac;
                         if (x < 0.0f) x = 0.0f;   // s==0: no s-1 to interpolate from
                         if (nCross == 0) firstX = x;
+                        else {
+                            float iv = x - lastX;
+                            if (iv > maxIv) maxIv = iv;
+                            if (iv < minIv) minIv = iv;
+                        }
                         lastX = x;
                         nCross++;
                         above = true;
@@ -354,10 +360,21 @@ AllCTReadings readAllCT(float grid_voltage) {
 
     // Mains frequency: humps are 1/cycle, samples are 1ms apart. Require >=5
     // clean humps and a plausible answer; otherwise report 0 (= unknown).
+    //
+    // Interval-consistency guard (2.14.2): one MISSED interior hump (a shallow
+    // hump under the threshold during a load dip) drops the count by one while
+    // the span stays put, reading exactly 50 x 23/24 = 47.92Hz — the pilot's
+    // outlier cluster, ~0.8% of readings, all at 47.91-47.95. A miss doubles
+    // one interval (~40ms), a double-count halves one (~10ms); both are far
+    // outside real grid drift (<1% interval variation), so reject the window
+    // when any interval strays 50% from the mean. Better no reading than a
+    // wrong one — consumers treat 0 as "not measured".
     all.mains_hz = 0.0f;
     if (fqUsable && nCross >= 5 && lastX > firstX) {
-        float hz = (float)(nCross - 1) * 1000.0f / (lastX - firstX);
-        if (hz >= 45.0f && hz <= 65.0f) all.mains_hz = hz;
+        float meanIv = (lastX - firstX) / (float)(nCross - 1);
+        bool consistent = (maxIv <= 1.5f * meanIv) && (minIv >= 0.5f * meanIv);
+        float hz = 1000.0f / meanIv;
+        if (consistent && hz >= 45.0f && hz <= 65.0f) all.mains_hz = hz;
     }
 
     // Choose next window's frequency/black-box channel: strongest this window.
