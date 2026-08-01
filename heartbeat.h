@@ -9,6 +9,7 @@
 #include "diagnostics.h"
 #include "http_sender.h"
 #include "ct_sensor.h"
+#include "waveform_blackbox.h"
 
 // ============================================================================
 // Heartbeat — Thread-safe error log with FIXED-SIZE char arrays (no heap
@@ -211,6 +212,17 @@ void processCommands(const String& responseBody) {
             float val = cmd["value"] | -1.0f;
             if (!setChannelSlope(ch - 1, val))
                 logError("set_ct_slope rejected: bad channel/slope");
+        } else if (action == "set_window_ms") {
+            // Sampling window 500-900ms in 100ms steps (2.14.0). Persisted;
+            // wider = less blind time per second, less loop-idle headroom.
+            int val = cmd["value"] | -1;
+            if (!setSampleWindowMs(val))
+                logError("set_window_ms rejected: want 500-900 step 100");
+        } else if (action == "capture_waveform") {
+            // Freeze the raw-sample ring and upload it (2.14.0). The capture
+            // itself runs on the sampling task between windows; this only
+            // raises the request flag. Rate-limited to one per 10 min.
+            wbRequestCapture();
         } else if (action == "clear_rejected") {
             clearRejectedStore();            // DESTRUCTIVE: discards parked backlog
         } else if (action == "set_reboot_days") {
@@ -280,6 +292,9 @@ void sendHeartbeat() {
     // per-channel slope if calibrated, else the rating default), so the server
     // can confirm an OTA landed and recompute thresholds for exactly the
     // channels that moved. ~90 bytes on a 5-minute heartbeat.
+    doc["window_ms"] = getSampleWindowMs();           // sampling window (2.14.0)
+    doc["wb_pending"] = wbDumpPending();              // black-box dump awaiting upload
+
     JsonArray _ctRat = doc["ct_ratings"].to<JsonArray>();
     JsonArray _ctSlp = doc["ct_slopes"].to<JsonArray>();
     JsonArray _ctCal = doc["ct_slope_calibrated"].to<JsonArray>();
@@ -356,6 +371,11 @@ void heartbeatLoop() {
     if (now - _lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
         _lastHeartbeat = now;
         sendHeartbeat();
+        // Black-box dump upload rides the heartbeat cadence (networkTask):
+        // file read + one HTTP POST, no ring access, ~24KB. Retries each
+        // minute until a 2xx clears it.
+        if (wbDumpPending())
+            wbUploadDump("http://46.224.90.187", getDeviceId());
     }
 
     if (now - _lastErrorSave >= ERROR_SAVE_INTERVAL_MS) {

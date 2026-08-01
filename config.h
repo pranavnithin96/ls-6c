@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.13.1"
+#define FIRMWARE_VERSION "2.14.0"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -19,8 +19,27 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define BOOT_BUTTON_PIN   0
 
 // --- CT Sensor ---
-#define ADC_SAMPLES_PER_CH    500     // 500ms sampling window
+// The sampling window is RUNTIME-CONFIGURABLE from 2.14.0 (heartbeat command
+// set_window_ms, NVS-persisted). 500ms stays the default so an OTA changes
+// nothing by itself; widening is a per-device decision. Wider = less of each
+// second is blind (crash/event coverage) at the cost of loop-idle headroom.
+// Constraint: multiples of 100ms so the 20ms envelope sub-windows divide the
+// window evenly AND group evenly into the 5 env5 slots (slot = window/5).
+#define ADC_SAMPLES_PER_CH    500     // DEFAULT window: 500 samples = 500ms
+#define MAX_ADC_SAMPLES       900     // hard cap: leaves >=100ms/s loop headroom
+#define MIN_ADC_SAMPLES       500
 #define SAMPLE_INTERVAL_US    1000    // 1 kHz ADC rate within window
+#define ENV_SUBWIN_SAMPLES    20      // 20ms @ 1kHz = one 50Hz mains cycle
+#define MAX_ENV_SUBWIN        (MAX_ADC_SAMPLES / ENV_SUBWIN_SAMPLES)
+
+// --- Waveform black box (2.14.0) ---
+// Rolling raw-sample ring for ONE channel (the currently strongest), frozen to
+// flash and uploaded on the capture_waveform heartbeat command. Static .bss,
+// not heap — 12s x 1kHz x 2B = 24KB, always allocated, no runtime OOM risk.
+#define WB_RING_SECONDS       12
+#define WB_RING_SAMPLES       (WB_RING_SECONDS * 1000)
+#define WB_DUMP_FILE          "/wfdump.bin"
+#define WB_MIN_CAPTURE_GAP_MS 600000UL   // rate limit: one capture per 10 min
 #define CAL_POINTS            3
 // Corrected: manufacturer 0.0123 A/count, with ADC_11db 1 count = 0.756 mV
 // So 0.0123 / 0.756 = 0.01627 A/mV

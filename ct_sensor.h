@@ -37,7 +37,39 @@ struct AllCTReadings {
     float total_watts;
     unsigned long timestamp_ms;      // millis() at sample START
     unsigned long sample_duration_ms;
+    // Mains frequency measured from the rectified waveform's hump timing on
+    // the strongest channel (2.14.0). One hump per mains cycle (half-wave
+    // rectified front end), sub-sample interpolated at the threshold
+    // crossings. 0.0 = not measurable this window (no loaded channel, or
+    // fewer than 5 clean humps). Clamped to the plausible 45-65Hz band.
+    float mains_hz;
 };
+
+// --- Runtime sampling window (2.14.0) --------------------------------------
+// 500ms default (identical behavior to 2.13.x). set via setSampleWindowMs()
+// from the set_window_ms heartbeat command; persisted in lscfg/winms.
+static int _winSamples = ADC_SAMPLES_PER_CH;
+
+int getSampleWindowMs() { return _winSamples; }   // 1 sample == 1 ms at 1kHz
+
+bool setSampleWindowMs(int ms) {
+    if (ms < MIN_ADC_SAMPLES || ms > MAX_ADC_SAMPLES || ms % 100 != 0)
+        return false;                 // %100 keeps 20ms sub-windows AND env5 exact
+    _winSamples = ms;
+    Preferences p; p.begin("lscfg", false);
+    p.putInt("winms", ms);
+    p.end();
+    Serial.printf("[CT] sample window set: %dms\n", ms);
+    return true;
+}
+
+static void loadSampleWindowPref() {
+    Preferences p; p.begin("lscfg", true);
+    int ms = p.getInt("winms", ADC_SAMPLES_PER_CH);
+    p.end();
+    if (ms >= MIN_ADC_SAMPLES && ms <= MAX_ADC_SAMPLES && ms % 100 == 0)
+        _winSamples = ms;
+}
 
 // Multi-point calibration kept as future option — NOT used by default path.
 // Default path uses manufacturer's empirical formula: amps = 0.0123 * count + 0.13
@@ -70,6 +102,7 @@ void initCTSensors() {
     analogSetAttenuation(ADC_11db);
     loadWaveformStatsPref();
     loadChannelSlopes();
+    loadSampleWindowPref();
 
     // Multi-cal load is kept for future use — default path doesn't touch _calPoints
     Preferences calPrefs;
@@ -223,11 +256,15 @@ static inline float ctCountToAmps(int ch, int rating, float count) {
 // 3 mains cycles at 60Hz, and it satisfies both asserts below. (30 does NOT —
 // 500/30 is not an integer, so 16.67ms sub-windows are not reachable at 1kHz.)
 // ---------------------------------------------------------------------------
-#define ENV_SUBWIN 25
-static_assert(ADC_SAMPLES_PER_CH % ENV_SUBWIN == 0,
-              "ENV_SUBWIN must divide ADC_SAMPLES_PER_CH evenly");
-static_assert(ENV_SUBWIN % 5 == 0,
-              "ENV_SUBWIN must be a multiple of 5 so env5 aggregates exactly");
+// ENV_SUBWIN became runtime in 2.14.0 (n_subwin below) because the window
+// length is runtime-set; the 20ms sub-window itself is the fixed invariant.
+static_assert(ADC_SAMPLES_PER_CH % (ENV_SUBWIN_SAMPLES * 5) == 0,
+              "default window must divide into 20ms sub-windows and 5 env5 slots");
+static_assert(MAX_ADC_SAMPLES % (ENV_SUBWIN_SAMPLES * 5) == 0,
+              "max window must divide into 20ms sub-windows and 5 env5 slots");
+
+// Black box hook — defined in waveform_blackbox.h (same translation unit).
+void wbFeed(int ch, uint16_t v);
 
 // Read all CT channels — per-rating calibration on raw ADC counts (see above).
 // Legacy fallback keeps the +0.13 floor; the 50A/100A fits are through-origin.
@@ -236,21 +273,42 @@ AllCTReadings readAllCT(float grid_voltage) {
     all.timestamp_ms = millis();  // Timestamp at START of sampling
     all.total_watts = 0;
 
+    const int nSamples = _winSamples;                       // runtime window
+    const int n_subwin = nSamples / ENV_SUBWIN_SAMPLES;     // 20ms sub-windows
+
     uint32_t sumCounts[NUM_CT_CHANNELS] = {0};
-    // Envelope accumulator — ENV_SUBWIN sub-windows, 20ms each = exactly one
+    uint16_t maxCount[NUM_CT_CHANNELS] = {0};   // for channel selection only,
+                                                // NOT features (2.13.0 lesson)
+    // Envelope accumulator — n_subwin sub-windows, 20ms each = exactly one
     // 50Hz mains cycle, so each sub-window mean averages the AC carrier out and
     // leaves the LOAD level. O(1) integer ops per sample, no extra analogRead().
-    // The raw max/min/sumSq accumulators were REMOVED in 2.13.0: features
-    // computed on raw samples measured the carrier, not the load (see below).
     // Worst case per sub-window: 20 * 4095 = 81,900 — fits u32 with room.
     //
-    // static, not stack: at 6 x 25 x u32 this is 600B, and the Arduino loopTask
+    // static, not stack: at 6 x 45 x u32 this is 1080B, and the Arduino loopTask
     // stack is only 8KB (networkTask's 16KB is a different task). readAllCT is
     // called ONLY from loop() — both call sites are in Line_Sight.ino — so one
     // shared instance is safe. If it ever gains a second calling task, this must
     // move back onto the stack or take a lock.
-    static uint32_t subSum[NUM_CT_CHANNELS][ENV_SUBWIN];
+    static uint32_t subSum[NUM_CT_CHANNELS][MAX_ENV_SUBWIN];
     memset(subSum, 0, sizeof(subSum));
+
+    // --- Mains-frequency state (2.14.0) ---
+    // Hump timing on the STRONGEST channel of the previous window. The
+    // rectified front end produces one hump per mains cycle; counting
+    // threshold crossings with sub-sample interpolation gives grid frequency
+    // to ~0.01Hz over a 500ms window. Threshold = half the previous window's
+    // peak (loads change slowly relative to 1s), with hysteresis so ADC noise
+    // near the threshold can't double-count a hump.
+    static int _strongCh = 0;
+    static uint16_t _prevWinMax[NUM_CT_CHANNELS] = {0};
+    const int fq = _strongCh;
+    const uint16_t thrHi = _prevWinMax[fq] / 2;
+    const uint16_t thrLo = (uint16_t)(_prevWinMax[fq] * 3 / 8);   // 12.5% hysteresis
+    const bool fqUsable = thrHi >= 100;    // needs a real load to have humps
+    bool above = false;
+    int nCross = 0;
+    float firstX = 0.0f, lastX = 0.0f;
+    uint16_t prevV = 0;
 
     unsigned long t0 = micros();
 
@@ -258,12 +316,34 @@ AllCTReadings readAllCT(float grid_voltage) {
     // Raw analogRead() counts — NOT analogReadMilliVolts(). The manufacturer's
     // 0.0123 coefficient was empirically fit against raw counts; switching to mV
     // breaks the fit because the count→mV relationship is not constant.
-    for (int s = 0; s < ADC_SAMPLES_PER_CH; s++) {
-        int sw = (s * ENV_SUBWIN) / ADC_SAMPLES_PER_CH;   // 20ms sub-window 0..ENV_SUBWIN-1
+    for (int s = 0; s < nSamples; s++) {
+        int sw = s / ENV_SUBWIN_SAMPLES;    // fixed 20ms sub-window index
         for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
             uint16_t v = (uint16_t)analogRead(CT_PINS[ch]);   // single read, reused
             sumCounts[ch] += v;
             subSum[ch][sw] += v;
+            if (v > maxCount[ch]) maxCount[ch] = v;
+            if (ch == fq) {
+                wbFeed(ch, v);              // black-box ring (one u16 store)
+                if (fqUsable) {
+                    if (!above && v >= thrHi) {
+                        // rising crossing; interpolate between s-1 and s
+                        float frac = (v > prevV && s > 0)
+                                   ? (float)(thrHi - prevV) / (float)(v - prevV)
+                                   : 0.0f;
+                        if (frac < 0.0f) frac = 0.0f;
+                        if (frac > 1.0f) frac = 1.0f;
+                        float x = (float)(s - 1) + frac;
+                        if (nCross == 0) firstX = x;
+                        lastX = x;
+                        nCross++;
+                        above = true;
+                    } else if (above && v < thrLo) {
+                        above = false;
+                    }
+                    prevV = v;
+                }
+            }
         }
         unsigned long target = t0 + (unsigned long)((s + 1) * SAMPLE_INTERVAL_US);
         while (micros() < target) {}  // Busy-wait for precise 1ms cadence
@@ -271,12 +351,28 @@ AllCTReadings readAllCT(float grid_voltage) {
 
     all.sample_duration_ms = (micros() - t0) / 1000;
 
+    // Mains frequency: humps are 1/cycle, samples are 1ms apart. Require >=5
+    // clean humps and a plausible answer; otherwise report 0 (= unknown).
+    all.mains_hz = 0.0f;
+    if (fqUsable && nCross >= 5 && lastX > firstX) {
+        float hz = (float)(nCross - 1) * 1000.0f / (lastX - firstX);
+        if (hz >= 45.0f && hz <= 65.0f) all.mains_hz = hz;
+    }
+
+    // Choose next window's frequency/black-box channel: strongest this window.
+    { int best = 0;
+      for (int ch = 1; ch < NUM_CT_CHANNELS; ch++)
+          if (maxCount[ch] > maxCount[best]) best = ch;
+      _strongCh = best;
+      for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) _prevWinMax[ch] = maxCount[ch];
+    }
+
     for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
         CTReading r = {};
         r.voltage = grid_voltage;
-        r.samples = ADC_SAMPLES_PER_CH;
+        r.samples = nSamples;
 
-        float avgCount = (float)sumCounts[ch] / ADC_SAMPLES_PER_CH;
+        float avgCount = (float)sumCounts[ch] / nSamples;
 
         // Rating-aware calibration (2.9.0) — formula chosen by the channel's CT type
         int rating = getCtRating(ch);
@@ -305,17 +401,17 @@ AllCTReadings readAllCT(float grid_voltage) {
         // Averaging each 20ms sub-window (one full mains cycle) removes the
         // carrier, so max/min/std over those means describe the LOAD. env5 was
         // always correct precisely because it was already a sub-window mean.
-        const int subN = ADC_SAMPLES_PER_CH / ENV_SUBWIN;
-        float env[ENV_SUBWIN];
+        const int subN = ENV_SUBWIN_SAMPLES;   // 20 samples = 20ms, always
+        float env[MAX_ENV_SUBWIN];
         float envSum = 0.0f, envMax = 0.0f, envMin = 3.4e38f;
-        for (int k = 0; k < ENV_SUBWIN; k++) {
+        for (int k = 0; k < n_subwin; k++) {
             env[k] = ctCountToAmps(ch, rating, (float)subSum[ch][k] / subN);
             if (isnan(env[k]) || isinf(env[k])) env[k] = 0.0f;
             envSum += env[k];
             if (env[k] > envMax) envMax = env[k];
             if (env[k] < envMin) envMin = env[k];
         }
-        float envMean = envSum / ENV_SUBWIN;
+        float envMean = envSum / n_subwin;
 
         r.peak_amps = envMax;      // highest 20ms load in the window
         r.min_amps  = envMin;      // lowest 20ms load in the window
@@ -324,8 +420,8 @@ AllCTReadings readAllCT(float grid_voltage) {
         // mean: these are small floats (not the ~1e7 sums the raw-count path
         // used), so there is no catastrophic-cancellation risk here.
         float acc = 0.0f;
-        for (int k = 0; k < ENV_SUBWIN; k++) { float d = env[k] - envMean; acc += d * d; }
-        r.ripple_amps = sqrtf(acc / ENV_SUBWIN);
+        for (int k = 0; k < n_subwin; k++) { float d = env[k] - envMean; acc += d * d; }
+        r.ripple_amps = sqrtf(acc / n_subwin);
 
         // env_peak_ratio: envelope max/mean — burstiness of the LOAD.
         // 1.0 = perfectly steady. Clamped [1,20]. The 0.05A divisor guard keeps
@@ -335,11 +431,11 @@ AllCTReadings readAllCT(float grid_voltage) {
         if (ratio > 20.0f) ratio = 20.0f;
         r.env_peak_ratio = ratio;
 
-        // env5: five 100ms means -> 5Hz envelope, in amps. Unchanged contract —
-        // built by aggregating the finer sub-windows so there is one source of
-        // truth. Exactly equal to the old value: count->amps is affine, so the
-        // mean of converted sub-windows equals the conversion of their mean.
-        const int per5 = ENV_SUBWIN / 5;
+        // env5: five equal slots across the window -> in amps. At the default
+        // 500ms window each slot is 100ms (unchanged contract); at a widened
+        // window slots stretch proportionally (window/5) — consumers should
+        // read `samples` (window ms) rather than assume 100ms slots.
+        const int per5 = n_subwin / 5;
         for (int k = 0; k < 5; k++) {
             float s5 = 0.0f;
             for (int j = 0; j < per5; j++) s5 += env[k * per5 + j];

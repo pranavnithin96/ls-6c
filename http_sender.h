@@ -1026,7 +1026,8 @@ void initHTTPSender(const String& serverUrl, const String& deviceId) {
 // QUEUE READING
 // ====================================================================
 void queueReading(const String& deviceId, const String& location, const String& timezone,
-                  float gridVoltage, CTReading readings[NUM_CT_CHANNELS], const String& timestamp) {
+                  float gridVoltage, CTReading readings[NUM_CT_CHANNELS], const String& timestamp,
+                  float mainsHz = 0.0f, int sampleMs = 0) {
 
     JsonDocument doc;
     doc["device_id"] = deviceId;
@@ -1078,6 +1079,17 @@ void queueReading(const String& deviceId, const String& location, const String& 
         }
     }
     doc["readings"]["voltage_rms"] = serialized(String(gridVoltage, 1));
+    // 2.14.0 reading-level extras (~30B, passed in by the sampling loop so a
+    // queued/backlogged reading carries ITS OWN values, not the current ones):
+    // mains_hz — grid frequency from hump timing on the strongest channel;
+    //            omitted when no channel had enough load to measure.
+    // sample_ms — actual sampling wall time; deviation from the configured
+    //             window means the cadence slipped and every envelope
+    //             statistic in this reading is suspect.
+    if (mainsHz > 0.0f)
+        doc["readings"]["mains_hz"] = serialized(String(mainsHz, 2));
+    if (sampleMs > 0)
+        doc["readings"]["sample_ms"] = sampleMs;
 
     // Serialize to fixed stack buffer — avoids heap fragmentation from String growth
     char jsonBuf[1536];

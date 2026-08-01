@@ -178,6 +178,7 @@ void setup() {
 
     // 7. CT sensors
     initCTSensors();
+    wbInit();               // black-box ring (2.14.0) — one-time heap alloc
     feedWatchdog();
 
     // 8. ALWAYS launch Core 0 task — it handles WiFi reconnect + data POST when ready
@@ -375,6 +376,9 @@ void loop() {
 
         lastReadings = readAllCT(getGridVoltage());
         updateLastReadings(lastReadings);
+        // Black-box capture request (if any) is honored HERE, between sampling
+        // windows, so its flash write can't distort a window in progress.
+        wbServiceCapture(getSampleWindowMs());
 
         if (isOfflineMode()) {
             // OFFLINE: Store to compressed binary on flash
@@ -417,7 +421,9 @@ void loop() {
                     if (sampleEpoch != 0) lastQueuedEpoch = sampleEpoch;
                     String ts = formatUTCEpoch(sampleEpoch);
                     queueReading(getDeviceId(), getLocationName(), getTimezone(),
-                                 getGridVoltage(), lastReadings.ct, ts);
+                                 getGridVoltage(), lastReadings.ct, ts,
+                                 lastReadings.mains_hz,
+                                 (int)lastReadings.sample_duration_ms);
                     xSemaphoreGive(bufferMutex);
                     // Ring-full overflow (if any) is written to /rejected.log HERE,
                     // outside the mutex — file I/O under bufferMutex starved Core 0's
