@@ -79,6 +79,9 @@ void networkTask(void* param) {
             wdtCheckpoint(WDT_CP_OTA);
             otaLoop();            // OTA check — every 1h
             esp_task_wdt_reset();
+            wdtCheckpoint(WDT_CP_WFSTREAM);
+            wbStreamLoop();       // continuous 1kHz chunk export (2.15.0, pilot)
+            esp_task_wdt_reset();
         }
 
         // Buffer save runs ALWAYS, even when WiFi is down

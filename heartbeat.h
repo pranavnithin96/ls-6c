@@ -223,6 +223,12 @@ void processCommands(const String& responseBody) {
             // itself runs on the sampling task between windows; this only
             // raises the request flag. Rate-limited to one per 10 min.
             wbRequestCapture();
+        } else if (action == "wfstream_on") {
+            // Continuous 1kHz chunk export (2.15.0, pilot devices). RAM-only,
+            // health-gated behind live data; ~1KB/s uplink when running.
+            wbSetStream(true);
+        } else if (action == "wfstream_off") {
+            wbSetStream(false);
         } else if (action == "clear_rejected") {
             clearRejectedStore();            // DESTRUCTIVE: discards parked backlog
         } else if (action == "set_reboot_days") {
@@ -294,6 +300,8 @@ void sendHeartbeat() {
     // channels that moved. ~90 bytes on a 5-minute heartbeat.
     doc["window_ms"] = getSampleWindowMs();           // sampling window (2.14.0)
     doc["wb_pending"] = wbDumpPending();              // black-box dump awaiting upload
+    doc["wfstream"] = wbStreamOn();                   // continuous 1kHz export (2.15.0)
+    doc["wfstream_seq"] = wbStreamSeq();              // delivered chunks this uptime
 
     JsonArray _ctRat = doc["ct_ratings"].to<JsonArray>();
     JsonArray _ctSlp = doc["ct_slopes"].to<JsonArray>();

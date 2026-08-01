@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.14.2"
+#define FIRMWARE_VERSION "2.15.0"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -41,6 +41,19 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define WB_RING_SAMPLES       (WB_RING_SECONDS * 1000)
 #define WB_DUMP_FILE          "/wfdump.bin"
 #define WB_MIN_CAPTURE_GAP_MS 600000UL   // rate limit: one capture per 10 min
+
+// --- Continuous waveform streaming (2.15.0, pilot devices only) ---
+// Exports the SAME black-box ring as raw 1kHz chunks over HTTP, continuously.
+// RAM-only (the ring is the source, a heap scratch buffer is the staging area)
+// — flash is never touched, so there is no wear cost at any duty cycle.
+// Default OFF; per-device enable via heartbeat wfstream_on, NVS-persisted.
+// Chunk = 3000 samples (6KB), i.e. one POST per ~6s of wall time at the 500ms
+// window (500 samples/s of ring feed) — ~1KB/s average uplink. The chunk must
+// stay well under half the ring so the Core-0 reader always trails the Core-1
+// writer by a wide safety margin (see wbStreamLoop's cushion math).
+#define WB_STREAM_CHUNK_SAMPLES  3000
+#define WB_STREAM_RETRY_MS       10000UL  // backoff after a failed chunk POST
+#define WB_STREAM_MIN_HEAP       45000    // skip cycle if heap below this
 #define CAL_POINTS            3
 // Corrected: manufacturer 0.0123 A/count, with ADC_11db 1 count = 0.756 mV
 // So 0.0123 / 0.756 = 0.01627 A/mV
