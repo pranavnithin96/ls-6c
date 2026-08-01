@@ -52,6 +52,14 @@ void wbInit() {
     else
         Serial.printf("[WB] ring ready: %ds @ 1kHz (%uB)\n",
                       WB_RING_SECONDS, WB_RING_SAMPLES * 2);
+    // A dump captured just before a reboot/OTA would otherwise be orphaned:
+    // the pending flag lives in RAM, but the file survives on flash. Re-arm
+    // the upload if one is waiting. (Safe if LittleFS isn't mounted yet —
+    // exists() just returns false and the next capture overwrites the file.)
+    if (LittleFS.exists(WB_DUMP_FILE)) {
+        _wbDumpPending = true;
+        Serial.println("[WB] found dump from before reboot - upload re-armed");
+    }
 }
 
 // Called once per sample for the chosen channel from readAllCT's loop.
@@ -112,10 +120,16 @@ static bool captureWaveform(int window_ms) {
     f.write((const uint8_t*)&h, sizeof(h));
 
     // Oldest-first: when the ring is full the oldest sample is at _wbHead.
-    uint32_t start = (_wbCount == WB_RING_SAMPLES) ? _wbHead : 0;
-    for (uint32_t i = 0; i < _wbCount; i++) {
-        uint16_t v = _wbRing[(start + i) % WB_RING_SAMPLES];
-        f.write((const uint8_t*)&v, 2);
+    // Written as at most TWO large writes (the ring's two contiguous
+    // segments), NOT per-sample — 12,000 individual 2-byte f.write() calls
+    // each pay LittleFS overhead and stalled the sampling task for seconds.
+    // ESP32 is little-endian, so dumping the uint16 array raw preserves the
+    // wire format exactly.
+    if (_wbCount == WB_RING_SAMPLES && _wbHead != 0) {
+        f.write((const uint8_t*)&_wbRing[_wbHead], (WB_RING_SAMPLES - _wbHead) * 2);
+        f.write((const uint8_t*)&_wbRing[0], _wbHead * 2);
+    } else {
+        f.write((const uint8_t*)&_wbRing[0], _wbCount * 2);
     }
     f.close();
 

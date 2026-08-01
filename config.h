@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.14.0"
+#define FIRMWARE_VERSION "2.14.1"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -34,8 +34,9 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 
 // --- Waveform black box (2.14.0) ---
 // Rolling raw-sample ring for ONE channel (the currently strongest), frozen to
-// flash and uploaded on the capture_waveform heartbeat command. Static .bss,
-// not heap — 12s x 1kHz x 2B = 24KB, always allocated, no runtime OOM risk.
+// flash and uploaded on the capture_waveform heartbeat command. Heap-allocated
+// ONCE at boot (24KB of .bss overflows the dram0 static segment); on alloc
+// failure the black box disables itself rather than crash anything.
 #define WB_RING_SECONDS       12
 #define WB_RING_SAMPLES       (WB_RING_SECONDS * 1000)
 #define WB_DUMP_FILE          "/wfdump.bin"

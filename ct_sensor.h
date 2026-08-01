@@ -334,6 +334,7 @@ AllCTReadings readAllCT(float grid_voltage) {
                         if (frac < 0.0f) frac = 0.0f;
                         if (frac > 1.0f) frac = 1.0f;
                         float x = (float)(s - 1) + frac;
+                        if (x < 0.0f) x = 0.0f;   // s==0: no s-1 to interpolate from
                         if (nCross == 0) firstX = x;
                         lastX = x;
                         nCross++;
