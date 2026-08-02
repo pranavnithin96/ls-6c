@@ -378,10 +378,16 @@ AllCTReadings readAllCT(float grid_voltage) {
     }
 
     // Choose next window's frequency/black-box channel: strongest this window.
+    // 2.15.1: only ADOPT a new channel when it carries a real load. When every
+    // channel idles near zero (machine parked), the argmax jitters across ADC
+    // noise on EMPTY channels and each switch resets the black-box ring —
+    // measured on meton_01: 445 ring resets in 5h of streaming, truncating
+    // exactly the between-part parks the stream exists to record. Below the
+    // floor, keep the incumbent: the ring then records the park intact.
     { int best = 0;
       for (int ch = 1; ch < NUM_CT_CHANNELS; ch++)
           if (maxCount[ch] > maxCount[best]) best = ch;
-      _strongCh = best;
+      if (maxCount[best] >= 100 && best != _strongCh) _strongCh = best;
       for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) _prevWinMax[ch] = maxCount[ch];
     }
 
