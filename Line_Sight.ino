@@ -383,7 +383,11 @@ void loop() {
         // windows, so its flash write can't distort a window in progress.
         wbServiceCapture(getSampleWindowMs());
 
-        if (isOfflineMode()) {
+        if (isOfflineMode() || otaForcedActive()) {
+            // Forced-OTA quiet window (2.16): readings divert into the
+            // compressed offline store (550KB budget — the real outage
+            // machinery), NOT the small rejected log. Recovered by the
+            // normal boot/online drain after the update.
             // OFFLINE: Store to compressed binary on flash
             storeOfflineReading(lastReadings.ct);
 

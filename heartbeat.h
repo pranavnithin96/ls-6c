@@ -183,6 +183,11 @@ void processCommands(const String& responseBody) {
         } else if (action == "set_voltage") {
             float val = cmd["value"] | -1.0f;
             setGridVoltage(val);           // live + persisted (range-checked inside) — Defect 2
+        } else if (action == "reboot" && isUpdateInProgress()) {
+            // Review fix: a reboot/reset landing mid-download discards the
+            // whole journey at the last moment. Defer; retry after the
+            // journey ends (operator sees the deferral in the error log).
+            logError("cmd 'reboot' deferred: OTA in progress");
         } else if (action == "reboot") {
             flushBeforeRestart();
             delay(500);
@@ -302,25 +307,23 @@ void sendHeartbeat() {
         doc["ota_target"] = otaJourneyVersion();
     }
     // "done updating" report persisted by the finalize step of the PREVIOUS
-    // firmware. Carried on the first TWO heartbeats (the first POST of a
-    // fresh boot on a shaky link can fail — clearing on build would lose the
-    // report; a duplicate is harmless telemetry), then cleared from NVS.
-    static int _otaRepSends = 0;
-    if (_otaRepSends < 2) {
-        Preferences p; p.begin("otastate", false);
+    // firmware. Included on EVERY heartbeat until one actually DELIVERS
+    // (review fix: clearing on build lost the report if the first posts
+    // failed on a shaky post-update link); cleared in the 200 handler.
+    static bool _otaRepPending = false;
+    static bool _otaRepChecked = false;
+    if (!_otaRepChecked || _otaRepPending) {
+        _otaRepChecked = true;
+        Preferences p; p.begin("otastate", true);
         String f = p.getString("rep_f", "");
         if (f.length()) {
+            _otaRepPending = true;
             doc["ota_done_from"] = f;
             doc["ota_done_to"] = p.getString("rep_t", "");
             doc["ota_done_ms"] = p.getUInt("rep_ms", 0);
             doc["ota_done_attempts"] = (int)p.getUShort("rep_at", 0);
-            _otaRepSends++;
-            if (_otaRepSends >= 2) {
-                p.remove("rep_f"); p.remove("rep_t");
-                p.remove("rep_ms"); p.remove("rep_at");
-            }
         } else {
-            _otaRepSends = 2;   // nothing to report; stop checking
+            _otaRepPending = false;
         }
         p.end();
     }
@@ -353,10 +356,12 @@ void sendHeartbeat() {
     char snapTs[MAX_ERROR_LOG][32];
     char snapMsg[MAX_ERROR_LOG][128];
     int errCount = 0;
+    int snapStart = 0;   // captured for the post-200 partial clear
 
     portENTER_CRITICAL(&_errMux);
     if (_errorCount > 0) {
         int start = (_errorCount >= MAX_ERROR_LOG) ? _errorHead : 0;
+        snapStart = start;
         errCount = min(_errorCount, (int)MAX_ERROR_LOG);
         for (int i = 0; i < errCount; i++) {
             int idx = (start + i) % MAX_ERROR_LOG;
@@ -390,14 +395,34 @@ void sendHeartbeat() {
             ESP.getFreeHeap(), getQueueSize(), getTotalSent());
         processCommands(response);
 
-        // Clear error log after successful send — prevents stale errors repeating
+        // Clear ONLY the entries we actually sent (review fix: the old
+        // wholesale clear destroyed errors logged by Core 1 during the POST
+        // itself — exactly when OTA/ring-full errors are being logged).
+        // Survivors (logged mid-POST) are compacted to the front so the
+        // "unwrapped entries start at slot 0" invariant holds.
         if (errCount > 0) {
             portENTER_CRITICAL(&_errMux);
-            _errorHead = 0;
-            _errorCount = 0;
+            int survivors = _errorCount - errCount;
+            if (survivors < 0) survivors = 0;
+            if (survivors > MAX_ERROR_LOG) survivors = MAX_ERROR_LOG;
+            for (int i = 0; i < survivors; i++) {
+                int src = (snapStart + errCount + i) % MAX_ERROR_LOG;
+                if (src != i) _errorLog[i] = _errorLog[src];
+            }
+            _errorHead = survivors % MAX_ERROR_LOG;
+            _errorCount = survivors;
             _errorsDirty = true;
             portEXIT_CRITICAL(&_errMux);
             saveErrorsToFlash();  // Persist the cleared state
+        }
+        // OTA done-report delivered — safe to clear it from NVS now
+        {
+            Preferences p; p.begin("otastate", false);
+            if (p.isKey("rep_f")) {
+                p.remove("rep_f"); p.remove("rep_t");
+                p.remove("rep_ms"); p.remove("rep_at");
+            }
+            p.end();
         }
     } else if (httpCode > 0) {
         Serial.printf("[HB] HTTP %d\n", httpCode);

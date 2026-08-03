@@ -172,12 +172,16 @@ static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
 // link is provably healthy. FORCE (update_firmware command) suspends the
 // live pipeline (Core 1 parks readings to flash — outage machinery) and owns
 // the uplink until done or capped. Both resume via HTTP Range + If-Range.
-#define OTA_AUTO_PASS_BUDGET_MS   45000UL   // max download time per otaLoop pass
+// Auto-slice budget sits UNDER the 30s live ring (MAX_BUFFER_SIZE): a maxed
+// slice can't overflow the ring, so healthy-link auto updates park nothing.
+#define OTA_AUTO_PASS_BUDGET_MS   25000UL   // max download time per otaLoop pass
 #define OTA_AUTO_JOURNEY_TTL_MS   1800000UL // give up an auto journey after 30 min
 #define OTA_FORCE_MAX_MS          900000UL  // forced mode hard cap: 15 min dark
 #define OTA_STALL_MS              20000UL   // no bytes this long -> reconnect+resume
-#define OTA_HB_INTERVAL_MS        60000UL   // forced-mode narration heartbeat cadence
 #define OTA_MIN_HEAP              45000     // don't download below this heap
+#define OTA_FIRST_CHECK_MS        300000UL  // first check 5 min after boot
+#define OTA_OPEN_PACE_MS          5000UL    // min gap between connection opens
+#define OTA_FORCE_CHECK_RETRY_MS  10000UL   // force-command check retry pacing
 
 // --- Diagnostics ---
 #define WDT_TIMEOUT_S         60
