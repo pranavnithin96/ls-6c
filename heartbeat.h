@@ -192,6 +192,11 @@ void processCommands(const String& responseBody) {
         } else if (action == "debug_off") {
             setHTTPDebug(false);
         } else if (action == "update_firmware") {
+            // 2.16: this is now the FORCE path — deliberate quiet-window
+            // update (suspends live pipeline, owns the uplink, 15-min cap).
+            otaForceUpdate();
+        } else if (action == "check_update") {
+            // the old light behavior: nudge the hourly AUTO check
             forceOTACheck();
         } else if (action == "wfstats_on") {
             setWaveformStats(true);          // enable waveform features on this unit
@@ -288,6 +293,37 @@ void sendHeartbeat() {
     doc["mac"] = WiFi.macAddress();                   // stable hardware identity
     doc["build"] = __DATE__ " " __TIME__;             // exact build, beyond version string
     doc["ntp_sync_age_s"] = getNtpSyncAgeS();         // seconds since last SNTP sync (-1 never)
+
+    // --- OTA narration (2.16): the device explains its update lifecycle ---
+    doc["ota_status"] = otaStatusStr();               // idle|downloading|flashing|failed
+    if (otaTotal() > 0) {
+        doc["ota_progress"] = otaProgress();          // bytes written so far
+        doc["ota_total"] = otaTotal();
+        doc["ota_target"] = otaJourneyVersion();
+    }
+    // "done updating" report persisted by the finalize step of the PREVIOUS
+    // firmware. Carried on the first TWO heartbeats (the first POST of a
+    // fresh boot on a shaky link can fail — clearing on build would lose the
+    // report; a duplicate is harmless telemetry), then cleared from NVS.
+    static int _otaRepSends = 0;
+    if (_otaRepSends < 2) {
+        Preferences p; p.begin("otastate", false);
+        String f = p.getString("rep_f", "");
+        if (f.length()) {
+            doc["ota_done_from"] = f;
+            doc["ota_done_to"] = p.getString("rep_t", "");
+            doc["ota_done_ms"] = p.getUInt("rep_ms", 0);
+            doc["ota_done_attempts"] = (int)p.getUShort("rep_at", 0);
+            _otaRepSends++;
+            if (_otaRepSends >= 2) {
+                p.remove("rep_f"); p.remove("rep_t");
+                p.remove("rep_ms"); p.remove("rep_at");
+            }
+        } else {
+            _otaRepSends = 2;   // nothing to report; stop checking
+        }
+        p.end();
+    }
 
     // --- Per-channel CT calibration state (2.13.0) ---
     // The rating lives only in device NVS and was never reported, so the server

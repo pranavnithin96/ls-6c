@@ -1157,10 +1157,19 @@ static int _livePost(const char* body, uint16_t len) {
 // ====================================================================
 // PROCESS SEND QUEUE — Clean control flow, no goto
 // ====================================================================
+bool otaForcedActive();   // ota_updater.h (included after this file)
+
 void processSendQueue() {
     if (WiFi.status() != WL_CONNECTED) {
         if (_wifiDownSince == 0) _wifiDownSince = millis();
         troubleSave();   // ring -> flash while the link is down (<=5 s exposure)
+        return;
+    }
+    // FORCED OTA owns the uplink: suspend live sends + drains. Core 1's
+    // enqueue path parks every reading to flash (the outage machinery), so
+    // this is a deliberate, zero-loss quiet window — max OTA_FORCE_MAX_MS.
+    if (otaForcedActive()) {
+        troubleSave();   // keep the ring flushed to flash during the window
         return;
     }
     _wifiDownSince = 0;

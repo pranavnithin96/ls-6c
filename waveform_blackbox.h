@@ -248,19 +248,22 @@ static bool          _wsHttpInit = false;
 bool     wbStreamOn()  { return _wsEnabled; }
 uint32_t wbStreamSeq() { return _wsSeq; }
 
+// 2.16: streaming is STRICTLY on-request — RAM flag only, never persisted.
+// Every boot starts quiet; a wfstream_on command must arrive each time the
+// operator wants the hose open. A power-cycled/rebooted device can never
+// resume streaming on its own (owner decision 2026-08-03).
 void wbSetStream(bool on) {
     _wsEnabled = on;
-    Preferences p; p.begin("lscfg", false);
-    p.putBool("wfstream", on);
-    p.end();
-    Serial.printf("[WS] streaming %s\n", on ? "ENABLED" : "disabled");
+    Serial.printf("[WS] streaming %s (session-only, not persisted)\n",
+                  on ? "ENABLED" : "disabled");
 }
 
 static void wbLoadStreamPref() {
-    Preferences p; p.begin("lscfg", true);
-    _wsEnabled = p.getBool("wfstream", false);
+    // one-time cleanup of the 2.15.0 persisted flag, then always-off at boot
+    Preferences p; p.begin("lscfg", false);
+    if (p.isKey("wfstream")) p.remove("wfstream");
     p.end();
-    if (_wsEnabled) Serial.println("[WS] streaming enabled (persisted)");
+    _wsEnabled = false;
 }
 
 // Core 0, every networkTask cycle (WiFi already confirmed up by the caller).

@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.15.1"
+#define FIRMWARE_VERSION "2.16.0"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -164,13 +164,20 @@ static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
 #define MAX_ERROR_LOG         30
 #define ERROR_SAVE_INTERVAL_MS 300000
 
-// --- OTA ---
+// --- OTA (2.16 resilient design) ---
 #define OTA_CHECK_INTERVAL_MS 3600000  // 1 hour
-#define OTA_DOWNLOAD_TIMEOUT  300000   // 300 seconds (1MB at 4KBps worst-case Indian WiFi)
-#define OTA_RETRY_DELAY_MS    10000   // 10s before retry on failure
-#define OTA_MAX_RETRIES       3       // Retry download up to 3 times
 #define MAX_CRASH_COUNT       3
 #define OTA_MAX_SIZE          0x140000 // 1,310,720 bytes (partition size)
+// AUTO journeys download in short slices between live sends; only while the
+// link is provably healthy. FORCE (update_firmware command) suspends the
+// live pipeline (Core 1 parks readings to flash — outage machinery) and owns
+// the uplink until done or capped. Both resume via HTTP Range + If-Range.
+#define OTA_AUTO_PASS_BUDGET_MS   45000UL   // max download time per otaLoop pass
+#define OTA_AUTO_JOURNEY_TTL_MS   1800000UL // give up an auto journey after 30 min
+#define OTA_FORCE_MAX_MS          900000UL  // forced mode hard cap: 15 min dark
+#define OTA_STALL_MS              20000UL   // no bytes this long -> reconnect+resume
+#define OTA_HB_INTERVAL_MS        60000UL   // forced-mode narration heartbeat cadence
+#define OTA_MIN_HEAP              45000     // don't download below this heap
 
 // --- Diagnostics ---
 #define WDT_TIMEOUT_S         60
