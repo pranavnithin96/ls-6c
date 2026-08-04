@@ -1,439 +1,236 @@
 /*
- * LineSights LS-6C-IOT v2.0.0 — Industrial Power Monitor
- * ESP32-WROOM-32E | 6-channel CT current sensing
+ * LineSights LS-6C-IOT v3 refactor
  *
- * Architecture:
- *   Core 1 (main):  Phase-locked 1s CT sampling, serial commands, button
- *   Core 0 (net):   Serialized HTTP POST, heartbeat, OTA, diagnostics
- *   Shared data:    Ring buffer protected by mutex
- *
- * Key fixes in v2.0.0:
- *   - Mutex-protected ring buffer (was created but never used)
- *   - Guaranteed http.end() on all code paths (socket leak fix)
- *   - Fixed calibration math: 0.01627 A/mV (was 0.01526, -6.2% error)
- *   - Timestamps at sample time, not queue time (was 950ms off)
- *   - LittleFS with atomic writes (was SPIFFS with corruption risk)
- *   - Removed web server in station mode (was leaking sockets)
- *   - WiFi uses reconnect() with exponential backoff + jitter
- *   - OTA: partition size check, version comparison, download integrity
- *   - AP portal: PIN authentication (was open to anyone)
- *   - Thread-safe LED and error log (was unprotected cross-core)
- *   - Reduced WDT to 60s, uint32_t counters, broader crash detection
- *   - Non-blocking NTP, mDNS lifecycle cleanup, reconnect jitter
+ * Core 1 owns acquisition. A completed reading is synchronously committed to
+ * the CRC-protected WAL before its sequence advances. Core 0 owns every network
+ * operation. Wi-Fi availability therefore changes delivery latency, never data
+ * ownership.
  */
 
-#include <Preferences.h>
+#include <Arduino.h>
+#include <esp_task_wdt.h>
+
+#include "app_types.h"
+#include "clock_service.h"
 #include "config.h"
-#include "led_status.h"
-#include "diagnostics.h"
-#include "wifi_manager.h"
-#include "ct_sensor.h"
-#include "http_sender.h"
-#include "ota_updater.h"
-#include "web_status.h"
-#include "heartbeat.h"
+#include "durable_queue.h"
+#include "heartbeat_service.h"
+#include "led_service.h"
+#include "measurement_service.h"
+#include "ota_service.h"
+#include "settings_service.h"
+#include "transport_service.h"
+#include "wifi_service.h"
 
-// ============================================================================
-// Shared State
-// ============================================================================
-static SemaphoreHandle_t bufferMutex = NULL;
-static volatile bool networkReady = false;
-static volatile bool wifiConnected = false;  // Updated ONLY by Core 0
-static unsigned long lastReadingTime = 0;
-static unsigned long bootButtonPressStart = 0;
-static AllCTReadings lastReadings = {};
+namespace {
 
-// ============================================================================
-// Network Task — Core 0, serialized operations, vTaskDelayUntil
-// ============================================================================
-void networkTask(void* param) {
-    Serial.println("[NET] Core 0 network task started");
-    esp_task_wdt_add(NULL);
+fw::SettingsService settings;
+fw::ClockService clockService;
+fw::DurableQueue durableQueue;
+fw::MeasurementService measurement;
+fw::WifiService wifi;
+fw::TransportService transport;
+fw::HeartbeatService heartbeat;
+fw::OtaService ota;
+fw::LedService led;
+fw::ControlFlags controls;
 
-    TickType_t xLastWake = xTaskGetTickCount();
-    const TickType_t xPeriod = pdMS_TO_TICKS(100);  // 100ms deterministic cycle
+TaskHandle_t networkTaskHandle = nullptr;
+uint32_t nextSequence = 1;
+uint32_t nextSampleMillis = 0;
+fw::ElectricalReading pendingReading;
+bool pendingCommit = false;
+bool applicationReady = false;
+uint32_t lastStorageRecoveryMillis = 0;
+uint32_t lastReadingEpoch = 0;
 
-    for (;;) {
-        vTaskDelayUntil(&xLastWake, xPeriod);
-        esp_task_wdt_reset();
-
-        // WiFi management — ONLY Core 0 calls isWiFiConnected()
-        wifiConnected = isWiFiConnected();
-
-        if (wifiConnected) {
-            // Feed the WDT BETWEEN subsystems, not just at the top of the
-            // cycle. Under a stalled router every endpoint stalls at once,
-            // and the serialized worst cases stack: _livePost ~40s (2
-            // attempts x connect 5s + write 10 retries x 1s select + read
-            // 5s, measured from the 2.0.17 core) + heartbeat ~20s + drain
-            // ~20s > the 60s WDT — the reboot-every-~100s loop observed at
-            // Meton 2026-07-25. No SINGLE call can reach 60s, so feeding
-            // between calls removes the accumulation trip while a genuine
-            // hang inside one call still resets, as a watchdog should.
-            wdtCheckpoint(WDT_CP_SENDQUEUE);
-            processSendQueue();   // Data POST — highest priority
-            esp_task_wdt_reset();
-            wdtCheckpoint(WDT_CP_HEARTBEAT);
-            heartbeatLoop();      // Heartbeat — every 60s
-            esp_task_wdt_reset();
-            wdtCheckpoint(WDT_CP_OTA);
-            otaLoop();            // OTA check — every 1h
-            esp_task_wdt_reset();
-        }
-
-        // Buffer save runs ALWAYS, even when WiFi is down
-        // (processSendQueue skips this when disconnected)
-        wdtCheckpoint(WDT_CP_BUFSAVE);
-        periodicBufferSave();
-        wdtCheckpoint(WDT_CP_IDLE);
-
-        diagnosticsLoop();
-        scheduledRebootLoop();    // 7-day maintenance reboot, safe-gated
+const char* storageStateName(fw::StorageState state) {
+    switch (state) {
+        case fw::StorageState::Ready: return "ready";
+        case fw::StorageState::CapacityBlocked: return "CAPACITY BLOCKED";
+        case fw::StorageState::Fault: return "FAULT";
+        default: return "uninitialized";
     }
 }
 
-// ============================================================================
-// Status Print
-// ============================================================================
 void printStatus() {
-    AllCTReadings r = getLastReadings();
-
-    Serial.println("\n=== Device Status ===");
-    Serial.printf("  Firmware:  v%s\n", FIRMWARE_VERSION);
-    Serial.printf("  Device:    %s @ %s\n", getDeviceId().c_str(), getLocationName().c_str());
-    Serial.printf("  WiFi:      %s (RSSI: %d dBm)\n",
-        WiFi.status() == WL_CONNECTED ? "connected" : "disconnected", WiFi.RSSI());
-    Serial.printf("  IP:        %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("  Server:    %s\n", getServerUrl().c_str());
-    Serial.printf("  Uptime:    %lus | Heap: %u\n", getUptimeSeconds(), ESP.getFreeHeap());
-    Serial.printf("  Queue:     %d | Sent: %u | Failed: %u | Dropped: %u\n",
-        getQueueSize(), getTotalSent(), getTotalFailed(), getTotalDropped());
-    Serial.printf("  Cal:       %s | MultiCal: %s\n",
-        isCTCalibrated() ? "yes" : "no", isMultiCalLoaded() ? "yes" : "no");
-    for (int i = 0; i < NUM_CT_CHANNELS; i++) {
-        Serial.printf("  CT%d: %.3fA | %.1fW | %dmV\n",
-            i + 1, r.ct[i].amps, r.ct[i].watts, r.ct[i].avg_mv);
-    }
-    Serial.printf("  Total: %.1fW\n", r.total_watts);
-    Serial.println("=====================\n");
+    const fw::DeliveryStats stats = durableQueue.stats();
+    Serial.println("\n=== LineSights status ===");
+    Serial.printf("Firmware: %s | boot:%u | next sequence:%u\n",
+                  fw::kFirmwareVersion, settings.bootId(), nextSequence);
+    Serial.printf("Device: %s @ %s\n", settings.config().deviceId.c_str(),
+                  settings.config().location.c_str());
+    Serial.printf("Wi-Fi: %s | RSSI:%d | reconnects:%u\n",
+                  wifi.connected() ? "connected" : "disconnected",
+                  wifi.rssi(), wifi.reconnects());
+    Serial.printf("Storage: %s | WAL:%u records/%u bytes | offline:%u | legacy JSON:%u | free:%u\n",
+                  storageStateName(durableQueue.state()), durableQueue.walDepth(),
+                  durableQueue.walBytes(), durableQueue.offlineBytes(),
+                  durableQueue.legacyJsonBytes(), durableQueue.freeBytes());
+    Serial.printf("Generated:%u durable:%u live ACK:%u bulk ACK:%u retries:%u local failures:%u losses:%u\n",
+                  stats.generated, stats.durable, stats.liveAcknowledged,
+                  stats.bulkAcknowledged, stats.retries, stats.localWriteFailures,
+                  stats.permanentLosses);
+    Serial.println("=========================\n");
 }
 
-// ============================================================================
-// Setup — Proper boot order: mutex FIRST, then everything else
-// ============================================================================
+void processSerial() {
+    static char buffer[128];
+    static size_t length = 0;
+    while (Serial.available()) {
+        const char value = Serial.read();
+        if (value != '\n' && value != '\r') {
+            if (length + 1 < sizeof(buffer)) buffer[length++] = value;
+            continue;
+        }
+        if (length == 0) continue;
+        buffer[length] = '\0';
+        String command(buffer);
+        length = 0;
+        command.trim();
+        if (command == "status") {
+            printStatus();
+        } else if (command == "update") {
+            controls.otaRequested = true;
+        } else if (command == "reboot") {
+            controls.rebootRequested = true;
+        } else if (command.startsWith("setinterval ")) {
+            const int value = command.substring(12).toInt();
+            Serial.println(settings.setInterval(value) ? "Interval updated" : "Invalid interval/write failure");
+        } else if (command.startsWith("setvoltage ")) {
+            const float value = command.substring(11).toFloat();
+            Serial.println(settings.setVoltage(value) ? "Voltage updated" : "Invalid voltage/write failure");
+        } else if (command.startsWith("setslope ")) {
+            int channel = 0;
+            float slope = -1;
+            const bool parsed = sscanf(command.c_str(), "setslope %d %f", &channel, &slope) == 2;
+            Serial.println(parsed && settings.setChannelSlope(channel - 1, slope)
+                               ? "Slope updated" : "Usage: setslope <1-6> <0 or 0.001-0.5>");
+        } else {
+            Serial.println("Commands: status | update | reboot | setinterval N | setvoltage V | setslope CH VALUE");
+        }
+    }
+}
+
+void networkTask(void*) {
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        wifi.loop();
+        const bool connected = wifi.connected();
+        clockService.loop(connected);
+        transport.loop(connected);
+        heartbeat.loop(connected);
+        ota.loop(connected, durableQueue.state() == fw::StorageState::Ready);
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(fw::kNetworkLoopMs));
+    }
+}
+
+void restartSafely() {
+    // There is no RAM-only send queue: every completed reading is already in the
+    // WAL. A best-effort checkpoint reduces duplicate replay after the reboot.
+    durableQueue.checkpoint();
+    delay(250);
+    ESP.restart();
+}
+
+}  // namespace
+
 void setup() {
     Serial.begin(115200);
-    delay(500);
+    delay(250);
+    Serial.printf("\nLineSights LS-6C-IOT %s\n", fw::kFirmwareVersion);
+    led.begin();
+    led.set(fw::LedState::Booting);
 
-    Serial.println();
-    Serial.println("========================================");
-    Serial.printf("  LineSights Power Monitor v%s\n", FIRMWARE_VERSION);
-    Serial.println("  LS-6C-IOT_V1.0 | ESP32-WROOM-32E");
-    Serial.println("========================================");
-
-    // 1. Firmware rollback check (must be first)
-    checkFirmwareRollback();
-
-    // 2. Create mutex BEFORE anything that might use it
-    bufferMutex = xSemaphoreCreateMutex();
-
-    // 3. Hardware init
-    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-    initLED();
-    setLEDState(LED_BOOTING);
-    initReadingsMutex();
-
-    // 4. Diagnostics & watchdog
-    initDiagnostics();
-    initScheduledReboot();
-    feedWatchdog();
-
-    // 5. WiFi
-    setLEDState(LED_WIFI_CONNECTING);
-    initWiFiManager();
-    feedWatchdog();
-
-    if (isAPMode()) {
-        setLEDState(LED_WIFI_AP_MODE);
-        Serial.println("\n*** SETUP MODE ***");
-        Serial.println("Connect to WiFi shown above, open http://192.168.4.1");
-        Serial.println("Enter the PIN shown above to save configuration");
-        Serial.println("******************\n");
+    if (!settings.begin()) {
+        Serial.println("[FATAL] NVS state unavailable; acquisition is fail-closed");
+        led.set(fw::LedState::StorageFault);
         return;
     }
-
-    // 6. ALWAYS init sender + LittleFS (even without WiFi — needed for offline storage)
-    initHTTPSender(getServerUrl(), getDeviceId());
-    setBufferMutex(bufferMutex);
-    initHeartbeat(getServerUrl());
-    initOTAUpdater(getDeviceId(), getServerUrl());
-    initStatusServer();
-
-    if (isWiFiConnected()) {
-        syncNTP();
-        feedWatchdog();
+    const bool storageReady = durableQueue.begin(settings.config().deviceId);
+    if (!storageReady) {
+        Serial.printf("[FATAL] Durable storage %s; no reading will be sampled and discarded\n",
+                      storageStateName(durableQueue.state()));
     }
 
-    networkReady = true;  // ALWAYS true — Core 0 checks WiFi per-operation
+    measurement.begin(settings.config());
+    clockService.begin();
+    wifi.begin(settings);
+    transport.begin(settings, clockService, durableQueue);
+    heartbeat.begin(transport.heartbeatUrl(), settings, wifi, clockService,
+                    durableQueue, controls);
+    ota.begin(transport.firmwareBaseUrl(), settings.config().deviceId,
+              durableQueue, controls);
 
-    // 7. CT sensors
-    initCTSensors();
-    feedWatchdog();
-
-    // 8. ALWAYS launch Core 0 task — it handles WiFi reconnect + data POST when ready
-    xTaskCreatePinnedToCore(networkTask, "Net", NETWORK_TASK_STACK, NULL, 1, NULL, 0);
-
-    setLEDState(LED_RUNNING);
-
-    Serial.println("\n--- Configuration ---");
-    Serial.printf("  Device:    %s\n", getDeviceId().c_str());
-    Serial.printf("  Location:  %s\n", getLocationName().c_str());
-    Serial.printf("  Server:    %s\n", getServerUrl().c_str());
-    Serial.printf("  Voltage:   %.0fV | Interval: %ds\n", getGridVoltage(), getSendInterval());
-    Serial.println("---------------------");
-    Serial.println("Commands: status | setslope | slopes | calpoint | debug | reset | update");
-    Serial.println("Monitoring started...\n");
+    esp_task_wdt_init(fw::kWatchdogSeconds, true);
+    esp_task_wdt_add(nullptr);
+    xTaskCreatePinnedToCore(networkTask, "network", fw::kNetworkTaskStack, nullptr,
+                            1, &networkTaskHandle, 0);
+    nextSampleMillis = millis();
+    applicationReady = storageReady && settings.isProvisioned();
+    led.set(settings.isProvisioned() ? fw::LedState::Connecting : fw::LedState::Provisioning);
+    Serial.println("Commands: status | update | reboot | setinterval N | setvoltage V | setslope CH VALUE");
 }
 
-// ============================================================================
-// Main Loop — Core 1, phase-locked sampling
-// ============================================================================
 void loop() {
-    feedWatchdog();
-    updateLED();
+    esp_task_wdt_reset();
+    led.loop();
+    processSerial();
 
-    // --- Serial Commands (non-blocking — never stalls sampling) ---
-    static char _cmdBuf[129];
-    static int _cmdLen = 0;
-    static bool _cmdReady = false;
-    while (Serial.available()) {
-        char c = Serial.read();
-        if (c == '\n' || c == '\r') {
-            if (_cmdLen > 0) _cmdReady = true;
-            break;
+    if (controls.rebootRequested) restartSafely();
+    if (!applicationReady) {
+        if (settings.isProvisioned() && durableQueue.filesystemReady() &&
+            millis() - lastStorageRecoveryMillis >= 5000UL) {
+            lastStorageRecoveryMillis = millis();
+            applicationReady = durableQueue.recover();
+            if (applicationReady) nextSampleMillis = millis();
         }
-        if (_cmdLen < 128) _cmdBuf[_cmdLen++] = c;
-    }
-    if (_cmdReady) {
-        _cmdBuf[_cmdLen] = '\0';
-        String cmd = String(_cmdBuf);
-        _cmdLen = 0;
-        _cmdReady = false;
-        cmd.trim();
-        feedWatchdog();
-
-        if (cmd == "status") {
-            printStatus();
-        } else if (cmd == "debug") {
-            setHTTPDebug(!getHTTPDebug());
-            Serial.printf("[CMD] HTTP debug: %s\n", getHTTPDebug() ? "ON" : "OFF");
-        } else if (cmd.startsWith("calpoint ")) {
-            int ch = 0, pt = 0; float amps = 0;
-            if (sscanf(cmd.c_str(), "calpoint %d %d %f", &ch, &pt, &amps) == 3) {
-                setCalPoint(ch - 1, pt, amps);
-            } else {
-                Serial.println("Usage: calpoint <ch 1-6> <point 0-2> <amps>");
-            }
-        } else if (cmd.startsWith("setslope ")) {
-            int ch = 0; float slope = -1;
-            if (sscanf(cmd.c_str(), "setslope %d %f", &ch, &slope) == 2 &&
-                setChannelSlope(ch - 1, slope)) {
-                // setChannelSlope prints the confirmation
-            } else {
-                Serial.println("Usage: setslope <ch 1-6> <A/count, 0 clears>  e.g. setslope 1 0.0421");
-            }
-        } else if (cmd == "slopes") {
-            Serial.println("Per-channel CT slopes (0 = rating default):");
-            for (int i = 0; i < NUM_CT_CHANNELS; i++) {
-                float s = getChannelSlope(i);
-                if (s > 0) Serial.printf("  CH%d: %.5f A/count (calibrated)\n", i + 1, s);
-                else       Serial.printf("  CH%d: rating default (%dA)\n", i + 1, getCtRating(i));
-            }
-        } else if (cmd == "test_offline") {
-            int testSecs = 25;  // 25 readings = 2 full blocks (10 each) + 5 partial
-            Serial.printf("[TEST] Storing %d offline readings...\n", testSecs);
-            _offlineTestLock = true;
-            enterOfflineMode(getDeviceId());
-            int count = 0;
-            while (count < testSecs) {
-                feedWatchdog();
-                if (millis() - lastReadingTime >= 1000) {
-                    lastReadingTime = millis();
-                    lastReadings = readAllCT(getGridVoltage());
-                    storeOfflineReading(lastReadings.ct);
-                    count++;
-                    Serial.printf("[TEST] %d/%d stored:%u file:%uB heap:%u\n",
-                        count, testSecs, getOfflineStored(),
-                        getOfflineFileSize(), ESP.getFreeHeap());
-                }
-            }
-            Serial.printf("[TEST] Done. Releasing offline mode — upload should follow\n");
-            _offlineTestLock = false;
-            exitOfflineMode();
-        } else if (cmd == "update") {
-            forceOTACheck();
-        } else if (cmd == "reset") {
-            Serial.println("Type 'reset_confirm' to factory reset");
-        } else if (cmd == "reset_confirm") {
-            Serial.println("[RESET] Factory reset!");
-            flushBeforeRestart();
-            Preferences p; p.begin("lscfg", false); p.clear(); p.end();
-            delay(500);
-            ESP.restart();
-        }
-    }
-
-    // --- Factory Reset Button (hold BOOT 5s) ---
-    if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
-        if (bootButtonPressStart == 0) {
-            bootButtonPressStart = millis();
-        } else if (millis() - bootButtonPressStart >= FACTORY_RESET_HOLD_MS) {
-            Serial.println("[RESET] Button factory reset!");
-            flushBeforeRestart();
-            feedWatchdog();
-            Preferences p; p.begin("lscfg", false); p.clear(); p.end();
-            delay(1000);
-            ESP.restart();
-        }
-    } else {
-        bootButtonPressStart = 0;
-    }
-
-    // --- AP Mode Loop ---
-    if (isAPMode()) {
-        isWiFiConnected();  // Processes DNS + AP server
+        led.set(wifi.provisioning() ? fw::LedState::Provisioning : fw::LedState::StorageFault);
         delay(10);
         return;
     }
 
-    // --- WiFi State + Offline Mode (reads volatile wifiConnected from Core 0) ---
-    static unsigned long wifiDownStart = 0;
-    static bool wasConnected = false;
-    if (!wifiConnected) {
-        if (wasConnected) {
-            // Blink while reconnecting, not off — a dark LED reads as a dead board.
-            // Solid = connected, blinking = trying to reconnect, off = no power.
-            setLEDState(LED_WIFI_CONNECTING);
-            recordWiFiReconnect();
-            logError("WiFi disconnected");
-            wasConnected = false;
-        }
-        if (wifiDownStart == 0) wifiDownStart = millis();
-
-        // Enter offline mode after grace period
-        if (!isOfflineMode() && (millis() - wifiDownStart > OFFLINE_GRACE_MS)) {
-            // Only set the flag — don't do saveBufferToFlash here (Core 0 handles it)
-            enterOfflineMode(getDeviceId());
-        }
+    if (durableQueue.state() != fw::StorageState::Ready) {
+        led.set(fw::LedState::StorageFault);
+    } else if (ota.updating()) {
+        led.set(fw::LedState::Updating);
     } else {
-        if (!wasConnected) {
-            setLEDState(LED_RUNNING);
-            wasConnected = true;
-        }
-        wifiDownStart = 0;
+        led.set(wifi.connected() ? fw::LedState::Running : fw::LedState::Connecting);
     }
 
-    // --- NTP retry: never give up while unsynced ---
-    // Post-outage the router/WAN often comes up minutes AFTER the ESP32; the old
-    // max-5-then-stop left the clock unsynced for the whole uptime, so every
-    // offline block was flagged UNSYNCED and staged unresolved server-side.
-    // First 5 tries at 30s, then every 15 min. Once synced, zero further cost.
-    static unsigned long lastNTPRetry = 0;
-    static int ntpRetries = 0;
-    static bool ntpSynced = false;
-    if (wifiConnected && !ntpSynced &&
-        millis() - lastNTPRetry > (ntpRetries < 5 ? 30000UL : 900000UL)) {
-        struct tm t;
-        if (getLocalTime(&t, 0)) {
-            ntpSynced = true;
+    if (pendingCommit) {
+        if (durableQueue.commit(pendingReading)) {
+            pendingCommit = false;
+            ++nextSequence;
+            Serial.printf("[SAMPLE] boot:%u seq:%u durable | WAL:%u\n",
+                          pendingReading.bootId, pendingReading.sequence,
+                          durableQueue.walDepth());
         } else {
-            lastNTPRetry = millis();
-            ntpRetries++;
-            syncNTP();
-        }
-    } else if (wifiConnected && ntpSynced &&
-               (getNtpSyncAgeS() < 0 || getNtpSyncAgeS() > (long)NTP_STALE_RESYNC_S) &&
-               millis() - lastNTPRetry > 60000) {
-        // SNTP should auto-resync every 15 min; if it silently stalls for 2h,
-        // re-kick it. age < 0 (never synced this session) matters after a
-        // SOFTWARE reboot: the RTC carries time across ESP.restart, so the
-        // clock reads synced without SNTP ever being started — without this,
-        // a post-scheduled-reboot uptime would run on pure RTC drift.
-        lastNTPRetry = millis();
-        syncNTP();
-    }
-
-    // ===== CT SAMPLING — Always 1Hz, route depends on online/offline =====
-    unsigned long now = millis();
-    int intervalMs = getSendInterval() * 1000;
-
-    if (now - lastReadingTime >= (unsigned long)intervalMs) {
-        lastReadingTime += intervalMs;
-        if (now - lastReadingTime > (unsigned long)intervalMs) {
-            lastReadingTime = now;
-        }
-
-        lastReadings = readAllCT(getGridVoltage());
-        updateLastReadings(lastReadings);
-
-        if (isOfflineMode()) {
-            // OFFLINE: Store to compressed binary on flash
-            storeOfflineReading(lastReadings.ct);
-
-            // Log every 10th reading
-            static int offlineLogCount = 0;
-            if (++offlineLogCount >= 10) {
-                offlineLogCount = 0;
-                Serial.printf("[OFFLINE] %.1fW | Stored:%u | File:%uKB | %lums\n",
-                    lastReadings.total_watts, getOfflineStored(),
-                    getOfflineFileSize() / 1024, lastReadings.sample_duration_ms);
-            }
-        } else {
-            // ONLINE: Queue for immediate POST
-            Serial.printf("[%s] %.1fW | Q:%d S:%u%s | %lums\n",
-                getUTCTimestamp().c_str(), lastReadings.total_watts,
-                getQueueSize(), getTotalSent(),
-                isUploadPending() ? " UPL" : "",
-                lastReadings.sample_duration_ms);
-
-            // Stamp at SAMPLE time (not queue time): queue-time labels collided
-            // when phase drift compressed spacing under 1s and the server 400'd
-            // the twin (observed fleet-wide at a ~61s cadence). With sample-time
-            // stamps the only remaining collision source is a BACKWARD SNTP step
-            // (oscillator ran fast) re-issuing an already-used second. Never drop
-            // and never emit a duplicate label — clamp the label forward by 1s.
-            // Skew is bounded by the step size (<1s in steady state) and clears
-            // at the next forward step or send gap.
-            static time_t lastQueuedEpoch = 0;
-            time_t sampleEpoch = getEpochAt(lastReadings.timestamp_ms);
-            if (sampleEpoch != 0 && lastQueuedEpoch != 0 && sampleEpoch <= lastQueuedEpoch) {
-                sampleEpoch = lastQueuedEpoch + 1;
-            }
-            if (networkReady && bufferMutex) {
-                // 100ms timeout — Core 0 holds mutex <10ms, so this always succeeds.
-                // Old design used timeout=0 with offline fallback, but that created
-                // orphaned readings in _blockBuf that never flushed and had wrong timestamps.
-                if (xSemaphoreTake(bufferMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    if (sampleEpoch != 0) lastQueuedEpoch = sampleEpoch;
-                    String ts = formatUTCEpoch(sampleEpoch);
-                    queueReading(getDeviceId(), getLocationName(), getTimezone(),
-                                 getGridVoltage(), lastReadings.ct, ts);
-                    xSemaphoreGive(bufferMutex);
-                    // Ring-full overflow (if any) is written to /rejected.log HERE,
-                    // outside the mutex — file I/O under bufferMutex starved Core 0's
-                    // saveBufferToFlash and broke the <10ms hold invariant.
-                    flushOverflowReading();
-                    // Only force solid when actually connected — otherwise this
-                    // ran every reading and stomped the reconnecting blink back to
-                    // solid within ~1s (LED "blinked once then went solid").
-                    if (wifiConnected) setLEDState(LED_RUNNING);
-                } else {
-                    // Should never happen (Core 0 holds <10ms, we wait 100ms)
-                    // But if it does: store offline with proper timestamp tracking
-                    storeOfflineReading(lastReadings.ct);
-                    Serial.println("[WARN] Mutex timeout — reading stored offline");
-                }
-            }
+            // Do not overwrite the only RAM copy and do not pretend later samples
+            // are complete. Retry until storage accepts it or an operator expands
+            // capacity; the heartbeat/LED expose this fail-closed state.
+            delay(20);
+            return;
         }
     }
+
+    const uint32_t now = millis();
+    const uint32_t period = settings.config().intervalSeconds * 1000UL;
+    if (static_cast<int32_t>(now - nextSampleMillis) < 0) return;
+    const uint32_t lateness = now - nextSampleMillis;
+    if (lateness >= period) {
+        durableQueue.recordCaptureGap(lateness / period);
+        nextSampleMillis = now + period;
+    } else {
+        nextSampleMillis += period;
+    }
+
+    uint32_t epoch = clockService.epochAt(now);
+    if (epoch != 0 && lastReadingEpoch != 0 && epoch <= lastReadingEpoch) {
+        epoch = lastReadingEpoch + settings.config().intervalSeconds;
+    }
+    if (epoch != 0) lastReadingEpoch = epoch;
+    const uint8_t flags = epoch == 0 ? fw::kFlagClockUnsynced : 0;
+    pendingReading = measurement.sample(settings.bootId(), nextSequence, epoch, flags);
+    pendingCommit = true;
 }
