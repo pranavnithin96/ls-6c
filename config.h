@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.17.0"
+#define FIRMWARE_VERSION "2.17.3"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -133,7 +133,14 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 // resurrecting the Meton competition.
 #define DRAIN_LIVE_HEALTH_MS     90000UL
 #define DRAIN_TROUBLE_WINDOW_MS  120000UL
-#define DRAIN_TROUBLE_RETRY_MULT 5
+#define DRAIN_TROUBLE_RETRY_MULT 2
+// 2.17.3 (PCS field defect 08-05): "trouble" needs a failure RATE, not one
+// recent failure. On lossy-steady links (PCS NAT: ~10-15% baseline loss)
+// SOME failure is always recent, so the old any-failure trigger throttled
+// the drain permanently -> stores capped -> fresh readings dropped. Require
+// >=this many failures inside the window before pacing kicks in, and slow
+// only 2x, so chronic-lossy links keep draining at a rate that outruns parking.
+#define DRAIN_TROUBLE_MIN_FAILS  3
 
 // --- Time sync ---
 #define NTP_SYNC_INTERVAL_MS   900000  // SNTP auto re-sync every 15 min (explicit, not SDK default)

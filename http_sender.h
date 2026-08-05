@@ -134,6 +134,19 @@ static unsigned long _liveOkMs = 0;   // LIVE/batch 200s ONLY. Deliberately not
                                       // and a drain must never keep ITSELF
                                       // alive while live delivery starves.
 static unsigned long _lastFailMs = 0;           // last live/batch send failure
+static unsigned long _failTimes[8] = {0};       // ring of recent failure stamps
+static uint8_t _failTimeIdx = 0;
+static void _noteFail(unsigned long now) {
+    _lastFailMs = now;
+    _failTimes[_failTimeIdx] = now;
+    _failTimeIdx = (uint8_t)((_failTimeIdx + 1) & 7);
+}
+static int _recentFailCount(unsigned long now) {
+    int n = 0;
+    for (int i = 0; i < 8; i++)
+        if (_failTimes[i] != 0 && now - _failTimes[i] < DRAIN_TROUBLE_WINDOW_MS) n++;
+    return n;
+}
 static uint16_t _postMsRing[16];                // round-trips of successful posts
 static uint8_t _postMsN = 0, _postMsIdx = 0;
 static uint32_t _lastBulkBps = 0;               // last successful bulk throughput
@@ -934,8 +947,7 @@ bool uploadOfflineFile(const String& deviceId) {
         // fast path additionally requires NO recent live failure — full-speed
         // sequential bulk on a struggling uplink is exactly the competition
         // the drain gate exists to prevent.
-        if (more && (_lastFailMs == 0 ||
-                     millis() - _lastFailMs >= DRAIN_TROUBLE_WINDOW_MS))
+        if (more && _recentFailCount(millis()) < DRAIN_TROUBLE_MIN_FAILS)
             _lastUploadAttempt = 0;
         return !more;
     }
@@ -1271,7 +1283,7 @@ static bool _postOneBatch(int n) {
         // which parks losslessly.
         _totalFailed++;
         _consecutiveFailures++;
-        _lastFailMs = millis();
+        _noteFail(millis());
         _lastSendAttempt = millis();
         _backoffMs = min(_backoffMs * 2, (int)MAX_BACKOFF_MS);
         recordSendFailure();
@@ -1362,7 +1374,7 @@ static bool _postOneBatch(int n) {
     // Transport failure — identical cascade to the single path.
     _totalFailed++;
     _consecutiveFailures++;
-    _lastFailMs = millis();
+    _noteFail(millis());
     _backoffMs = min(_backoffMs * 2, (int)MAX_BACKOFF_MS);
     recordSendFailure();
     if (_consecutiveFailures == 1) logError("batch send failed");
@@ -1575,7 +1587,7 @@ void processSendQueue() {
                 break;      // Stop sending until timestamps are valid
             } else {
                 _totalFailed++; _consecutiveFailures++;
-                _lastFailMs = millis();          // stretches drain pacing (2.17.0)
+                _noteFail(millis());             // rate-based drain pacing (2.17.3)
                 _backoffMs = min(_backoffMs * 2, (int)MAX_BACKOFF_MS);
                 recordSendFailure();
                 if (_consecutiveFailures == 1) {
@@ -1668,7 +1680,7 @@ void processSendQueue() {
                         (now - _serverReachableMs) < DRAIN_LIVE_HEALTH_MS);
     // Recent live failure => recovery trickles: stretch the per-file cadence.
     unsigned long drainRetryMs = OFFLINE_UPLOAD_RETRY_MS;
-    if (_lastFailMs != 0 && (now - _lastFailMs) < DRAIN_TROUBLE_WINDOW_MS)
+    if (_recentFailCount(now) >= DRAIN_TROUBLE_MIN_FAILS)
         drainRetryMs = OFFLINE_UPLOAD_RETRY_MS * DRAIN_TROUBLE_RETRY_MULT;
 
     bool ringQuiet = (bufCount() <= BG_UPLOAD_LOWATER);
