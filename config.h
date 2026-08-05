@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.16.2"
+#define FIRMWARE_VERSION "2.17.0"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -96,6 +96,44 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 
 // --- Send Mode ---
 #define DEFAULT_SEND_INTERVAL    1  // seconds
+
+// --- Live batching (2.17.0) ---
+// N readings per POST as newline-delimited JSON to /api/data/batch. Default 1
+// = byte-identical behavior to 2.16.2 (single POSTs to /api/data); raised
+// per-device via the set_batch heartbeat command (NVS "batchsz"). The win on
+// trickle uplinks is REQUEST COUNT, not bytes: Meton-class links die of queue
+// delay per request, so 10x fewer requests is the cure the 08-04 A/B proved.
+// A server without the batch endpoint 404s; the firmware latches back to
+// single sends and re-probes hourly, so ship order (fw vs server) is free.
+#define BATCH_SIZE_DEFAULT       1
+#define BATCH_MAX                10    // ring is 30; keep >=1/3 headroom for parking
+#define BATCH_FLUSH_SLACK_MS     2000UL   // partial-batch flush past the natural fill time
+#define BATCH_RETRY_UNSUPPORTED_MS 3600000UL  // re-probe a 404ing batch endpoint hourly
+
+// --- Connectivity watchdog (2.17.0) ---
+// WiFi associated but ZERO server acknowledgments (live, batch, or heartbeat
+// 200s) for this long => the network stack is presumed wedged and the device
+// self-reboots. Cures the meton_05/meton_07 class (08-04: both wedged for
+// hours with good RSSI, fixed only by power-cycle). Reboot is cheap here:
+// troubleSave keeps RAM-ring exposure <=5s and parked data survives. During a
+// genuine server outage this fires at most once per window — acceptable, and
+// bounded by the min-uptime guard so it can never boot-loop.
+// 0 disables. Runtime override: NVS "netwdtmin" / heartbeat set_net_watchdog.
+#define NET_WATCHDOG_DEFAULT_MIN 30
+
+// --- Drain pacing (2.17.0) ---
+// Bulk uploads (offline backlog + rejected drain) only run when live delivery
+// is provably working: a live/batch 200 within DRAIN_LIVE_HEALTH_MS. On a
+// choked uplink the drain otherwise COMPETES with live data for the queue —
+// the 08-03 A/B measured 99.8% live with drain paused vs ~72% with it running.
+// While any send failure is recent (DRAIN_TROUBLE_WINDOW_MS), the per-file
+// cadence stretches by DRAIN_TROUBLE_RETRY_MULT so recovery trickles instead
+// of flooding. The starvation escape still fires — but only when live is
+// healthy, so the pcs1/pcs7 "never drains" deadlock stays fixed without
+// resurrecting the Meton competition.
+#define DRAIN_LIVE_HEALTH_MS     90000UL
+#define DRAIN_TROUBLE_WINDOW_MS  120000UL
+#define DRAIN_TROUBLE_RETRY_MULT 5
 
 // --- Time sync ---
 #define NTP_SYNC_INTERVAL_MS   900000  // SNTP auto re-sync every 15 min (explicit, not SDK default)

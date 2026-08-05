@@ -150,6 +150,48 @@ void initHeartbeat(const String& serverUrl) {
     }
 }
 
+// --- Command acks (2.17.0) --------------------------------------------------
+// The 499 hole, closed from the device side: the server may include an "id"
+// with each command; every executed id is echoed back as cmd_acks in each
+// heartbeat until a heartbeat gets its 200 (ack delivery confirmed). A server
+// that sends no ids gets exactly the old behavior. Re-delivered ids (our ack
+// got lost) are re-acked but NOT re-executed — _doneRing remembers the last
+// 32 — so an ack-mode server can safely re-deliver without double-executing.
+// Reboot-class commands persist their id to NVS BEFORE restarting, so the ack
+// survives the reboot and a re-delivered reboot can never loop the device.
+static uint32_t _ackPending[16]; static uint8_t _ackCount = 0;
+static uint32_t _doneRing[32];   static uint8_t _doneIdx = 0; static bool _doneInit = false;
+static uint8_t _ackedInFlight = 0;   // how many acks the in-flight heartbeat carried
+
+static void _doneRemember(uint32_t id) {
+    _doneRing[_doneIdx] = id;
+    _doneIdx = (uint8_t)((_doneIdx + 1) % 32);
+}
+static bool _doneSeen(uint32_t id) {
+    for (int i = 0; i < 32; i++) if (_doneRing[i] == id) return true;
+    return false;
+}
+static void _ackAdd(uint32_t id) {
+    if (id == 0) return;
+    for (int i = 0; i < _ackCount; i++) if (_ackPending[i] == id) return;
+    if (_ackCount < 16) _ackPending[_ackCount++] = id;
+}
+static void _ackLoadRebootId() {          // called once, lazily, before first use
+    if (_doneInit) return;
+    _doneInit = true;
+    Preferences p;
+    if (p.begin("lscfg", true)) {
+        uint32_t id = p.getUInt("rebootcmdid", 0);
+        p.end();
+        if (id != 0) { _doneRemember(id); _ackAdd(id); }
+    }
+}
+static void _ackPersistRebootId(uint32_t id) {
+    if (id == 0) return;
+    Preferences p;
+    if (p.begin("lscfg", false)) { p.putUInt("rebootcmdid", id); p.end(); }
+}
+
 void processCommands(const String& responseBody) {
     if (responseBody.length() == 0) return;
 
@@ -174,6 +216,15 @@ void processCommands(const String& responseBody) {
 
         String action = cmd["action"] | "";
         if (action.length() == 0) continue;
+        _ackLoadRebootId();
+        uint32_t cmdId = cmd["id"] | 0U;
+        if (cmdId != 0 && _doneSeen(cmdId)) {
+            _ackAdd(cmdId);     // our ack was lost — re-ack, never re-execute
+            Serial.printf("[CMD] duplicate id %u (%s) — re-acking only\n",
+                          (unsigned)cmdId, action.c_str());
+            continue;
+        }
+        if (cmdId != 0) { _doneRemember(cmdId); _ackAdd(cmdId); }
 
         Serial.printf("[CMD] -> %s\n", action.c_str());
 
@@ -184,6 +235,7 @@ void processCommands(const String& responseBody) {
             float val = cmd["value"] | -1.0f;
             setGridVoltage(val);           // live + persisted (range-checked inside) — Defect 2
         } else if (action == "reboot") {
+            _ackPersistRebootId(cmdId);   // ack survives the restart
             flushBeforeRestart();
             delay(500);
             ESP.restart();
@@ -238,7 +290,19 @@ void processCommands(const String& responseBody) {
                 p.putInt("rebootdays", val); p.end();
                 initScheduledReboot();       // recompute immediately, no reboot needed
             }
+        } else if (action == "set_batch") {
+            // Live-batching (2.17.0): N readings per POST. 1 = classic single
+            // sends; raise on trickle uplinks (request count is what kills them).
+            int val = cmd["value"] | -1;
+            if (!setBatchSize(val))
+                logError("set_batch rejected: want 1-" + String(BATCH_MAX));
+        } else if (action == "set_net_watchdog") {
+            // Connectivity watchdog window in minutes, 0 = off (2.17.0).
+            int val = cmd["value"] | -1;
+            if (!setNetWatchdogMin(val))
+                logError("set_net_watchdog rejected: want 0-1440 min");
         } else if (action == "factory_reset") {
+            _ackPersistRebootId(cmdId);
             flushBeforeRestart();
             Preferences p; p.begin("lscfg", false);
             p.clear(); p.end();
@@ -302,6 +366,20 @@ void sendHeartbeat() {
     doc["wb_pending"] = wbDumpPending();              // black-box dump awaiting upload
     doc["wfstream"] = wbStreamOn();                   // continuous 1kHz export (2.15.0)
     doc["wfstream_seq"] = wbStreamSeq();              // delivered chunks this uptime
+    // --- 2.17.0: the device's own internet-speed report + new feature state ---
+    doc["post_ms_p50"] = getPostMsP50();              // live POST round-trip, median
+    doc["post_ms_p90"] = getPostMsP90();              // ...and tail (queue-delay signal)
+    doc["bulk_bps"] = getBulkBps();                   // last bulk upload throughput
+    doc["batch_size"] = getBatchSize();               // live batching factor (1 = off)
+    doc["net_wdt_min"] = getNetWatchdogMin();         // connectivity watchdog window
+    doc["wedge_reboots"] = getWedgeReboots();         // times the net watchdog fired
+    // Executed-command ids not yet confirmed delivered (2.17.0 ack loop). An
+    // ack-mode server marks them executed on receipt; cleared on our 200.
+    if (_ackCount > 0) {
+        JsonArray _acks = doc["cmd_acks"].to<JsonArray>();
+        for (int i = 0; i < _ackCount; i++) _acks.add(_ackPending[i]);
+    }
+    _ackedInFlight = _ackCount;
 
     JsonArray _ctRat = doc["ct_ratings"].to<JsonArray>();
     JsonArray _ctSlp = doc["ct_slopes"].to<JsonArray>();
@@ -349,6 +427,20 @@ void sendHeartbeat() {
     int httpCode = http.POST(json);
 
     if (httpCode == 200) {
+        recordHeartbeatOk();               // counts as server contact (net watchdog)
+        // The 200 confirms the server received this heartbeat's cmd_acks —
+        // retire exactly the ones that were in flight; anything queued by
+        // processCommands() below rides the NEXT heartbeat. Also safe to
+        // clear the persisted reboot-command id: its ack has now landed.
+        if (_ackedInFlight > 0) {
+            uint8_t remaining = (uint8_t)(_ackCount - _ackedInFlight);
+            for (uint8_t i = 0; i < remaining; i++)
+                _ackPending[i] = _ackPending[_ackedInFlight + i];
+            _ackCount = remaining;
+            _ackedInFlight = 0;
+            Preferences p;
+            if (p.begin("lscfg", false)) { p.remove("rebootcmdid"); p.end(); }
+        }
         String response = http.getString();
         Serial.printf("[HB] OK | heap:%u | Q:%d | S:%u\n",
             ESP.getFreeHeap(), getQueueSize(), getTotalSent());

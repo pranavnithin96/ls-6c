@@ -30,6 +30,13 @@ struct CTReading {
     float env_peak_ratio;
     float ripple_amps;
     float env5[5];
+    // Per-channel current fundamental from hump timing (2.17.0). On the
+    // lathes/VMCs the CTs sit on the VFD OUTPUT (confirmed meton_01/sb3/
+    // pcs11, 08-03..05), so this is the spindle's electrical frequency — a
+    // live RPM proxy. Mains-side channels just read ~50. 0 = unmeasurable
+    // this window. Wider 10-200Hz plausibility band than mains_hz: VFD
+    // output observed 26-92Hz in the field, headroom above for fast spindles.
+    float hz;
 };
 
 struct AllCTReadings {
@@ -302,14 +309,27 @@ AllCTReadings readAllCT(float grid_voltage) {
     static int _strongCh = 0;
     static uint16_t _prevWinMax[NUM_CT_CHANNELS] = {0};
     const int fq = _strongCh;
-    const uint16_t thrHi = _prevWinMax[fq] / 2;
-    const uint16_t thrLo = (uint16_t)(_prevWinMax[fq] * 3 / 8);   // 12.5% hysteresis
-    const bool fqUsable = thrHi >= 100;    // needs a real load to have humps
-    bool above = false;
-    int nCross = 0;
-    float firstX = 0.0f, lastX = 0.0f;
-    float maxIv = 0.0f, minIv = 1e9f;   // interval consistency guard (2.14.2)
-    uint16_t prevV = 0;
+    // 2.17.0: hump timing runs on EVERY loaded channel (per-channel hz — the
+    // spindle-frequency feature), not just the strongest. Same detector, same
+    // thresholds-from-last-window trick, state promoted to arrays. Cost is a
+    // few integer compares per channel per sample — noise next to the 6
+    // analogRead()s that dominate the 1ms budget.
+    uint16_t thrHiC[NUM_CT_CHANNELS], thrLoC[NUM_CT_CHANNELS];
+    bool usableC[NUM_CT_CHANNELS], aboveC[NUM_CT_CHANNELS];
+    int nCrossC[NUM_CT_CHANNELS];
+    float firstXC[NUM_CT_CHANNELS], lastXC[NUM_CT_CHANNELS];
+    float maxIvC[NUM_CT_CHANNELS], minIvC[NUM_CT_CHANNELS];
+    uint16_t prevVC[NUM_CT_CHANNELS];
+    for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
+        thrHiC[ch] = _prevWinMax[ch] / 2;
+        thrLoC[ch] = (uint16_t)(_prevWinMax[ch] * 3 / 8);   // 12.5% hysteresis
+        usableC[ch] = thrHiC[ch] >= 100;   // needs a real load to have humps
+        aboveC[ch] = false; nCrossC[ch] = 0;
+        firstXC[ch] = 0.0f; lastXC[ch] = 0.0f;
+        maxIvC[ch] = 0.0f; minIvC[ch] = 1e9f;
+        prevVC[ch] = 0;
+    }
+    const bool fqUsable = usableC[fq];
 
     unsigned long t0 = micros();
 
@@ -324,32 +344,30 @@ AllCTReadings readAllCT(float grid_voltage) {
             sumCounts[ch] += v;
             subSum[ch][sw] += v;
             if (v > maxCount[ch]) maxCount[ch] = v;
-            if (ch == fq) {
-                wbFeed(ch, v);              // black-box ring (one u16 store)
-                if (fqUsable) {
-                    if (!above && v >= thrHi) {
-                        // rising crossing; interpolate between s-1 and s
-                        float frac = (v > prevV && s > 0)
-                                   ? (float)(thrHi - prevV) / (float)(v - prevV)
-                                   : 0.0f;
-                        if (frac < 0.0f) frac = 0.0f;
-                        if (frac > 1.0f) frac = 1.0f;
-                        float x = (float)(s - 1) + frac;
-                        if (x < 0.0f) x = 0.0f;   // s==0: no s-1 to interpolate from
-                        if (nCross == 0) firstX = x;
-                        else {
-                            float iv = x - lastX;
-                            if (iv > maxIv) maxIv = iv;
-                            if (iv < minIv) minIv = iv;
-                        }
-                        lastX = x;
-                        nCross++;
-                        above = true;
-                    } else if (above && v < thrLo) {
-                        above = false;
+            if (ch == fq) wbFeed(ch, v);    // black-box ring (one u16 store)
+            if (usableC[ch]) {
+                if (!aboveC[ch] && v >= thrHiC[ch]) {
+                    // rising crossing; interpolate between s-1 and s
+                    float frac = (v > prevVC[ch] && s > 0)
+                               ? (float)(thrHiC[ch] - prevVC[ch]) / (float)(v - prevVC[ch])
+                               : 0.0f;
+                    if (frac < 0.0f) frac = 0.0f;
+                    if (frac > 1.0f) frac = 1.0f;
+                    float x = (float)(s - 1) + frac;
+                    if (x < 0.0f) x = 0.0f;   // s==0: no s-1 to interpolate from
+                    if (nCrossC[ch] == 0) firstXC[ch] = x;
+                    else {
+                        float iv = x - lastXC[ch];
+                        if (iv > maxIvC[ch]) maxIvC[ch] = iv;
+                        if (iv < minIvC[ch]) minIvC[ch] = iv;
                     }
-                    prevV = v;
+                    lastXC[ch] = x;
+                    nCrossC[ch]++;
+                    aboveC[ch] = true;
+                } else if (aboveC[ch] && v < thrLoC[ch]) {
+                    aboveC[ch] = false;
                 }
+                prevVC[ch] = v;
             }
         }
         unsigned long target = t0 + (unsigned long)((s + 1) * SAMPLE_INTERVAL_US);
@@ -370,11 +388,24 @@ AllCTReadings readAllCT(float grid_voltage) {
     // when any interval strays 50% from the mean. Better no reading than a
     // wrong one — consumers treat 0 as "not measured".
     all.mains_hz = 0.0f;
-    if (fqUsable && nCross >= 5 && lastX > firstX) {
-        float meanIv = (lastX - firstX) / (float)(nCross - 1);
-        bool consistent = (maxIv <= 1.5f * meanIv) && (minIv >= 0.5f * meanIv);
+    if (fqUsable && nCrossC[fq] >= 5 && lastXC[fq] > firstXC[fq]) {
+        float meanIv = (lastXC[fq] - firstXC[fq]) / (float)(nCrossC[fq] - 1);
+        bool consistent = (maxIvC[fq] <= 1.5f * meanIv) && (minIvC[fq] >= 0.5f * meanIv);
         float hz = 1000.0f / meanIv;
         if (consistent && hz >= 45.0f && hz <= 65.0f) all.mains_hz = hz;
+    }
+    // Per-channel fundamental (2.17.0): same >=5-hump + interval-consistency
+    // contract as mains_hz, wider 10-200Hz band (VFD-output channels run the
+    // spindle's electrical frequency, not the grid's). Consumers treat 0 as
+    // "not measured" — a parked channel or a dirty window reports nothing.
+    for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
+        all.ct[ch].hz = 0.0f;
+        if (usableC[ch] && nCrossC[ch] >= 5 && lastXC[ch] > firstXC[ch]) {
+            float meanIv = (lastXC[ch] - firstXC[ch]) / (float)(nCrossC[ch] - 1);
+            bool consistent = (maxIvC[ch] <= 1.5f * meanIv) && (minIvC[ch] >= 0.5f * meanIv);
+            float chz = 1000.0f / meanIv;
+            if (consistent && chz >= 10.0f && chz <= 200.0f) all.ct[ch].hz = chz;
+        }
     }
 
     // Choose next window's frequency/black-box channel: strongest this window.
