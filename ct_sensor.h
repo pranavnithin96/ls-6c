@@ -394,20 +394,6 @@ AllCTReadings readAllCT(float grid_voltage) {
         float hz = 1000.0f / meanIv;
         if (consistent && hz >= 45.0f && hz <= 65.0f) all.mains_hz = hz;
     }
-    // Per-channel fundamental (2.17.0): same >=5-hump + interval-consistency
-    // contract as mains_hz, wider 10-200Hz band (VFD-output channels run the
-    // spindle's electrical frequency, not the grid's). Consumers treat 0 as
-    // "not measured" — a parked channel or a dirty window reports nothing.
-    for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
-        all.ct[ch].hz = 0.0f;
-        if (usableC[ch] && nCrossC[ch] >= 5 && lastXC[ch] > firstXC[ch]) {
-            float meanIv = (lastXC[ch] - firstXC[ch]) / (float)(nCrossC[ch] - 1);
-            bool consistent = (maxIvC[ch] <= 1.5f * meanIv) && (minIvC[ch] >= 0.5f * meanIv);
-            float chz = 1000.0f / meanIv;
-            if (consistent && chz >= 10.0f && chz <= 200.0f) all.ct[ch].hz = chz;
-        }
-    }
-
     // Choose next window's frequency/black-box channel: strongest this window.
     // 2.15.1: only ADOPT a new channel when it carries a real load. When every
     // channel idles near zero (machine parked), the argmax jitters across ADC
@@ -499,6 +485,24 @@ AllCTReadings readAllCT(float grid_voltage) {
 
         all.ct[ch] = r;
         all.total_watts += r.watts;
+    }
+
+    // Per-channel fundamental (2.17.0) — MUST run after the construction loop
+    // above: that loop whole-struct-assigns all.ct[ch], which would clobber
+    // anything written earlier (review HIGH-1). Same >=5-hump + interval-
+    // consistency contract as mains_hz, wider 10-200Hz band (VFD-output
+    // channels run the spindle's electrical frequency, not the grid's). The
+    // amps floor keeps a floating input's 50Hz pickup from emitting a
+    // plausible-looking hz with no real load behind it (review LOW-10).
+    for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
+        all.ct[ch].hz = 0.0f;
+        if (usableC[ch] && all.ct[ch].amps >= 0.3f &&
+            nCrossC[ch] >= 5 && lastXC[ch] > firstXC[ch]) {
+            float meanIv = (lastXC[ch] - firstXC[ch]) / (float)(nCrossC[ch] - 1);
+            bool consistent = (maxIvC[ch] <= 1.5f * meanIv) && (minIvC[ch] >= 0.5f * meanIv);
+            float chz = 1000.0f / meanIv;
+            if (consistent && chz >= 10.0f && chz <= 200.0f) all.ct[ch].hz = chz;
+        }
     }
 
     return all;

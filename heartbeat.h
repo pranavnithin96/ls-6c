@@ -302,10 +302,13 @@ void processCommands(const String& responseBody) {
             if (!setNetWatchdogMin(val))
                 logError("set_net_watchdog rejected: want 0-1440 min");
         } else if (action == "factory_reset") {
-            _ackPersistRebootId(cmdId);
             flushBeforeRestart();
             Preferences p; p.begin("lscfg", false);
             p.clear(); p.end();
+            // Review MED-6: persist AFTER the clear (clear() wipes lscfg, and
+            // under an ack-mode re-delivering server a lost factory_reset ack
+            // is a re-provision->wipe brick loop).
+            _ackPersistRebootId(cmdId);
             delay(500);
             ESP.restart();
         }
@@ -314,6 +317,9 @@ void processCommands(const String& responseBody) {
 
 void sendHeartbeat() {
     if (_heartbeatUrl.length() == 0) return;
+    _ackLoadRebootId();   // review MED-6: a persisted reboot ack must ride the
+                          // FIRST heartbeat after boot, not wait for a response
+                          // that happens to contain another command.
 
     JsonDocument doc;
     doc["device_id"] = getDeviceId();

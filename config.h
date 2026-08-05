@@ -184,7 +184,13 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 // ever ALLOWED to run — which is exactly the saturated unit that has a full log.
 // The static_assert keeps that relationship from being broken by a later tweak.
 #define REJECTED_ONLINE_WINDOW_MS  60000UL   // a live 200 this recent == "online"
-#define REJECTED_STALL_MS         300000UL   // no drain progress this long while online -> dispose
+#define REJECTED_STALL_MS         900000UL   // no drain progress this long while online -> dispose
+// 2.17.0 (review HIGH-3): the stall window must comfortably outlast the
+// trouble-stretched drain cadence (60s x 5 = 300s), or ONE failed attempt on
+// a flapping link ages straight into disposal — the drain gets zero retries.
+static_assert(REJECTED_STALL_MS >= OFFLINE_UPLOAD_RETRY_MS * DRAIN_TROUBLE_RETRY_MULT * 3,
+              "REJECTED_STALL_MS must give the trouble-paced drain >=3 attempts "
+              "before disposal, or a flapping link shreds parked backlog");
 static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
               "REJECTED_STALL_MS must outlast BG_UPLOAD_STARVE_MS, or a ring-blocked "
               "drain is disposed before the starvation escape ever lets it run");
