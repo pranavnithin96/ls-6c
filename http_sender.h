@@ -1618,6 +1618,15 @@ void processSendQueue() {
         }
     }
 
+    // 2.17.4 (panel-confirmed root cause): the send block above BLOCKS for
+    // seconds and stamps _serverReachableMs/_lastSuccessMs AFTER the top-of-
+    // function `now` capture. Comparing those newer stamps against the stale
+    // capture underflows unsigned and scores "just proved reachable" as
+    // "unreachable" — inverting the drain gate: drains only opened on ticks
+    // that DIDN'T send. Saturated rings send every tick => drains never ran
+    // (the PCS/meton_07 frozen-store bug). Re-stamp before every consumer.
+    now = millis();
+
     // Rejected-log dispose backstop — watches DRAIN PROGRESS, not elapsed time.
     // Every file the drain delivers stamps _rejLastProgressMs and restarts the
     // clock, so a drain that is getting somewhere is never cut off, however big
@@ -1635,7 +1644,7 @@ void processSendQueue() {
     // backlog the pause exists to preserve.
     if (_rejRecoveryArmed && _drainEnabled) {
         bool online = (_lastSuccessMs != 0 &&
-                       (now - _lastSuccessMs) < REJECTED_ONLINE_WINDOW_MS);
+                       (long)(now - _lastSuccessMs) < (long)REJECTED_ONLINE_WINDOW_MS);
         if (!online) {
             _rejLastProgressMs = 0;       // offline — stall clock restarts on reconnect
         } else if (_rejLastProgressMs == 0) {
@@ -1677,7 +1686,7 @@ void processSendQueue() {
     // PARKED to the very store the drain must recover, and a 4xx proves the
     // pipe is open. Transport failures (code<=0) still close the gate.
     bool liveHealthy = (_serverReachableMs != 0 &&
-                        (now - _serverReachableMs) < DRAIN_LIVE_HEALTH_MS);
+                        (long)(now - _serverReachableMs) < (long)DRAIN_LIVE_HEALTH_MS);
     // Recent live failure => recovery trickles: stretch the per-file cadence.
     unsigned long drainRetryMs = OFFLINE_UPLOAD_RETRY_MS;
     if (_recentFailCount(now) >= DRAIN_TROUBLE_MIN_FAILS)

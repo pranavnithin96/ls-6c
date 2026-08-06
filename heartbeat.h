@@ -252,6 +252,8 @@ void processCommands(const String& responseBody) {
         } else if (action == "recover_rejected") {
             recoverRejectedFiles();          // re-queue quarantined offline files
         } else if (action == "upload_rejected_log") {
+            if (!isDrainEnabled())
+                logError("upload_rejected_log ignored — drain paused (send resume_drain)");
             requestRejectedDrain();          // drained one file per tick by processSendQueue
         } else if (action == "pause_drain") {
             setDrainEnabled(false);          // keep backlog on flash, stop spending uplink on it
@@ -378,6 +380,9 @@ void sendHeartbeat() {
     doc["bulk_bps"] = getBulkBps();                   // last bulk upload throughput
     doc["batch_size"] = getBatchSize();               // live batching factor (1 = off)
     doc["net_wdt_min"] = getNetWatchdogMin();         // connectivity watchdog window
+    doc["drain_enabled"] = isDrainEnabled();          // pause_drain state — 2.17.4:
+                                                      // invisible pause cost a day of
+                                                      // meton_07 misdiagnosis
     doc["wedge_reboots"] = getWedgeReboots();         // times the net watchdog fired
     // Executed-command ids not yet confirmed delivered (2.17.0 ack loop). An
     // ack-mode server marks them executed on receipt; cleared on our 200.
