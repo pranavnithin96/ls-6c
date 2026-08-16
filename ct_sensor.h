@@ -285,13 +285,13 @@ uint16_t getSamplingOverrunsLast() { return _samplingOverrunsLast; }
 // Legacy fallback keeps the +0.13 floor; the 50A/100A fits are through-origin.
 AllCTReadings readAllCT(float grid_voltage) {
     AllCTReadings all = {};
-    all.timestamp_ms = millis();  // Timestamp at START of sampling
     all.total_watts = 0;
 
     // Promote a remotely staged mask only here, before the first sample. The
     // local snapshot is immutable for the entire frame.
     uint32_t configRevision = 0;
     const uint8_t activeMask = applyPendingCTConfigAtFrameBoundary(&configRevision);
+    all.timestamp_ms = millis();  // after boundary persistence, immediately before acquisition
     const int nSamples = _winSamples;
     const int n_subwin = nSamples / ENV_SUBWIN_SAMPLES;     // 20ms sub-windows
 
