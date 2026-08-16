@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.17.4"
+#define FIRMWARE_VERSION "2.18.1"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -235,4 +235,3 @@ static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
 #define AP_SSID_PREFIX           "LineSights-"
 #define MDNS_HOSTNAME            "linesights"
 #define FACTORY_RESET_HOLD_MS    5000
-
