@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.17.4"
+#define FIRMWARE_VERSION "2.18.0"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -19,39 +19,28 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define BOOT_BUTTON_PIN   0
 
 // --- CT Sensor ---
-// The sampling window is RUNTIME-CONFIGURABLE from 2.14.0 (heartbeat command
-// set_window_ms, NVS-persisted). 500ms stays the default so an OTA changes
-// nothing by itself; widening is a per-device decision. Wider = less of each
-// second is blind (crash/event coverage) at the cost of loop-idle headroom.
-// Constraint: multiples of 100ms so the 20ms envelope sub-windows divide the
-// window evenly AND group evenly into the 5 env5 slots (slot = window/5).
-#define ADC_SAMPLES_PER_CH    500     // DEFAULT window: 500 samples = 500ms
-#define MAX_ADC_SAMPLES       900     // hard cap: leaves >=100ms/s loop headroom
-#define MIN_ADC_SAMPLES       500
+// v2.18: every configured CT is sampled for the complete one-second frame.
+// Disabled channels are not touched by analogRead(). The fixed window removes
+// the historical 100-500ms blind interval and gives WFS2 an honest frame
+// boundary. Runtime changes to shorter windows are deliberately rejected.
+#define ADC_SAMPLES_PER_CH    1000
+#define MAX_ADC_SAMPLES       1000
+#define MIN_ADC_SAMPLES       1000
 #define SAMPLE_INTERVAL_US    1000    // 1 kHz ADC rate within window
 #define ENV_SUBWIN_SAMPLES    20      // 20ms @ 1kHz = one 50Hz mains cycle
 #define MAX_ENV_SUBWIN        (MAX_ADC_SAMPLES / ENV_SUBWIN_SAMPLES)
 
-// --- Waveform black box (2.14.0) ---
-// Rolling raw-sample ring for ONE channel (the currently strongest), frozen to
-// flash and uploaded on the capture_waveform heartbeat command. Heap-allocated
-// ONCE at boot (24KB of .bss overflows the dram0 static segment); on alloc
-// failure the black box disables itself rather than crash anything.
-#define WB_RING_SECONDS       12
-#define WB_RING_SAMPLES       (WB_RING_SECONDS * 1000)
-#define WB_DUMP_FILE          "/wfdump.bin"
-#define WB_MIN_CAPTURE_GAP_MS 600000UL   // rate limit: one capture per 10 min
-
-// --- Continuous waveform streaming (2.15.0, pilot devices only) ---
-// Exports the SAME black-box ring as raw 1kHz chunks over HTTP, continuously.
-// RAM-only (the ring is the source, a heap scratch buffer is the staging area)
-// — flash is never touched, so there is no wear cost at any duty cycle.
-// Default OFF; per-device enable via heartbeat wfstream_on, NVS-persisted.
-// Chunk = 3000 samples (6KB), i.e. one POST per ~6s of wall time at the 500ms
-// window (500 samples/s of ring feed) — ~1KB/s average uplink. The chunk must
-// stay well under half the ring so the Core-0 reader always trails the Core-1
-// writer by a wide safety margin (see wbStreamLoop's cushion math).
-#define WB_STREAM_CHUNK_SAMPLES  3000
+// --- WFS2 continuous waveform streaming (2.18.0, pilot devices only) ---
+// Each queued item is exactly one complete 1000ms acquisition frame containing
+// ONLY configured channels, scan-interleaved in ascending CT order. Three heap
+// slots allow Core 1 to acquire while Core 0 uploads. If the network cannot
+// keep up, whole frames are dropped and counted; frames are never overwritten,
+// mixed across configurations, or silently spliced across wall-time gaps.
+#define WFS2_SAMPLE_RATE_HZ       1000
+#define WFS2_SAMPLES_PER_CHANNEL  1000
+#define WFS2_QUEUE_DEPTH          3
+#define WFS2_MAX_FRAME_SAMPLES    (NUM_CT_CHANNELS * WFS2_SAMPLES_PER_CHANNEL)
+#define WFS2_ENCODE_SCRATCH_BYTES (sizeof(Wfs2Header) + WFS2_MAX_FRAME_SAMPLES * 2 + 256)
 #define WB_STREAM_RETRY_MS       10000UL  // backoff after a failed chunk POST
 #define WB_STREAM_MIN_HEAP       45000    // skip cycle if heap below this
 #define CAL_POINTS            3
@@ -235,4 +224,3 @@ static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
 #define AP_SSID_PREFIX           "LineSights-"
 #define MDNS_HOSTNAME            "linesights"
 #define FACTORY_RESET_HOLD_MS    5000
-

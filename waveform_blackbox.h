@@ -1,356 +1,315 @@
 #pragma once
+
 #include <Arduino.h>
 #include <HTTPClient.h>
-#include <LittleFS.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <esp_system.h>
+#include <esp_timer.h>
+#include <esp32/rom/miniz.h>
+#include <sys/time.h>
 #include "config.h"
+#include "wfs2_protocol.h"
 
-// Cross-module hooks (declared here; defined in http_sender.h / ota_updater.h /
-// diagnostics.h, all in the same translation unit) — used by wbStreamLoop's
-// health gates so streaming can never compete with live data or an OTA.
+// Cross-module health hooks (defined in http_sender.h / ota_updater.h /
+// diagnostics.h in the same Arduino translation unit).
 int  getQueueSize();
 long getLastSuccessAgeS();
 bool isUpdateInProgress();
 void feedWatchdog();
 
 // ============================================================================
-// Waveform black box (2.14.0)
+// WFS2 complete-frame waveform queue (2.18.0)
 //
-// A rolling ring of RAW 1kHz ADC samples for ONE channel — the strongest
-// channel, as chosen by readAllCT each window. Streaming raw samples
-// continuously is impossible (1kHz x 6ch would dwarf the live payload), but a
-// frozen 12-second snapshot around an interesting moment costs one 24KB upload
-// and gives millisecond-grade ground truth: what the rectified waveform
-// actually looks like, what a crash spike looks like raw, what the inter-part
-// gaps on the EQ machines really are.
-//
-// Capture is COMMAND-TRIGGERED only (heartbeat action "capture_waveform"),
-// rate-limited to one per 10 minutes. No automatic triggers in 2.14.0 — the
-// first job of this tool is to collect calibration/validation snapshots on
-// request, not to invent an alerting channel.
-//
-// Memory: the ring is heap-allocated ONCE at boot (wbInit). It cannot be
-// static — 24KB of .bss overflows the ESP32's dram0 static segment by ~6KB
-// (measured; the segment is much smaller than total DRAM). Boot-time heap is
-// ~250KB free, so the one-time malloc is safe; if it ever fails the black box
-// simply disables itself (wbFeed no-ops) rather than crashing anything.
+// Core 1 owns WRITING slots and appends configured channels in scan order.
+// Core 0 owns SENDING slots and POSTs one complete frame. READY/EMPTY handoff
+// is protected by a spinlock containing fixed-size state changes only. The
+// network never reads a slot that the sampler can overwrite.
 // ============================================================================
 
-static void wbLoadStreamPref();   // stream section, below — called from wbInit
-
-// Task ownership. The ring is written ONLY by readAllCT's sampling loop
-// (loopTask, core 1). The heartbeat command handler runs on networkTask
-// (core 0), so it must NOT touch the ring — it only sets _wbCaptureRequested,
-// and the actual freeze happens on loopTask between sampling windows
-// (wbServiceCapture, called right after readAllCT in loop()). That also puts
-// the flash write between windows instead of during one — a flash write
-// stalls the other core's cache, which would distort the sampling cadence.
-// The upload (file read + HTTP, no ring access) stays on networkTask.
-static uint16_t* _wbRing = nullptr;   // heap, allocated once by wbInit()
-static uint32_t _wbHead = 0;          // next write position
-static uint32_t _wbCount = 0;         // total samples ever written (saturating view)
-static int8_t   _wbChannel = -1;      // channel currently in the ring
-static unsigned long _wbLastCaptureMs = 0;
-static volatile bool _wbCaptureRequested = false;   // set by networkTask
-static volatile bool _wbDumpPending = false;
-// Stream-reader coordination (2.15.0). _wbTotal counts samples fed since the
-// last ring reset; _wbGen bumps on every reset (channel switch). Both are
-// written ONLY by Core 1 (wbFeed) and read by Core 0 (wbStreamLoop). Aligned
-// 32-bit reads/writes are atomic on the ESP32, and the reader keeps a
-// multi-thousand-sample cushion behind the writer, so no barrier is needed —
-// an off-by-a-few-samples view of _wbTotal is harmless by construction.
-static volatile uint32_t _wbTotal = 0;
-static volatile uint8_t  _wbGen = 0;
-
-// One-time boot allocation. Call from setup() before sampling starts.
-void wbInit() {
-    if (_wbRing != nullptr) return;
-    _wbRing = (uint16_t*)malloc(WB_RING_SAMPLES * sizeof(uint16_t));
-    if (_wbRing == nullptr)
-        Serial.println("[WB] ring alloc FAILED - black box disabled");
-    else
-        Serial.printf("[WB] ring ready: %ds @ 1kHz (%uB)\n",
-                      WB_RING_SECONDS, WB_RING_SAMPLES * 2);
-    // A dump captured just before a reboot/OTA would otherwise be orphaned:
-    // the pending flag lives in RAM, but the file survives on flash. Re-arm
-    // the upload if one is waiting. (Safe if LittleFS isn't mounted yet —
-    // exists() just returns false and the next capture overwrites the file.)
-    if (LittleFS.exists(WB_DUMP_FILE)) {
-        _wbDumpPending = true;
-        Serial.println("[WB] found dump from before reboot - upload re-armed");
-    }
-    wbLoadStreamPref();        // restore the per-device streaming enable
-}
-
-// Called once per sample for the chosen channel from readAllCT's loop.
-// Channel switches (strongest channel changed) restart the ring — a ring with
-// mixed channels is worse than a short one.
-void wbFeed(int ch, uint16_t v) {
-    if (_wbRing == nullptr) return;
-    if (ch != _wbChannel) {
-        _wbChannel = (int8_t)ch;
-        _wbHead = 0;
-        _wbCount = 0;
-        _wbTotal = 0;    // stream cursor resyncs via the generation bump
-        _wbGen++;
-    }
-    _wbRing[_wbHead] = v;
-    _wbHead = (_wbHead + 1) % WB_RING_SAMPLES;
-    if (_wbCount < WB_RING_SAMPLES) _wbCount++;
-    _wbTotal++;          // after the store — the counted sample is always in place
-}
-
-struct __attribute__((packed)) WbDumpHeader {
-    char     magic[4];        // "WBD1"
-    uint32_t epoch;           // device wall clock at capture (0 if unsynced)
-    uint8_t  channel;         // 0-based CT index
-    uint8_t  reserved;
-    uint16_t window_ms;       // sampling window at capture time
-    uint16_t sample_rate_hz;  // 1000
-    uint16_t n_samples;       // how many samples follow
+enum Wfs2SlotState : uint8_t {
+    WFS2_EMPTY = 0,
+    WFS2_WRITING,
+    WFS2_READY,
+    WFS2_SENDING,
 };
 
-bool wbDumpPending() { return _wbDumpPending; }
-int  wbChannel()     { return _wbChannel; }
+struct Wfs2Slot {
+    Wfs2Header header;
+    uint16_t samples[WFS2_MAX_FRAME_SAMPLES];
+    volatile uint8_t state;
+};
 
-// networkTask side: just raise the flag. loopTask does the work.
-void wbRequestCapture() { _wbCaptureRequested = true; }
+static_assert(offsetof(Wfs2Slot, samples) == sizeof(Wfs2Header),
+              "WFS2 header and sample payload must be contiguous");
 
-// Freeze the ring to flash, oldest sample first. loopTask ONLY (see above).
-// Returns false when rate-limited, ring empty, or flash write failed.
-static bool captureWaveform(int window_ms) {
-    unsigned long now = millis();
-    if (_wbRing == nullptr) return false;
-    if (_wbLastCaptureMs != 0 && (now - _wbLastCaptureMs) < WB_MIN_CAPTURE_GAP_MS) {
-        Serial.println("[WB] capture rate-limited");
-        return false;
+static portMUX_TYPE _wbMux = portMUX_INITIALIZER_UNLOCKED;
+static Wfs2Slot* _wbSlots = nullptr;
+static int8_t _wbWriteSlot = -1;               // Core 1 only
+static uint32_t _wbWriteSamples = 0;            // Core 1 only
+static bool _wbWriteOnDemand = false;           // Core 1 only
+static volatile bool _wbCaptureRequested = false;
+static volatile bool _wbStreamEnabled = false;
+static uint32_t _wbBootId = 0;
+static volatile uint32_t _wbFramesGenerated = 0;
+static volatile uint32_t _wbFramesDelivered = 0;
+static volatile uint32_t _wbFramesDropped = 0;
+static unsigned long _wbLastAttemptMs = 0;
+static bool _wbBackoff = false;
+static WiFiClient _wbClient;
+static HTTPClient _wbHttp;
+static bool _wbHttpInit = false;
+static uint8_t* _wbSendBuf = nullptr;              // Core 0 deflate/header staging
+
+static uint8_t _wbQueuedFramesUnlocked() {
+    if (_wbSlots == nullptr) return 0;
+    uint8_t n = 0;
+    for (int i = 0; i < WFS2_QUEUE_DEPTH; ++i)
+        if (_wbSlots[i].state == WFS2_READY || _wbSlots[i].state == WFS2_SENDING) ++n;
+    return n;
+}
+
+uint8_t wbQueuedFrames() {
+    portENTER_CRITICAL(&_wbMux);
+    uint8_t n = _wbQueuedFramesUnlocked();
+    portEXIT_CRITICAL(&_wbMux);
+    return n;
+}
+
+uint32_t wbFramesGenerated() { return _wbFramesGenerated; }
+uint32_t wbFramesDelivered() { return _wbFramesDelivered; }
+uint32_t wbFramesDropped()   { return _wbFramesDropped; }
+bool wbStreamOn()            { return _wbStreamEnabled; }
+uint32_t wbStreamSeq()       { return _wbFramesDelivered; } // legacy heartbeat alias
+
+void wbSetStream(bool on) {
+    _wbStreamEnabled = on;
+    Preferences p;
+    p.begin("lscfg", false);
+    p.putBool("wfstream", on);
+    p.end();
+    Serial.printf("[WFS2] streaming %s\n", on ? "ENABLED" : "disabled");
+}
+
+void wbInit() {
+    if (_wbSlots != nullptr) return;
+    _wbSlots = (Wfs2Slot*)calloc(WFS2_QUEUE_DEPTH, sizeof(Wfs2Slot));
+    if (_wbSlots == nullptr) {
+        Serial.printf("[WFS2] queue alloc FAILED (%u bytes) - waveform disabled\n",
+                      (unsigned)(WFS2_QUEUE_DEPTH * sizeof(Wfs2Slot)));
+        _wbStreamEnabled = false;
+        return;
     }
-    if (_wbCount == 0 || _wbChannel < 0) {
-        Serial.println("[WB] ring empty");
-        return false;
+    _wbBootId = esp_random();
+    Preferences p;
+    p.begin("lscfg", true);
+    _wbStreamEnabled = p.getBool("wfstream", false);
+    p.end();
+    Serial.printf("[WFS2] queue ready: %d x %u bytes, boot=%08X, stream=%s\n",
+                  WFS2_QUEUE_DEPTH, (unsigned)sizeof(Wfs2Slot),
+                  (unsigned)_wbBootId, _wbStreamEnabled ? "on" : "off");
+}
+
+// Called by Core 1 immediately before the first ADC scan of a one-second frame.
+// Returns false when streaming is off, no CT is active, or all queue slots are
+// occupied. A full queue drops the NEW frame and increments a visible counter.
+bool wbBeginFrame(uint8_t activeMask, uint32_t configRevision) {
+    activeMask &= 0x3f;
+    _wbWriteSlot = -1;
+    _wbWriteSamples = 0;
+    if (_wbSlots == nullptr || activeMask == 0) return false;
+
+    bool onDemand = _wbCaptureRequested;
+    if (!_wbStreamEnabled && !onDemand) return false;
+
+    int slot = -1;
+    portENTER_CRITICAL(&_wbMux);
+    for (int i = 0; i < WFS2_QUEUE_DEPTH; ++i) {
+        if (_wbSlots[i].state == WFS2_EMPTY) {
+            _wbSlots[i].state = WFS2_WRITING;
+            slot = i;
+            break;
+        }
     }
+    if (slot < 0) _wbFramesDropped++;
+    portEXIT_CRITICAL(&_wbMux);
+    if (slot < 0) return false;
 
-    File f = LittleFS.open(WB_DUMP_FILE, "w");
-    if (!f) { Serial.println("[WB] open failed"); return false; }
-
-    WbDumpHeader h = {};
-    memcpy(h.magic, "WBD1", 4);
-    h.epoch = (uint32_t)time(nullptr);
-    h.channel = (uint8_t)_wbChannel;
-    h.window_ms = (uint16_t)window_ms;
-    h.sample_rate_hz = 1000;
-    h.n_samples = (uint16_t)_wbCount;
-    f.write((const uint8_t*)&h, sizeof(h));
-
-    // Oldest-first: when the ring is full the oldest sample is at _wbHead.
-    // Written as at most TWO large writes (the ring's two contiguous
-    // segments), NOT per-sample — 12,000 individual 2-byte f.write() calls
-    // each pay LittleFS overhead and stalled the sampling task for seconds.
-    // ESP32 is little-endian, so dumping the uint16 array raw preserves the
-    // wire format exactly.
-    if (_wbCount == WB_RING_SAMPLES && _wbHead != 0) {
-        f.write((const uint8_t*)&_wbRing[_wbHead], (WB_RING_SAMPLES - _wbHead) * 2);
-        f.write((const uint8_t*)&_wbRing[0], _wbHead * 2);
-    } else {
-        f.write((const uint8_t*)&_wbRing[0], _wbCount * 2);
+    Wfs2Slot& out = _wbSlots[slot];
+    memset(&out.header, 0, sizeof(out.header));
+    memcpy(out.header.magic, "WFS2", 4);
+    out.header.version = 2;
+    out.header.header_bytes = sizeof(Wfs2Header);
+    out.header.active_mask = activeMask;
+    out.header.channel_count = wfs2ChannelCount(activeMask);
+    out.header.boot_id = _wbBootId;
+    out.header.frame_seq = _wbFramesGenerated++;
+    out.header.config_revision = configRevision;
+    out.header.capture_monotonic_us = (uint64_t)esp_timer_get_time();
+    timeval tv = {};
+    gettimeofday(&tv, nullptr);
+    if (tv.tv_sec >= 1700000000L) {
+        out.header.capture_epoch_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint32_t)tv.tv_usec;
+        out.header.flags |= WFS2_FLAG_CLOCK_SYNCED;
     }
-    f.close();
+    if (onDemand) out.header.flags |= WFS2_FLAG_ON_DEMAND;
+    out.header.dropped_frames = _wbFramesDropped;
+    out.header.sample_rate_hz = WFS2_SAMPLE_RATE_HZ;
+    out.header.samples_per_channel = WFS2_SAMPLES_PER_CHANNEL;
+    out.header.raw_payload_bytes = (uint32_t)wfs2PayloadBytes(
+        activeMask, WFS2_SAMPLES_PER_CHANNEL);
+    out.header.payload_bytes = out.header.raw_payload_bytes;
 
-    _wbLastCaptureMs = now;
-    _wbDumpPending = true;
-    Serial.printf("[WB] captured ch%d n=%u -> %s\n", _wbChannel + 1,
-                  (unsigned)_wbCount, WB_DUMP_FILE);
+    _wbWriteSlot = (int8_t)slot;
+    _wbWriteOnDemand = onDemand;
     return true;
 }
 
-// loopTask side: called once per second, right after readAllCT returns, so
-// the freeze (and its flash write) lands BETWEEN sampling windows.
-void wbServiceCapture(int window_ms) {
-    if (!_wbCaptureRequested) return;
-    _wbCaptureRequested = false;
-    captureWaveform(window_ms);
+// Called once for every enabled channel in every millisecond scan. readAllCT
+// iterates channels in ascending order, which is the WFS2 wire ordering.
+void wbFeed(int ch, uint16_t value) {
+    (void)ch;
+    if (_wbWriteSlot < 0) return;
+    if (_wbWriteSamples >= WFS2_MAX_FRAME_SAMPLES) return;
+    _wbSlots[_wbWriteSlot].samples[_wbWriteSamples++] = value;
 }
 
-// Upload the frozen dump as a raw binary POST (no base64 — a 24KB body
-// streamed straight from flash, zero large allocations). Metadata rides in
-// query params so the server never has to parse the body to route it.
-// Called from the network side when wbDumpPending(); clears the file on 2xx.
+// Publish only a complete frame. Partial or overfull frames are discarded as a
+// unit, so the server never mistakes truncated data for continuous acquisition.
+void wbEndFrame(uint32_t sampleDurationUs, uint16_t timingOverruns) {
+    if (_wbWriteSlot < 0) return;
+    Wfs2Slot& out = _wbSlots[_wbWriteSlot];
+    uint32_t expectedSamples = (uint32_t)out.header.channel_count *
+                               out.header.samples_per_channel;
+    bool complete = _wbWriteSamples == expectedSamples;
+    if (complete) {
+        out.header.sample_duration_us = sampleDurationUs;
+        out.header.timing_overruns = timingOverruns;
+        if (timingOverruns > 0) out.header.flags |= WFS2_FLAG_TIMING_OVERRUN;
+        out.header.payload_crc32 = wfs2Crc32(
+            (const uint8_t*)out.samples, out.header.raw_payload_bytes);
+    }
+
+    portENTER_CRITICAL(&_wbMux);
+    out.state = complete ? WFS2_READY : WFS2_EMPTY;
+    if (!complete) _wbFramesDropped++;
+    if (complete && _wbWriteOnDemand) _wbCaptureRequested = false;
+    portEXIT_CRITICAL(&_wbMux);
+    if (!complete) {
+        Serial.printf("[WFS2] incomplete frame: got=%u want=%u\n",
+                      (unsigned)_wbWriteSamples, (unsigned)expectedSamples);
+    }
+    _wbWriteSlot = -1;
+    _wbWriteSamples = 0;
+    _wbWriteOnDemand = false;
+}
+
+void wbRequestCapture() { _wbCaptureRequested = true; }
+bool wbDumpPending() { return _wbCaptureRequested || wbQueuedFrames() > 0; }
+int wbChannel() {
+    uint8_t mask = getActiveCTMask();
+    for (int ch = 0; ch < NUM_CT_CHANNELS; ++ch)
+        if (mask & (1u << ch)) return ch;
+    return -1;
+}
+
+// Compatibility hooks retained for the command/heartbeat call sites. WFS2
+// publishes the on-demand frame through wbStreamLoop; no flash dump is used.
+void wbServiceCapture(int windowMs) { (void)windowMs; }
 bool wbUploadDump(const String& serverBase, const String& deviceId) {
-    if (!_wbDumpPending) return false;
-    File f = LittleFS.open(WB_DUMP_FILE, "r");
-    if (!f) { _wbDumpPending = false; return false; }
-
-    WbDumpHeader h;
-    if (f.read((uint8_t*)&h, sizeof(h)) != sizeof(h) || memcmp(h.magic, "WBD1", 4) != 0) {
-        f.close();
-        LittleFS.remove(WB_DUMP_FILE);
-        _wbDumpPending = false;
-        return false;
-    }
-    f.seek(0);
-
-    HTTPClient http;
-    String url = serverBase + "/api/waveform/dump?device_id=" + deviceId +
-                 "&ct=" + String((int)h.channel + 1) +
-                 "&epoch=" + String((unsigned long)h.epoch) +
-                 "&rate=" + String((int)h.sample_rate_hz) +
-                 "&window_ms=" + String((int)h.window_ms) +
-                 "&n=" + String((int)h.n_samples);
-    http.begin(url);
-    http.setTimeout(20000);           // 24KB over a thin 4G link needs patience
-    http.addHeader("Content-Type", "application/octet-stream");
-    int code = http.sendRequest("POST", &f, f.size());
-    http.end();
-    f.close();
-
-    if (code >= 200 && code < 300) {
-        LittleFS.remove(WB_DUMP_FILE);
-        _wbDumpPending = false;
-        Serial.printf("[WB] dump uploaded (%d)\n", code);
-        return true;
-    }
-    // keep the file; retried on the next heartbeat cycle
-    Serial.printf("[WB] dump upload failed (%d), will retry\n", code);
+    (void)serverBase;
+    (void)deviceId;
     return false;
 }
 
-// ============================================================================
-// Continuous waveform streaming (2.15.0) — pilot-scale raw 1kHz export.
-//
-// Reads the SAME ring wbFeed fills and ships it as 3000-sample (6KB) binary
-// chunks to /api/waveform/stream, ~one POST per 6s of wall time. Design rules
-// inherited from the rest of the codebase:
-//   - snapshot-then-act: samples are memcpy'd into a heap scratch buffer
-//     first; the network never touches the ring.
-//   - SPSC ownership: Core 1 writes the ring (wbFeed), Core 0 only reads
-//     behind a wide cushion. No locks. The cushion argument: a chunk is only
-//     copied when the writer is ≥ WB_STREAM_CHUNK_SAMPLES ahead of the copy
-//     region's END-of-wrap distance (enforced by the lag cap below), and the
-//     copy itself takes microseconds vs the writer's ~500 samples/second.
-//   - live data first: the same gate family as the background uploads
-//     (ring at/below low-water, recent live 200, no OTA in flight).
-//   - LOSSY BY DESIGN: if the uplink can't keep up, the cursor jumps forward
-//     and a gap appears in `off` — this is a research data hose, not the
-//     zero-loss delivery pipeline. Gaps are visible (off/seq discontinuity),
-//     never silent.
-// ============================================================================
-static bool          _wsEnabled = false;
-static uint8_t*      _wsBuf = nullptr;        // heap scratch, lazily allocated
-static uint32_t      _wsCursor = 0;           // samples consumed (units of _wbTotal)
-static uint8_t       _wsGen = 0xFF;           // generation the cursor is valid for
-static uint32_t      _wsSeq = 0;              // delivered-chunk counter (diagnostic)
-static unsigned long _wsLastAttemptMs = 0;
-static bool          _wsBackoff = false;
-static WiFiClient    _wsClient;               // own pooled socket — never the
-static HTTPClient    _wsHttp;                 // live data plane's connection
-static bool          _wsHttpInit = false;
-
-bool     wbStreamOn()  { return _wsEnabled; }
-uint32_t wbStreamSeq() { return _wsSeq; }
-
-void wbSetStream(bool on) {
-    _wsEnabled = on;
-    Preferences p; p.begin("lscfg", false);
-    p.putBool("wfstream", on);
-    p.end();
-    Serial.printf("[WS] streaming %s\n", on ? "ENABLED" : "disabled");
-}
-
-static void wbLoadStreamPref() {
-    Preferences p; p.begin("lscfg", true);
-    _wsEnabled = p.getBool("wfstream", false);
-    p.end();
-    if (_wsEnabled) Serial.println("[WS] streaming enabled (persisted)");
-}
-
-// Core 0, every networkTask cycle (WiFi already confirmed up by the caller).
-// At most one chunk POST per call; all early-outs are O(1).
+// Core 0, called every 100ms. At most one complete frame is sent per call.
 void wbStreamLoop() {
-    if (!_wsEnabled || _wbRing == nullptr) return;
-    if (isUpdateInProgress()) return;              // never compete with an OTA
+    if (_wbSlots == nullptr) return;
+    if (isUpdateInProgress()) return;
     unsigned long now = millis();
-    if (_wsBackoff && (now - _wsLastAttemptMs) < WB_STREAM_RETRY_MS) return;
-    // Live data keeps absolute priority — same shape as the background-upload
-    // gate. A demonstrably healthy uplink = a live 200 in the last 30s.
+    if (_wbBackoff && (now - _wbLastAttemptMs) < WB_STREAM_RETRY_MS) return;
     if (getQueueSize() > BG_UPLOAD_LOWATER) return;
     long okAge = getLastSuccessAgeS();
     if (okAge < 0 || okAge > 30) return;
     if (ESP.getFreeHeap() < WB_STREAM_MIN_HEAP) return;
 
-    // Snapshot the writer's position (single volatile reads; cushion below
-    // makes exact ordering irrelevant).
-    uint8_t  gen   = _wbGen;
-    uint32_t total = _wbTotal;
-    int8_t   ch    = _wbChannel;
-    if (ch < 0) return;
-    if (gen != _wsGen) {
-        // Ring was reset (channel switch) — resync to the oldest valid sample.
-        _wsGen = gen;
-        _wsCursor = (total > WB_RING_SAMPLES) ? total - WB_RING_SAMPLES : 0;
+    int slot = -1;
+    uint32_t oldestSeq = 0;
+    portENTER_CRITICAL(&_wbMux);
+    for (int i = 0; i < WFS2_QUEUE_DEPTH; ++i) {
+        if (_wbSlots[i].state != WFS2_READY) continue;
+        uint32_t seq = _wbSlots[i].header.frame_seq;
+        if (slot < 0 || (int32_t)(seq - oldestSeq) < 0) {
+            slot = i;
+            oldestSeq = seq;
+        }
     }
-    // Lag cap: keep the copy region a full ring-minus-chunk-minus-margin away
-    // from the writer's clobber point. 12000-ring, 3000-chunk, 1000-margin =>
-    // max lag 8000 samples; beyond that, jump to the freshest full chunk.
-    const uint32_t maxLag = WB_RING_SAMPLES - WB_STREAM_CHUNK_SAMPLES - 1000;
-    if (total - _wsCursor > maxLag) _wsCursor = total - WB_STREAM_CHUNK_SAMPLES;
-    if (total - _wsCursor < WB_STREAM_CHUNK_SAMPLES) return;   // chunk not ready
+    if (slot >= 0) _wbSlots[slot].state = WFS2_SENDING;
+    portEXIT_CRITICAL(&_wbMux);
+    if (slot < 0) return;
 
-    if (_wsBuf == nullptr) {
-        _wsBuf = (uint8_t*)malloc(WB_STREAM_CHUNK_SAMPLES * 2);
-        if (_wsBuf == nullptr) {          // heap denied: disable rather than thrash
-            _wsEnabled = false;
-            Serial.println("[WS] scratch alloc FAILED - streaming disabled");
+    Wfs2Slot& frame = _wbSlots[slot];
+    if (_wbSendBuf == nullptr) {
+        _wbSendBuf = (uint8_t*)malloc(WFS2_ENCODE_SCRATCH_BYTES);
+        if (_wbSendBuf == nullptr) {
+            portENTER_CRITICAL(&_wbMux);
+            frame.state = WFS2_READY;
+            _wbBackoff = true;
+            portEXIT_CRITICAL(&_wbMux);
+            _wbLastAttemptMs = millis();
             return;
         }
     }
 
-    // Copy the chunk out of the ring (≤2 contiguous segments), then re-check
-    // the generation: a channel switch mid-copy means mixed data — discard.
-    uint32_t start = _wsCursor % WB_RING_SAMPLES;
-    uint32_t firstN = WB_RING_SAMPLES - start;
-    if (firstN > WB_STREAM_CHUNK_SAMPLES) firstN = WB_STREAM_CHUNK_SAMPLES;
-    memcpy(_wsBuf, &_wbRing[start], firstN * 2);
-    if (firstN < WB_STREAM_CHUNK_SAMPLES)
-        memcpy(_wsBuf + firstN * 2, &_wbRing[0],
-               (WB_STREAM_CHUNK_SAMPLES - firstN) * 2);
-    if (_wbGen != gen) return;            // ring reset mid-copy — resync next pass
-
-    String url = String("http://46.224.90.187/api/waveform/stream?device_id=") +
-                 getDeviceId() +
-                 "&ct=" + String((int)ch + 1) +
-                 "&seq=" + String((unsigned long)_wsSeq) +
-                 "&off=" + String((unsigned long)_wsCursor) +
-                 "&n=" + String(WB_STREAM_CHUNK_SAMPLES) +
-                 "&window_ms=" + String(getSampleWindowMs()) +
-                 "&gen=" + String((int)gen) +
-                 "&epoch=" + String((unsigned long)time(nullptr));
-    if (!_wsHttpInit) {
-        _wsHttp.setReuse(true);           // one socket across chunks, not one per
-        _wsHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-        _wsHttp.setTimeout(8000);
-        _wsHttpInit = true;
+    Wfs2Header encodedHeader = frame.header;
+    const size_t rawBytes = frame.header.raw_payload_bytes;
+    size_t encodedBytes = tdefl_compress_mem_to_mem(
+        _wbSendBuf + sizeof(Wfs2Header),
+        WFS2_ENCODE_SCRATCH_BYTES - sizeof(Wfs2Header),
+        frame.samples, rawBytes, TDEFL_DEFAULT_MAX_PROBES);
+    if (encodedBytes > 0 && encodedBytes != (size_t)-1 && encodedBytes < rawBytes) {
+        encodedHeader.flags |= WFS2_FLAG_RAW_DEFLATE;
+        encodedHeader.payload_bytes = (uint32_t)encodedBytes;
+    } else {
+        encodedBytes = rawBytes;
+        encodedHeader.payload_bytes = (uint32_t)rawBytes;
+        memcpy(_wbSendBuf + sizeof(Wfs2Header), frame.samples, rawBytes);
+    }
+    memcpy(_wbSendBuf, &encodedHeader, sizeof(encodedHeader));
+    size_t bodyBytes = sizeof(Wfs2Header) + encodedBytes;
+    String url = String("http://46.224.90.187/api/waveform/v2?device_id=") +
+                 getDeviceId();
+    if (!_wbHttpInit) {
+        _wbHttp.setReuse(true);
+        _wbHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        _wbHttp.setTimeout(8000);
+        _wbHttpInit = true;
     }
     feedWatchdog();
-    _wsHttp.begin(_wsClient, url);
-    _wsHttp.addHeader("Content-Type", "application/octet-stream");
-    int code = _wsHttp.POST(_wsBuf, WB_STREAM_CHUNK_SAMPLES * 2);
-    _wsHttp.end();
+    _wbHttp.begin(_wbClient, url);
+    _wbHttp.addHeader("Content-Type", "application/vnd.linesights.wfs2");
+    int code = _wbHttp.POST(_wbSendBuf, bodyBytes);
+    _wbHttp.end();
     feedWatchdog();
-    _wsLastAttemptMs = millis();
+    _wbLastAttemptMs = millis();
 
+    portENTER_CRITICAL(&_wbMux);
     if (code >= 200 && code < 300) {
-        _wsCursor += WB_STREAM_CHUNK_SAMPLES;
-        _wsSeq++;
-        _wsBackoff = false;
+        frame.state = WFS2_EMPTY;
+        _wbFramesDelivered++;
+        _wbBackoff = false;
     } else {
-        // Keep the cursor (retry the same chunk after backoff); if the outage
-        // outlasts the ring, the lag cap above skips forward with a visible gap.
-        _wsBackoff = true;
-        _wsClient.stop();                 // reaped keep-alive: next POST reconnects
-        static unsigned long _wsLastErrLog = 0;
-        if (millis() - _wsLastErrLog > 300000) {   // log at most every 5 min
-            _wsLastErrLog = millis();
-            Serial.printf("[WS] chunk POST failed (%d)\n", code);
+        frame.state = WFS2_READY;
+        _wbBackoff = true;
+    }
+    portEXIT_CRITICAL(&_wbMux);
+
+    if (code < 200 || code >= 300) {
+        _wbClient.stop();
+        static unsigned long lastLogMs = 0;
+        if (millis() - lastLogMs > 300000UL) {
+            lastLogMs = millis();
+            Serial.printf("[WFS2] frame POST failed (%d)\n", code);
         }
     }
 }

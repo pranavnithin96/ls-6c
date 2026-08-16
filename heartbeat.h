@@ -129,6 +129,10 @@ void logError(const String& message) {
 
 void initHeartbeat(const String& serverUrl) {
     _heartbeatUrl = "http://46.224.90.187/api/firmware/heartbeat";
+    // Ask for persistent desired CT configuration immediately after boot. A
+    // newly upgraded legacy device has no local mask, so waiting 60 seconds
+    // would produce a minute of intentionally disabled readings.
+    _lastHeartbeat = millis() - HEARTBEAT_INTERVAL_MS;
 
     esp_reset_reason_t reason = esp_reset_reason();
     switch (reason) {
@@ -266,12 +270,21 @@ void processCommands(const String& responseBody) {
             float val = cmd["value"] | -1.0f;
             if (!setChannelSlope(ch - 1, val))
                 logError("set_ct_slope rejected: bad channel/slope");
+        } else if (action == "set_ct_channels") {
+            // Atomic six-bit configuration. `mask` is preferred; `value` keeps
+            // compatibility with the server's scalar command schema. A higher
+            // revision is staged now and applied by Core 1 at the next complete
+            // one-second frame boundary.
+            int mask = cmd.containsKey("mask") ? (int)cmd["mask"] : (int)(cmd["value"] | -1);
+            uint32_t revision = cmd["revision"] | 0U;
+            if (mask < 0 || mask > 0x3f || !stageCTChannelConfig((uint8_t)mask, revision))
+                logError("set_ct_channels rejected: want mask 0-63 and newer revision");
         } else if (action == "set_window_ms") {
-            // Sampling window 500-900ms in 100ms steps (2.14.0). Persisted;
-            // wider = less blind time per second, less loop-idle headroom.
+            // v2.18 fixes acquisition at one complete second. Retained only as
+            // an idempotent compatibility command for value=1000.
             int val = cmd["value"] | -1;
             if (!setSampleWindowMs(val))
-                logError("set_window_ms rejected: want 500-900 step 100");
+                logError("set_window_ms rejected: v2.18 requires 1000");
         } else if (action == "capture_waveform") {
             // Freeze the raw-sample ring and upload it (2.14.0). The capture
             // itself runs on the sampling task between windows; this only
@@ -371,9 +384,19 @@ void sendHeartbeat() {
     // can confirm an OTA landed and recompute thresholds for exactly the
     // channels that moved. ~90 bytes on a 5-minute heartbeat.
     doc["window_ms"] = getSampleWindowMs();           // sampling window (2.14.0)
+    doc["ct_active_mask"] = getActiveCTMask();        // applied physical-input mask
+    doc["ct_config_revision"] = getCTConfigRevision();// applied remote/provisioning revision
+    doc["ct_config_required"] = isCTConfigRequired(); // fresh device has no active inputs
+    doc["ct_config_pending"] = isCTConfigPending();   // staged; applies next frame boundary
     doc["wb_pending"] = wbDumpPending();              // black-box dump awaiting upload
-    doc["wfstream"] = wbStreamOn();                   // continuous 1kHz export (2.15.0)
-    doc["wfstream_seq"] = wbStreamSeq();              // delivered chunks this uptime
+    doc["wfstream"] = wbStreamOn();                   // complete-frame WFS2 export
+    doc["wfstream_seq"] = wbStreamSeq();              // delivered frames this uptime
+    doc["wfs2_generated"] = wbFramesGenerated();
+    doc["wfs2_delivered"] = wbFramesDelivered();
+    doc["wfs2_dropped"] = wbFramesDropped();
+    doc["wfs2_queued"] = wbQueuedFrames();
+    doc["sampling_overruns_last"] = getSamplingOverrunsLast();
+    doc["sampling_overruns_total"] = getSamplingOverrunsTotal();
     // --- 2.17.0: the device's own internet-speed report + new feature state ---
     doc["post_ms_p50"] = getPostMsP50();              // live POST round-trip, median
     doc["post_ms_p90"] = getPostMsP90();              // ...and tail (queue-delay signal)

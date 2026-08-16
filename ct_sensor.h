@@ -17,7 +17,7 @@ struct CTReading {
     int avg_mv;
     int samples;
     // --- Waveform features (FEATURE_WAVEFORM_STATS, live payload only) ---
-    // Derived per 500ms window from the same samples readAllCT already takes.
+    // Derived per complete 1000ms frame from the same samples readAllCT takes.
     // Populated unconditionally (cost is tens of us); emitted only when the
     // flag is on. ALL of these are computed on the ENVELOPE (20ms sub-window
     // means, one mains cycle each) as of 2.13.0 — never on raw ADC samples,
@@ -52,16 +52,16 @@ struct AllCTReadings {
     float mains_hz;
 };
 
-// --- Runtime sampling window (2.14.0) --------------------------------------
-// 500ms default (identical behavior to 2.13.x). set via setSampleWindowMs()
-// from the set_window_ms heartbeat command; persisted in lscfg/winms.
+// --- Complete one-second sampling window (2.18.0) --------------------------
+// Fixed at 1000ms. The legacy setter remains as an idempotent compatibility
+// hook, but shorter windows are rejected because they reintroduce blind time.
 static int _winSamples = ADC_SAMPLES_PER_CH;
 
 int getSampleWindowMs() { return _winSamples; }   // 1 sample == 1 ms at 1kHz
 
 bool setSampleWindowMs(int ms) {
     if (ms < MIN_ADC_SAMPLES || ms > MAX_ADC_SAMPLES || ms % 100 != 0)
-        return false;                 // %100 keeps 20ms sub-windows AND env5 exact
+        return false;
     _winSamples = ms;
     Preferences p; p.begin("lscfg", false);
     p.putInt("winms", ms);
@@ -128,8 +128,8 @@ void initCTSensors() {
     }
     calPrefs.end();
 
-    Serial.printf("[CT] %d channels | %d samples | %dms window\n",
-        NUM_CT_CHANNELS, ADC_SAMPLES_PER_CH, (ADC_SAMPLES_PER_CH * SAMPLE_INTERVAL_US) / 1000);
+    Serial.printf("[CT] configured mask=0x%02X | %d samples/channel | %dms frame\n",
+        getActiveCTMask(), _winSamples, (_winSamples * SAMPLE_INTERVAL_US) / 1000);
     Serial.println("[CT] Cal: per-channel slope if set, else 50A=0.0421 100A=0.0327 legacy 0.0123+0.13");
 }
 
@@ -246,7 +246,7 @@ static inline float ctCountToAmps(int ch, int rating, float count) {
 }
 
 // ---------------------------------------------------------------------------
-// Envelope resolution for the waveform features. 25 sub-windows over the 500ms
+// Envelope resolution for the waveform features. 50 sub-windows over the 1000ms
 // sampling window = 20ms each = exactly ONE 50Hz mains cycle per sub-window, so
 // each sub-window mean cancels the AC carrier and reports load. Must divide
 // ADC_SAMPLES_PER_CH evenly, and must be a multiple of 5 so env5 (the 5 x 100ms
@@ -270,8 +270,16 @@ static_assert(ADC_SAMPLES_PER_CH % (ENV_SUBWIN_SAMPLES * 5) == 0,
 static_assert(MAX_ADC_SAMPLES % (ENV_SUBWIN_SAMPLES * 5) == 0,
               "max window must divide into 20ms sub-windows and 5 env5 slots");
 
-// Black box hook — defined in waveform_blackbox.h (same translation unit).
+// Complete-frame WFS2 hooks — defined in waveform_blackbox.h later in the same
+// Arduino translation unit.
+bool wbBeginFrame(uint8_t activeMask, uint32_t configRevision);
 void wbFeed(int ch, uint16_t v);
+void wbEndFrame(uint32_t sampleDurationUs, uint16_t timingOverruns);
+
+static volatile uint32_t _samplingOverrunsTotal = 0;
+static volatile uint16_t _samplingOverrunsLast = 0;
+uint32_t getSamplingOverrunsTotal() { return _samplingOverrunsTotal; }
+uint16_t getSamplingOverrunsLast() { return _samplingOverrunsLast; }
 
 // Read all CT channels — per-rating calibration on raw ADC counts (see above).
 // Legacy fallback keeps the +0.13 floor; the 50A/100A fits are through-origin.
@@ -280,7 +288,11 @@ AllCTReadings readAllCT(float grid_voltage) {
     all.timestamp_ms = millis();  // Timestamp at START of sampling
     all.total_watts = 0;
 
-    const int nSamples = _winSamples;                       // runtime window
+    // Promote a remotely staged mask only here, before the first sample. The
+    // local snapshot is immutable for the entire frame.
+    uint32_t configRevision = 0;
+    const uint8_t activeMask = applyPendingCTConfigAtFrameBoundary(&configRevision);
+    const int nSamples = _winSamples;
     const int n_subwin = nSamples / ENV_SUBWIN_SAMPLES;     // 20ms sub-windows
 
     uint32_t sumCounts[NUM_CT_CHANNELS] = {0};
@@ -303,11 +315,17 @@ AllCTReadings readAllCT(float grid_voltage) {
     // Hump timing on the STRONGEST channel of the previous window. The
     // rectified front end produces one hump per mains cycle; counting
     // threshold crossings with sub-sample interpolation gives grid frequency
-    // to ~0.01Hz over a 500ms window. Threshold = half the previous window's
+    // to ~0.01Hz over a 1000ms window. Threshold = half the previous window's
     // peak (loads change slowly relative to 1s), with hysteresis so ADC noise
     // near the threshold can't double-count a hump.
     static int _strongCh = 0;
     static uint16_t _prevWinMax[NUM_CT_CHANNELS] = {0};
+    if (!(activeMask & (1u << _strongCh))) {
+        _strongCh = 0;
+        while (_strongCh < NUM_CT_CHANNELS && !(activeMask & (1u << _strongCh)))
+            _strongCh++;
+        if (_strongCh >= NUM_CT_CHANNELS) _strongCh = 0;
+    }
     const int fq = _strongCh;
     // 2.17.0: hump timing runs on EVERY loaded channel (per-channel hz — the
     // spindle-frequency feature), not just the strongest. Same detector, same
@@ -323,15 +341,17 @@ AllCTReadings readAllCT(float grid_voltage) {
     for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
         thrHiC[ch] = _prevWinMax[ch] / 2;
         thrLoC[ch] = (uint16_t)(_prevWinMax[ch] * 3 / 8);   // 12.5% hysteresis
-        usableC[ch] = thrHiC[ch] >= 100;   // needs a real load to have humps
+        usableC[ch] = (activeMask & (1u << ch)) && thrHiC[ch] >= 100;
         aboveC[ch] = false; nCrossC[ch] = 0;
         firstXC[ch] = 0.0f; lastXC[ch] = 0.0f;
         maxIvC[ch] = 0.0f; minIvC[ch] = 1e9f;
         prevVC[ch] = 0;
     }
-    const bool fqUsable = usableC[fq];
+    const bool fqUsable = (activeMask != 0) && usableC[fq];
 
+    wbBeginFrame(activeMask, configRevision);
     unsigned long t0 = micros();
+    uint16_t timingOverruns = 0;
 
     // Interleaved sampling: all 6 channels per 1ms time step.
     // Raw analogRead() counts — NOT analogReadMilliVolts(). The manufacturer's
@@ -340,11 +360,12 @@ AllCTReadings readAllCT(float grid_voltage) {
     for (int s = 0; s < nSamples; s++) {
         int sw = s / ENV_SUBWIN_SAMPLES;    // fixed 20ms sub-window index
         for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
+            if (!(activeMask & (1u << ch))) continue;
             uint16_t v = (uint16_t)analogRead(CT_PINS[ch]);   // single read, reused
             sumCounts[ch] += v;
             subSum[ch][sw] += v;
             if (v > maxCount[ch]) maxCount[ch] = v;
-            if (ch == fq) wbFeed(ch, v);    // black-box ring (one u16 store)
+            wbFeed(ch, v);                  // WFS2 scan-major configured channels
             if (usableC[ch]) {
                 if (!aboveC[ch] && v >= thrHiC[ch]) {
                     // rising crossing; interpolate between s-1 and s
@@ -371,10 +392,16 @@ AllCTReadings readAllCT(float grid_voltage) {
             }
         }
         unsigned long target = t0 + (unsigned long)((s + 1) * SAMPLE_INTERVAL_US);
-        while (micros() < target) {}  // Busy-wait for precise 1ms cadence
+        if ((int32_t)(micros() - target) > 0 && timingOverruns < UINT16_MAX)
+            timingOverruns++;
+        while ((int32_t)(micros() - target) < 0) {} // rollover-safe 1ms cadence
     }
 
-    all.sample_duration_ms = (micros() - t0) / 1000;
+    uint32_t sampleDurationUs = micros() - t0;
+    all.sample_duration_ms = sampleDurationUs / 1000;
+    _samplingOverrunsLast = timingOverruns;
+    _samplingOverrunsTotal += timingOverruns;
+    wbEndFrame(sampleDurationUs, timingOverruns);
 
     // Mains frequency: humps are 1/cycle, samples are 1ms apart. Require >=5
     // clean humps and a plausible answer; otherwise report 0 (= unknown).
@@ -394,24 +421,27 @@ AllCTReadings readAllCT(float grid_voltage) {
         float hz = 1000.0f / meanIv;
         if (consistent && hz >= 45.0f && hz <= 65.0f) all.mains_hz = hz;
     }
-    // Choose next window's frequency/black-box channel: strongest this window.
-    // 2.15.1: only ADOPT a new channel when it carries a real load. When every
-    // channel idles near zero (machine parked), the argmax jitters across ADC
-    // noise on EMPTY channels and each switch resets the black-box ring —
-    // measured on meton_01: 445 ring resets in 5h of streaming, truncating
-    // exactly the between-part parks the stream exists to record. Below the
-    // floor, keep the incumbent: the ring then records the park intact.
-    { int best = 0;
-      for (int ch = 1; ch < NUM_CT_CHANNELS; ch++)
-          if (maxCount[ch] > maxCount[best]) best = ch;
-      if (maxCount[best] >= 100 && best != _strongCh) _strongCh = best;
-      for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) _prevWinMax[ch] = maxCount[ch];
+    // Choose the active channel used only for the legacy mains_hz summary.
+    // WFS2 captures every configured channel and never follows this selection.
+    if (activeMask != 0) {
+      int best = _strongCh;
+      for (int ch = 0; ch < NUM_CT_CHANNELS; ch++)
+          if ((activeMask & (1u << ch)) && maxCount[ch] > maxCount[best]) best = ch;
+      if (maxCount[best] >= 100) _strongCh = best;
     }
+    for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) _prevWinMax[ch] = maxCount[ch];
 
     for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
         CTReading r = {};
         r.voltage = grid_voltage;
-        r.samples = nSamples;
+        r.samples = (activeMask & (1u << ch)) ? nSamples : 0;
+
+        // Disabled physical inputs are not sampled and must remain true zero;
+        // never pass them through the legacy +0.13A fallback calibration.
+        if (!(activeMask & (1u << ch))) {
+            all.ct[ch] = r;
+            continue;
+        }
 
         float avgCount = (float)sumCounts[ch] / nSamples;
 
@@ -472,10 +502,7 @@ AllCTReadings readAllCT(float grid_voltage) {
         if (ratio > 20.0f) ratio = 20.0f;
         r.env_peak_ratio = ratio;
 
-        // env5: five equal slots across the window -> in amps. At the default
-        // 500ms window each slot is 100ms (unchanged contract); at a widened
-        // window slots stretch proportionally (window/5) — consumers should
-        // read `samples` (window ms) rather than assume 100ms slots.
+        // env5: five equal 200ms slots across the complete one-second frame.
         const int per5 = n_subwin / 5;
         for (int k = 0; k < 5; k++) {
             float s5 = 0.0f;
