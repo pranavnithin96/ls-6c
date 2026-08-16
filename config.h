@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.18.2"
+#define FIRMWARE_VERSION "2.18.3"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -30,7 +30,7 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define ENV_SUBWIN_SAMPLES    20      // 20ms @ 1kHz = one 50Hz mains cycle
 #define MAX_ENV_SUBWIN        (MAX_ADC_SAMPLES / ENV_SUBWIN_SAMPLES)
 
-// --- WFS2 continuous waveform streaming (2.18.2, pilot devices only) ---
+// --- WFS2 continuous waveform streaming (2.18.3, pilot devices only) ---
 // Each queued item is exactly one complete 1000ms acquisition frame containing
 // ONLY configured channels, scan-interleaved in ascending CT order. Four heap
 // slots allow Core 1 to acquire while Core 0 uploads. Frames use a bounded,
@@ -217,7 +217,8 @@ static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
 #define OTA_CHUNK_RETRY_MS    30000UL  // preserve ordinary telemetry between failures
 #define OTA_MAX_CHUNK_FAILURES 5
 #define OTA_SESSION_MAX_MS    1800000UL // 30 minutes, while telemetry continues normally
-#define MAX_CRASH_COUNT       3
+#define OTA_HEALTH_VALIDATION_MS 300000UL // prove 5 min uptime + live server delivery
+#define OTA_VALIDATION_MIN_HEAP  30000UL
 #define OTA_MAX_SIZE          0x140000 // 1,310,720 bytes (partition size)
 
 // --- Diagnostics ---

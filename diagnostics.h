@@ -25,6 +25,7 @@ int getQueueSize();
 bool isUploadPending();
 bool isOfflineMode();
 bool isRejectedDrainPending();
+bool isUpdateInProgress();
 
 static uint32_t _crashCount = 0;
 
@@ -188,6 +189,7 @@ void scheduledRebootLoop() {
     // If conditions never clear, the device just keeps running — reboot is
     // opportunistic maintenance, not a deadline.
     if (WiFi.status() != WL_CONNECTED) return;
+    if (isUpdateInProgress()) return;
     if (isOfflineMode() || isUploadPending() || getQueueSize() > 0) return;
     if (isRejectedDrainPending()) return;   // finish an operator-requested drain first
     struct tm t;

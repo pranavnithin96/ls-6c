@@ -32,6 +32,13 @@ heartbeat. Re-delivering the already-applied pair is idempotent.
 
 Content type: `application/vnd.linesights.wfs2`
 
+Header: `X-LS-WFS-Token: <per-device bearer credential>`. The server creates a
+new random credential whenever a super-admin enables the stream, stores only
+its SHA-256 verifier, and provisions the raw value through heartbeat. The
+device persists it in NVS. A device ID is routing metadata, not authentication;
+missing/mismatched credentials and devices without explicit desired streaming
+state receive 403 before their bodies are parsed or stored.
+
 For a single urgent or final frame, the request body is one 64-byte
 `Wfs2Header` followed immediately by its payload. Normally the device sends up
 to two complete, increasing-sequence frames in one request:
@@ -44,7 +51,7 @@ The batch body is simply two independently valid header+payload frames
 concatenated. The receiver validates the complete batch before storing either
 frame and rejects mixed boot IDs, reversed sequences, and a third frame.
 
-Firmware 2.18.2 encodes the payload losslessly while Core 1 samples, using
+Firmware 2.18.3 encodes the payload losslessly while Core 1 samples, using
 `WFS2_FLAG_DELTA_RLE`. The first enabled-channel scan is literal little-endian
 `uint16`. Remaining scan-major values use a predictor per channel:
 

@@ -291,9 +291,11 @@ void processCommands(const String& responseBody) {
             // raises the request flag. Rate-limited to one per 10 min.
             wbRequestCapture();
         } else if (action == "wfstream_on") {
-            // Continuous 1kHz chunk export (2.15.0, pilot devices). RAM-only,
-            // health-gated behind live data; ~1KB/s uplink when running.
-            wbSetStream(true);
+            // Continuous WFS2 export is authenticated independently of the
+            // public device id. The bearer credential is generated server-side
+            // per enable, kept in NVS, and never printed in diagnostics.
+            String token = cmd["value"] | "";
+            wbSetStream(true, token);
         } else if (action == "wfstream_off") {
             wbSetStream(false);
         } else if (action == "clear_rejected") {

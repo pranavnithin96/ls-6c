@@ -18,7 +18,7 @@ bool isUpdateInProgress();
 void feedWatchdog();
 
 // ============================================================================
-// WFS2 complete-frame waveform queue (2.18.2)
+// WFS2 complete-frame waveform queue (2.18.3)
 //
 // Core 1 owns WRITING slots and appends configured channels in scan order.
 // Core 0 owns SENDING slots and POSTs one complete frame. READY/EMPTY handoff
@@ -51,6 +51,7 @@ static uint32_t _wbWriteCrc = 0xffffffffu;
 static bool _wbWriteOnDemand = false;           // Core 1 only
 static volatile bool _wbCaptureRequested = false;
 static volatile bool _wbStreamEnabled = false;
+static String _wbAuthToken;
 static uint32_t _wbBootId = 0;
 static volatile uint32_t _wbFramesGenerated = 0;
 static volatile uint32_t _wbFramesDelivered = 0;
@@ -86,11 +87,29 @@ uint32_t wbFramesDropped()   { return _wbFramesDropped; }
 bool wbStreamOn()            { return _wbStreamEnabled; }
 uint32_t wbStreamSeq()       { return _wbFramesDelivered; } // legacy heartbeat alias
 
-void wbSetStream(bool on) {
+void wbSetStream(bool on, const String& token = String()) {
+    if (on && (token.length() < 20 || token.length() > 128)) {
+        Serial.println("[WFS2] enable rejected: missing/invalid credential");
+        return;
+    }
+    if (on) _wbAuthToken = token;
+    else _wbAuthToken = "";
     _wbStreamEnabled = on;
+    if (!on && _wbSlots != nullptr) {
+        // Operator stop is authoritative: discard queued best-effort waveform
+        // frames immediately so a desired=false intake gate cannot leave an
+        // unsendable queue retrying forever. A WRITING frame is handled at end.
+        portENTER_CRITICAL(&_wbMux);
+        for (int i = 0; i < WFS2_QUEUE_DEPTH; ++i)
+            if (_wbSlots[i].state == WFS2_READY)
+                _wbSlots[i].state = WFS2_EMPTY;
+        portEXIT_CRITICAL(&_wbMux);
+    }
     Preferences p;
     p.begin("lscfg", false);
     p.putBool("wfstream", on);
+    if (on) p.putString("wfstoken", _wbAuthToken);
+    else p.remove("wfstoken");
     p.end();
     Serial.printf("[WFS2] streaming %s\n", on ? "ENABLED" : "disabled");
 }
@@ -108,7 +127,12 @@ void wbInit() {
     Preferences p;
     p.begin("lscfg", true);
     _wbStreamEnabled = p.getBool("wfstream", false);
+    _wbAuthToken = p.getString("wfstoken", "");
     p.end();
+    // A legacy stream flag without a credential must fail closed. The server
+    // will redeliver desired state with a fresh token on the next heartbeat.
+    if (_wbStreamEnabled && _wbAuthToken.length() < 20)
+        _wbStreamEnabled = false;
     Serial.printf("[WFS2] queue ready: %d x %u bytes, boot=%08X, stream=%s\n",
                   WFS2_QUEUE_DEPTH, (unsigned)sizeof(Wfs2Slot),
                   (unsigned)_wbBootId, _wbStreamEnabled ? "on" : "off");
@@ -191,7 +215,8 @@ void wbEndFrame(uint32_t sampleDurationUs, uint16_t timingOverruns) {
     Wfs2Slot& out = _wbSlots[_wbWriteSlot];
     uint32_t expectedSamples = (uint32_t)out.header.channel_count *
                                out.header.samples_per_channel;
-    bool complete = _wbEncoder.finish() &&
+    bool wanted = _wbStreamEnabled || _wbWriteOnDemand;
+    bool complete = wanted && _wbEncoder.finish() &&
                     _wbWriteSamples == expectedSamples &&
                     _wbEncoder.size() <= out.header.raw_payload_bytes;
     if (complete) {
@@ -245,7 +270,7 @@ void wbStreamLoop() {
     if (_wbBackoff && (now - _wbLastAttemptMs) < WB_STREAM_RETRY_MS) return;
     // Waveforms are strictly lower priority than ordinary telemetry. The 2.18.0
     // pilot allowed seven live readings to queue and WFS made that backlog
-    // worse; 2.18.2 yields as soon as even one ordinary summary is pending.
+    // worse; 2.18.3 yields as soon as even one ordinary summary is pending.
     if (getQueueSize() != 0) return;
     long okAge = getLastSuccessAgeS();
     if (okAge < 0 || okAge > 30) return;
@@ -341,6 +366,7 @@ void wbStreamLoop() {
     _wbHttp.addHeader("Content-Type", selectedCount > 1
         ? "application/vnd.linesights.wfs2-batch"
         : "application/vnd.linesights.wfs2");
+    _wbHttp.addHeader("X-LS-WFS-Token", _wbAuthToken);
     int code = _wbHttp.POST(_wbBatchBuf, bodyBytes);
     _wbHttp.end();
     feedWatchdog();

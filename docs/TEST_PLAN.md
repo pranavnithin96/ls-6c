@@ -103,12 +103,19 @@ the flag off on that unit, or reduce `MAX_BUFFER_SIZE`.
 Confirm `isVersionGreater("2.7.0","2.6")` is true (a v2.6 unit offered 2.7.0 takes
 it) and that a v2.7.0 unit reports `firmware: "2.7.0"` in heartbeat and diagnostics.
 
-For 2.18.2, also interrupt a firmware download after several 16 KiB ranges.
+For 2.18.3, also interrupt a firmware download after several 16 KiB ranges.
 The next request must resume at the number reported by `ota_progress`, never at
 byte zero. Every 206 response must have the exact expected `Content-Length` and
 `Content-Range`; altered metadata must fail without booting the image. While OTA
 is active, WFS2 pauses and ordinary one-Hz readings must continue between range
-requests. Finalization must reject a deliberately wrong MD5.
+requests. Finalization must reject a deliberately wrong SHA-256, altered
+ECDSA manifest signature, signature from an untrusted key, relabelled version,
+or size/MD5 mismatch without
+selecting the new boot partition. After a valid update, reset the device during
+the five-minute health-validation window and confirm the bootloader rolls back.
+With continuous production-data acknowledgements, an empty upload queue, and
+healthy heap for five minutes, confirm the image is marked valid. Scheduled
+maintenance restart must not fire during download or pending validation.
 
 ## G2. WFS2 lossless batching
 
@@ -125,6 +132,11 @@ requests. Finalization must reject a deliberately wrong MD5.
 5. Blackhole the WFS endpoint while leaving `/api/data` healthy. Ordinary data
    must remain current; WFS queue depth may reach four, after which whole-frame
    drops and sequence gaps must rise visibly. Restore WFS and confirm recovery.
+6. Enable streaming and confirm the server-issued bearer token is stored in NVS
+   but never printed. Missing, altered, oversized, or another device's token
+   must return 403 and store no bytes. Reboot and confirm the credential and
+   stream state survive. Disable streaming and confirm queued frames are
+   discarded, the NVS token is removed, and the old token immediately fails.
 
 ## H. Concurrency + anchor fixes (post-review hardening)
 
