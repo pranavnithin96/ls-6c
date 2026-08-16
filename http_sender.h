@@ -4,6 +4,13 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "config.h"
+
+// Defined by waveform_blackbox.h later in the Arduino translation unit.
+// Healthy continuous acquisition defers non-essential LittleFS maintenance;
+// flash writes disable the shared instruction cache and were measured as
+// 117-148 ms sampling holes in the first production WFS2 pilot.
+bool wbStreamOn();
+long getLastSuccessAgeS();
 #include "ct_sensor.h"
 
 #include <esp32/rom/miniz.h>
@@ -1742,6 +1749,14 @@ static void troubleSave() {
 void periodicBufferSave() {
     unsigned long now = millis();
     if (_fsReady && (now - _lastBufferSave >= BUFFER_SAVE_INTERVAL_MS)) {
+        long successAge = getLastSuccessAgeS();
+        if (wbStreamOn() && successAge >= 0 && successAge <= 30) {
+            // Ordinary telemetry is acknowledged and remains RAM-protected by
+            // the ring. Defer both writes and stale-file deletion until the
+            // stream stops or connectivity becomes unhealthy. On trouble the
+            // existing 5 s trouble-save path still takes precedence over WFS.
+            return;
+        }
         _lastBufferSave = now;
         if (bufCount() > 0) saveBufferToFlash();
         // C1: never delete buffer.json while offline or an upload is pending — it

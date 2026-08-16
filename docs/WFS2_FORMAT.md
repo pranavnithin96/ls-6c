@@ -41,17 +41,17 @@ state receive 403 before their bodies are parsed or stored.
 
 For a single urgent or final frame, the request body is one 64-byte
 `Wfs2Header` followed immediately by its payload. Normally the device sends up
-to two complete, increasing-sequence frames in one request:
+to three complete, increasing-sequence frames in one request:
 
 `POST /api/waveform/v2/batch?device_id=<id>`
 
 Content type: `application/vnd.linesights.wfs2-batch`
 
-The batch body is simply two independently valid header+payload frames
-concatenated. The receiver validates the complete batch before storing either
-frame and rejects mixed boot IDs, reversed sequences, and a third frame.
+The batch body is up to three independently valid header+payload frames
+concatenated. The receiver validates the complete batch before storing any
+frame and rejects mixed boot IDs, non-increasing sequences, and a fourth frame.
 
-Firmware 2.18.3 encodes the payload losslessly while Core 1 samples, using
+Firmware 2.18.4 encodes the payload losslessly while Core 1 samples, using
 `WFS2_FLAG_DELTA_RLE`. The first enabled-channel scan is literal little-endian
 `uint16`. Remaining scan-major values use a predictor per channel:
 
@@ -98,7 +98,7 @@ silently truncates a pending frame.
 
 Waveform traffic is best-effort. Any queued ordinary one-Hz reading, an
 unhealthy live-data acknowledgement age, OTA, or low heap pauses WFS2 uploads.
-Four complete-frame slots absorb short stalls; after that, sequence gaps and the
+Five complete-frame slots absorb short stalls; after that, sequence gaps and the
 cumulative drop count make missing wall time explicit.
 
 ## Heartbeat observability

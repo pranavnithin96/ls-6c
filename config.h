@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.18.3"
+#define FIRMWARE_VERSION "2.18.4"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -30,24 +30,23 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define ENV_SUBWIN_SAMPLES    20      // 20ms @ 1kHz = one 50Hz mains cycle
 #define MAX_ENV_SUBWIN        (MAX_ADC_SAMPLES / ENV_SUBWIN_SAMPLES)
 
-// --- WFS2 continuous waveform streaming (2.18.3, pilot devices only) ---
+// --- WFS2 continuous waveform streaming (2.18.4, pilot devices only) ---
 // Each queued item is exactly one complete 1000ms acquisition frame containing
-// ONLY configured channels, scan-interleaved in ascending CT order. Four heap
+// ONLY configured channels, scan-interleaved in ascending CT order. Five heap
 // slots allow Core 1 to acquire while Core 0 uploads. Frames use a bounded,
-// lossless delta/zero-run codec and up to two share a request. If the network
+// lossless delta/zero-run codec and up to three share a request. If the network
 // cannot keep up, whole frames are dropped and counted; frames are never
 // overwritten, mixed across configurations, or spliced across wall-time gaps.
 #define WFS2_SAMPLE_RATE_HZ       1000
 #define WFS2_SAMPLES_PER_CHANNEL  1000
-#define WFS2_QUEUE_DEPTH          4
-#define WFS2_BATCH_MAX_FRAMES     2
+#define WFS2_QUEUE_DEPTH          5
+#define WFS2_BATCH_MAX_FRAMES     3
 #define WFS2_MAX_FRAME_SAMPLES    (NUM_CT_CHANNELS * WFS2_SAMPLES_PER_CHANNEL)
 #define WFS2_MAX_PAYLOAD_BYTES    (WFS2_MAX_FRAME_SAMPLES * 2)
 #define WFS2_BATCH_BUFFER_BYTES   (WFS2_BATCH_MAX_FRAMES * (sizeof(Wfs2Header) + WFS2_MAX_PAYLOAD_BYTES))
-#define WFS2_BATCH_WAIT_MS        1200UL
+#define WFS2_BATCH_WAIT_MS        2500UL
 #define WB_STREAM_RETRY_MS       10000UL  // backoff after a failed chunk POST
 #define WB_STREAM_MIN_HEAP       60000    // preserve field-tested safety margin
-#define WB_STREAM_ALLOC_GUARD     2048     // allocator/TCP overhead above payload growth
 #define CAL_POINTS            3
 // Corrected: manufacturer 0.0123 A/count, with ADC_11db 1 count = 0.756 mV
 // So 0.0123 / 0.756 = 0.01627 A/mV

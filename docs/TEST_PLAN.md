@@ -103,7 +103,7 @@ the flag off on that unit, or reduce `MAX_BUFFER_SIZE`.
 Confirm `isVersionGreater("2.7.0","2.6")` is true (a v2.6 unit offered 2.7.0 takes
 it) and that a v2.7.0 unit reports `firmware: "2.7.0"` in heartbeat and diagnostics.
 
-For 2.18.3, also interrupt a firmware download after several 16 KiB ranges.
+For 2.18.4, also interrupt a firmware download after several 16 KiB ranges.
 The next request must resume at the number reported by `ota_progress`, never at
 byte zero. Every 206 response must have the exact expected `Content-Length` and
 `Content-Range`; altered metadata must fail without booting the image. While OTA
@@ -124,19 +124,22 @@ maintenance restart must not fire during download or pending validation.
 2. Byte-compare decoded payloads against samples captured before encoding and
    verify the decoded CRC. Test steady zero/idle, 50 Hz load, sharp transitions,
    ADC values 0 and 4095, and a changing configuration between frames.
-3. Confirm two increasing frames share `/api/waveform/v2/batch`; a lone final or
-   on-demand frame uses the single endpoint after the bounded wait.
-4. Inject truncation, trailing bytes, an oversized zero run, a three-frame batch,
+3. Confirm three increasing frames share `/api/waveform/v2/batch`; a partial
+   batch or on-demand frame is sent after the bounded wait.
+4. Inject truncation, trailing bytes, an oversized zero run, a four-frame batch,
    reversed sequences, and mixed boot IDs. All must return 400 and store no
    frame from that request.
 5. Blackhole the WFS endpoint while leaving `/api/data` healthy. Ordinary data
-   must remain current; WFS queue depth may reach four, after which whole-frame
+   must remain current; WFS queue depth may reach five, after which whole-frame
    drops and sequence gaps must rise visibly. Restore WFS and confirm recovery.
 6. Enable streaming and confirm the server-issued bearer token is stored in NVS
    but never printed. Missing, altered, oversized, or another device's token
    must return 403 and store no bytes. Reboot and confirm the credential and
    stream state survive. Disable streaming and confirm queued frames are
    discarded, the NVS token is removed, and the old token immediately fails.
+7. With healthy ordinary acknowledgements and WFS enabled, run for at least five
+   minutes. The 60-second LittleFS maintenance cadence must not create periodic
+   timing-overrun frames. Stop WFS and confirm deferred maintenance resumes.
 
 ## H. Concurrency + anchor fixes (post-review hardening)
 

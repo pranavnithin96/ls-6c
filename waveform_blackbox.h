@@ -18,7 +18,7 @@ bool isUpdateInProgress();
 void feedWatchdog();
 
 // ============================================================================
-// WFS2 complete-frame waveform queue (2.18.3)
+// WFS2 complete-frame waveform queue (2.18.4)
 //
 // Core 1 owns WRITING slots and appends configured channels in scan order.
 // Core 0 owns SENDING slots and POSTs one complete frame. READY/EMPTY handoff
@@ -59,12 +59,70 @@ static volatile uint32_t _wbFramesDropped = 0;
 static uint32_t _wbFrameSeq = 0;
 static unsigned long _wbLastAttemptMs = 0;
 static bool _wbBackoff = false;
-static unsigned long _wbSingleReadySinceMs = 0;
+static unsigned long _wbPartialBatchSinceMs = 0;
 static WiFiClient _wbClient;
 static HTTPClient _wbHttp;
 static bool _wbHttpInit = false;
-static uint8_t* _wbBatchBuf = nullptr;
-static size_t _wbBatchCapacity = 0;
+
+// Exposes several immutable SENDING slots as one Stream. HTTPClient then writes
+// them directly to the socket with its small transport buffer. This avoids a
+// second worst-case 36 KB batch allocation and preserves the heap margin even
+// when all six configured CTs produce incompressible waveforms.
+class Wfs2BatchStream : public Stream {
+public:
+    Wfs2BatchStream(const uint8_t* const* parts, const size_t* lengths, int count)
+        : _parts(parts), _lengths(lengths), _count(count), _part(0), _offset(0),
+          _remaining(0) {
+        for (int i = 0; i < count; ++i) _remaining += lengths[i];
+    }
+
+    int available() override {
+        return _remaining > (size_t)INT_MAX ? INT_MAX : (int)_remaining;
+    }
+
+    int read() override {
+        uint8_t value = 0;
+        return readBytes(reinterpret_cast<char*>(&value), 1) == 1 ? value : -1;
+    }
+
+    int peek() override {
+        advanceEmptyParts();
+        if (_part >= _count) return -1;
+        return _parts[_part][_offset];
+    }
+
+    size_t readBytes(char* buffer, size_t length) override {
+        size_t copied = 0;
+        while (copied < length) {
+            advanceEmptyParts();
+            if (_part >= _count) break;
+            size_t availableHere = _lengths[_part] - _offset;
+            size_t take = min(length - copied, availableHere);
+            memcpy(buffer + copied, _parts[_part] + _offset, take);
+            copied += take;
+            _offset += take;
+            _remaining -= take;
+        }
+        return copied;
+    }
+
+    size_t write(uint8_t) override { return 0; }
+
+private:
+    void advanceEmptyParts() {
+        while (_part < _count && _offset >= _lengths[_part]) {
+            ++_part;
+            _offset = 0;
+        }
+    }
+
+    const uint8_t* const* _parts;
+    const size_t* _lengths;
+    int _count;
+    int _part;
+    size_t _offset;
+    size_t _remaining;
+};
 
 static uint8_t _wbQueuedFramesUnlocked() {
     if (_wbSlots == nullptr) return 0;
@@ -261,7 +319,7 @@ bool wbUploadDump(const String& serverBase, const String& deviceId) {
     return false;
 }
 
-// Core 0, called every 100ms. Two already-encoded frames share one request,
+// Core 0, called every 100ms. Three already-encoded frames share one request,
 // amortizing the request/response latency that dominated the production pilot.
 void wbStreamLoop() {
     if (_wbSlots == nullptr) return;
@@ -299,19 +357,21 @@ void wbStreamLoop() {
     }
     portEXIT_CRITICAL(&_wbMux);
     if (selectedCount == 0) {
-        _wbSingleReadySinceMs = 0;
+        _wbPartialBatchSinceMs = 0;
         return;
     }
 
     bool urgentSingle = !_wbStreamEnabled ||
         (_wbSlots[selected[0]].header.flags & WFS2_FLAG_ON_DEMAND);
-    if (selectedCount == 1 && !urgentSingle) {
-        if (_wbSingleReadySinceMs == 0) _wbSingleReadySinceMs = now;
-        if (now - _wbSingleReadySinceMs < WFS2_BATCH_WAIT_MS) return;
+    if (selectedCount < WFS2_BATCH_MAX_FRAMES && !urgentSingle) {
+        if (_wbPartialBatchSinceMs == 0) _wbPartialBatchSinceMs = now;
+        if (now - _wbPartialBatchSinceMs < WFS2_BATCH_WAIT_MS) return;
     }
-    _wbSingleReadySinceMs = 0;
+    _wbPartialBatchSinceMs = 0;
 
     size_t bodyBytes = 0;
+    const uint8_t* bodyParts[WFS2_BATCH_MAX_FRAMES];
+    size_t bodyPartBytes[WFS2_BATCH_MAX_FRAMES];
     for (int i = 0; i < selectedCount; ++i) {
         Wfs2Slot& frame = _wbSlots[selected[i]];
         size_t frameBytes = sizeof(Wfs2Header) + frame.header.payload_bytes;
@@ -320,37 +380,16 @@ void wbStreamLoop() {
             _wbLastAttemptMs = millis();
             return;
         }
+        bodyParts[i] = reinterpret_cast<const uint8_t*>(&frame.header);
+        bodyPartBytes[i] = frameBytes;
         bodyBytes += frameBytes;
-    }
-    if (bodyBytes > _wbBatchCapacity) {
-        size_t growth = bodyBytes - _wbBatchCapacity;
-        if (ESP.getFreeHeap() < WB_STREAM_MIN_HEAP + growth +
-                                WB_STREAM_ALLOC_GUARD) {
-            // Never let a worst-case noisy frame consume the heap margin that
-            // ordinary telemetry, JSON, and WiFi recovery need to stay alive.
-            return;
-        }
-        uint8_t* grown = (uint8_t*)realloc(_wbBatchBuf, bodyBytes);
-        if (grown == nullptr) {
-            _wbBackoff = true;
-            _wbLastAttemptMs = millis();
-            return;
-        }
-        _wbBatchBuf = grown;
-        _wbBatchCapacity = bodyBytes;
     }
 
     portENTER_CRITICAL(&_wbMux);
     for (int i = 0; i < selectedCount; ++i)
         _wbSlots[selected[i]].state = WFS2_SENDING;
     portEXIT_CRITICAL(&_wbMux);
-    bodyBytes = 0;
-    for (int i = 0; i < selectedCount; ++i) {
-        Wfs2Slot& frame = _wbSlots[selected[i]];
-        size_t frameBytes = sizeof(Wfs2Header) + frame.header.payload_bytes;
-        memcpy(_wbBatchBuf + bodyBytes, &frame.header, frameBytes);
-        bodyBytes += frameBytes;
-    }
+    Wfs2BatchStream batchStream(bodyParts, bodyPartBytes, selectedCount);
 
     String url = String("http://46.224.90.187/api/waveform/v2") +
                  (selectedCount > 1 ? "/batch" : "") +
@@ -367,7 +406,7 @@ void wbStreamLoop() {
         ? "application/vnd.linesights.wfs2-batch"
         : "application/vnd.linesights.wfs2");
     _wbHttp.addHeader("X-LS-WFS-Token", _wbAuthToken);
-    int code = _wbHttp.POST(_wbBatchBuf, bodyBytes);
+    int code = _wbHttp.sendRequest("POST", &batchStream, bodyBytes);
     _wbHttp.end();
     feedWatchdog();
     _wbLastAttemptMs = millis();

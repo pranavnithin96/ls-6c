@@ -479,7 +479,12 @@ void sendHeartbeat() {
             _ackCount = remaining;
             _ackedInFlight = 0;
             Preferences p;
-            if (p.begin("lscfg", false)) { p.remove("rebootcmdid"); p.end(); }
+            if (p.begin("lscfg", false)) {
+                // Most command acknowledgements have no persisted reboot id.
+                // Avoid an unnecessary NVS mutation while WFS2 is sampling.
+                if (p.isKey("rebootcmdid")) p.remove("rebootcmdid");
+                p.end();
+            }
         }
         String response = http.getString();
         Serial.printf("[HB] OK | heap:%u | Q:%d | S:%u\n",

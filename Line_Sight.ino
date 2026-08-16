@@ -81,7 +81,7 @@ void networkTask(void* param) {
             otaLoop();            // OTA check — every 1h
             esp_task_wdt_reset();
             wdtCheckpoint(WDT_CP_WFSTREAM);
-            wbStreamLoop();       // lossless batched 1kHz frames (2.18.3 pilot)
+            wbStreamLoop();       // lossless batched 1kHz frames (2.18.4 pilot)
             esp_task_wdt_reset();
         }
 
