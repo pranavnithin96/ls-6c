@@ -35,6 +35,7 @@ enum : uint16_t {
     WFS2_FLAG_ON_DEMAND    = 0x0002,
     WFS2_FLAG_TIMING_OVERRUN = 0x0004,
     WFS2_FLAG_RAW_DEFLATE     = 0x0008,
+    WFS2_FLAG_DELTA_RLE       = 0x0010,
 };
 
 static inline uint8_t wfs2ChannelCount(uint8_t mask) {
@@ -60,3 +61,95 @@ static inline uint32_t wfs2Crc32(const uint8_t* data, size_t len) {
     }
     return ~crc;
 }
+
+static inline uint32_t wfs2Crc32Update(uint32_t crc, uint8_t value) {
+    crc ^= value;
+    for (uint8_t bit = 0; bit < 8; ++bit)
+        crc = (crc >> 1) ^ (0xedb88320u & (uint32_t)-(int32_t)(crc & 1u));
+    return crc;
+}
+
+// Bounded lossless scan-major encoder used directly by the sampler. The first
+// value for every channel is literal; later values use per-channel deltas and
+// a shared zero-run across scan order. For 12-bit ADC values every nonzero
+// token is at most two bytes, so capacity == raw uint16 bytes is sufficient.
+class Wfs2DeltaEncoder {
+public:
+    void begin(uint8_t* output, size_t capacity) {
+        _output = output;
+        _capacity = capacity;
+        _size = 0;
+        _seenMask = 0;
+        _zeroRun = 0;
+        _valid = output != nullptr;
+        for (int i = 0; i < 6; ++i) _previous[i] = 0;
+    }
+
+    bool feed(uint8_t channel, uint16_t value) {
+        if (!_valid || channel >= 6 || value > 4095) {
+            _valid = false;
+            return false;
+        }
+        bool ok = true;
+        if (!(_seenMask & (1u << channel))) {
+            ok = flushZeroRun() && putByte((uint8_t)(value & 0xff)) &&
+                 putByte((uint8_t)(value >> 8));
+            _seenMask |= 1u << channel;
+        } else {
+            int32_t delta = (int32_t)value - (int32_t)_previous[channel];
+            if (delta == 0) {
+                if (_zeroRun == UINT16_MAX) ok = flushZeroRun();
+                if (ok) ++_zeroRun;
+            } else {
+                ok = flushZeroRun();
+                uint16_t zigzag = (uint16_t)(((uint32_t)delta << 1) ^
+                                              (uint32_t)(delta >> 31));
+                if (ok) ok = putVarint((uint16_t)(zigzag + 1));
+            }
+        }
+        _previous[channel] = value;
+        if (!ok) _valid = false;
+        return _valid;
+    }
+
+    bool finish() {
+        if (!_valid) return false;
+        _valid = flushZeroRun();
+        return _valid;
+    }
+
+    size_t size() const { return _size; }
+    bool valid() const { return _valid; }
+
+private:
+    bool putByte(uint8_t value) {
+        if (_size >= _capacity) return false;
+        _output[_size++] = value;
+        return true;
+    }
+
+    bool putVarint(uint16_t value) {
+        while (value >= 0x80) {
+            if (!putByte((uint8_t)((value & 0x7f) | 0x80))) return false;
+            value >>= 7;
+        }
+        return putByte((uint8_t)value);
+    }
+
+    bool flushZeroRun() {
+        if (_zeroRun == 0) return true;
+        bool ok = _zeroRun == 1
+            ? putByte(0)
+            : putByte(1) && putVarint(_zeroRun);
+        _zeroRun = 0;
+        return ok;
+    }
+
+    uint8_t* _output = nullptr;
+    size_t _capacity = 0;
+    size_t _size = 0;
+    uint16_t _previous[6] = {};
+    uint8_t _seenMask = 0;
+    uint16_t _zeroRun = 0;
+    bool _valid = false;
+};

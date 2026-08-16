@@ -32,13 +32,31 @@ heartbeat. Re-delivering the already-applied pair is idempotent.
 
 Content type: `application/vnd.linesights.wfs2`
 
-The request body is one 64-byte `Wfs2Header`, followed immediately by its
-payload. Header fields are defined in
-`wfs2_protocol.h`.
+For a single urgent or final frame, the request body is one 64-byte
+`Wfs2Header` followed immediately by its payload. Normally the device sends up
+to two complete, increasing-sequence frames in one request:
 
-The payload is normally a raw-DEFLATE stream (`WFS2_FLAG_RAW_DEFLATE`) created
-losslessly on Core 0. If compression cannot reduce a frame, the payload remains
-plain little-endian `uint16`. `raw_payload_bytes` is the decoded length,
+`POST /api/waveform/v2/batch?device_id=<id>`
+
+Content type: `application/vnd.linesights.wfs2-batch`
+
+The batch body is simply two independently valid header+payload frames
+concatenated. The receiver validates the complete batch before storing either
+frame and rejects mixed boot IDs, reversed sequences, and a third frame.
+
+Firmware 2.18.2 encodes the payload losslessly while Core 1 samples, using
+`WFS2_FLAG_DELTA_RLE`. The first enabled-channel scan is literal little-endian
+`uint16`. Remaining scan-major values use a predictor per channel:
+
+- token `0`: one unchanged sample;
+- token `1`, then unsigned LEB128 `N`: `N` unchanged samples (`N >= 2`);
+- token `>= 2`: `zigzag(delta) + 1`, encoded as unsigned LEB128.
+
+All values must decode to the ESP32's 12-bit ADC range (0-4095). Tokens and
+runs are bounded so malformed input cannot expand indefinitely. The encoding's
+worst case is no larger than the original two bytes per sample. The server
+continues accepting older raw-DEFLATE and plain WFS2 frames, but exactly one
+codec flag may be set. `raw_payload_bytes` is the decoded length,
 `payload_bytes` is the transmitted length, and `payload_crc32` covers decoded
 samples.
 
@@ -70,6 +88,11 @@ counts millisecond scans that completed after their deadline and sets the
 Frames are never concatenated across seconds or configurations. Queue pressure
 drops a whole new frame and increments `wfs2_dropped`; it never overwrites or
 silently truncates a pending frame.
+
+Waveform traffic is best-effort. Any queued ordinary one-Hz reading, an
+unhealthy live-data acknowledgement age, OTA, or low heap pauses WFS2 uploads.
+Four complete-frame slots absorb short stalls; after that, sequence gaps and the
+cumulative drop count make missing wall time explicit.
 
 ## Heartbeat observability
 

@@ -6,7 +6,6 @@
 #include <WiFi.h>
 #include <esp_system.h>
 #include <esp_timer.h>
-#include <esp32/rom/miniz.h>
 #include <sys/time.h>
 #include "config.h"
 #include "wfs2_protocol.h"
@@ -19,7 +18,7 @@ bool isUpdateInProgress();
 void feedWatchdog();
 
 // ============================================================================
-// WFS2 complete-frame waveform queue (2.18.0)
+// WFS2 complete-frame waveform queue (2.18.2)
 //
 // Core 1 owns WRITING slots and appends configured channels in scan order.
 // Core 0 owns SENDING slots and POSTs one complete frame. READY/EMPTY handoff
@@ -36,17 +35,19 @@ enum Wfs2SlotState : uint8_t {
 
 struct Wfs2Slot {
     Wfs2Header header;
-    uint16_t samples[WFS2_MAX_FRAME_SAMPLES];
+    uint8_t payload[WFS2_MAX_PAYLOAD_BYTES];
     volatile uint8_t state;
 };
 
-static_assert(offsetof(Wfs2Slot, samples) == sizeof(Wfs2Header),
+static_assert(offsetof(Wfs2Slot, payload) == sizeof(Wfs2Header),
               "WFS2 header and sample payload must be contiguous");
 
 static portMUX_TYPE _wbMux = portMUX_INITIALIZER_UNLOCKED;
 static Wfs2Slot* _wbSlots = nullptr;
 static int8_t _wbWriteSlot = -1;               // Core 1 only
 static uint32_t _wbWriteSamples = 0;            // Core 1 only
+static Wfs2DeltaEncoder _wbEncoder;              // Core 1 only
+static uint32_t _wbWriteCrc = 0xffffffffu;
 static bool _wbWriteOnDemand = false;           // Core 1 only
 static volatile bool _wbCaptureRequested = false;
 static volatile bool _wbStreamEnabled = false;
@@ -54,12 +55,15 @@ static uint32_t _wbBootId = 0;
 static volatile uint32_t _wbFramesGenerated = 0;
 static volatile uint32_t _wbFramesDelivered = 0;
 static volatile uint32_t _wbFramesDropped = 0;
+static uint32_t _wbFrameSeq = 0;
 static unsigned long _wbLastAttemptMs = 0;
 static bool _wbBackoff = false;
+static unsigned long _wbSingleReadySinceMs = 0;
 static WiFiClient _wbClient;
 static HTTPClient _wbHttp;
 static bool _wbHttpInit = false;
-static uint8_t* _wbSendBuf = nullptr;              // Core 0 deflate/header staging
+static uint8_t* _wbBatchBuf = nullptr;
+static size_t _wbBatchCapacity = 0;
 
 static uint8_t _wbQueuedFramesUnlocked() {
     if (_wbSlots == nullptr) return 0;
@@ -117,10 +121,12 @@ bool wbBeginFrame(uint8_t activeMask, uint32_t configRevision) {
     activeMask &= 0x3f;
     _wbWriteSlot = -1;
     _wbWriteSamples = 0;
+    _wbWriteCrc = 0xffffffffu;
     if (_wbSlots == nullptr || activeMask == 0) return false;
 
     bool onDemand = _wbCaptureRequested;
     if (!_wbStreamEnabled && !onDemand) return false;
+    uint32_t frameSeq = _wbFrameSeq++;
 
     int slot = -1;
     portENTER_CRITICAL(&_wbMux);
@@ -143,7 +149,7 @@ bool wbBeginFrame(uint8_t activeMask, uint32_t configRevision) {
     out.header.active_mask = activeMask;
     out.header.channel_count = wfs2ChannelCount(activeMask);
     out.header.boot_id = _wbBootId;
-    out.header.frame_seq = _wbFramesGenerated++;
+    out.header.frame_seq = frameSeq;
     out.header.config_revision = configRevision;
     out.header.capture_monotonic_us = (uint64_t)esp_timer_get_time();
     timeval tv = {};
@@ -153,6 +159,7 @@ bool wbBeginFrame(uint8_t activeMask, uint32_t configRevision) {
         out.header.flags |= WFS2_FLAG_CLOCK_SYNCED;
     }
     if (onDemand) out.header.flags |= WFS2_FLAG_ON_DEMAND;
+    out.header.flags |= WFS2_FLAG_DELTA_RLE;
     out.header.dropped_frames = _wbFramesDropped;
     out.header.sample_rate_hz = WFS2_SAMPLE_RATE_HZ;
     out.header.samples_per_channel = WFS2_SAMPLES_PER_CHANNEL;
@@ -160,6 +167,7 @@ bool wbBeginFrame(uint8_t activeMask, uint32_t configRevision) {
         activeMask, WFS2_SAMPLES_PER_CHANNEL);
     out.header.payload_bytes = out.header.raw_payload_bytes;
 
+    _wbEncoder.begin(out.payload, sizeof(out.payload));
     _wbWriteSlot = (int8_t)slot;
     _wbWriteOnDemand = onDemand;
     return true;
@@ -168,10 +176,12 @@ bool wbBeginFrame(uint8_t activeMask, uint32_t configRevision) {
 // Called once for every enabled channel in every millisecond scan. readAllCT
 // iterates channels in ascending order, which is the WFS2 wire ordering.
 void wbFeed(int ch, uint16_t value) {
-    (void)ch;
     if (_wbWriteSlot < 0) return;
     if (_wbWriteSamples >= WFS2_MAX_FRAME_SAMPLES) return;
-    _wbSlots[_wbWriteSlot].samples[_wbWriteSamples++] = value;
+    bool ok = _wbEncoder.feed((uint8_t)ch, value);
+    _wbWriteCrc = wfs2Crc32Update(_wbWriteCrc, (uint8_t)(value & 0xff));
+    _wbWriteCrc = wfs2Crc32Update(_wbWriteCrc, (uint8_t)(value >> 8));
+    if (ok) _wbWriteSamples++;
 }
 
 // Publish only a complete frame. Partial or overfull frames are discarded as a
@@ -181,13 +191,16 @@ void wbEndFrame(uint32_t sampleDurationUs, uint16_t timingOverruns) {
     Wfs2Slot& out = _wbSlots[_wbWriteSlot];
     uint32_t expectedSamples = (uint32_t)out.header.channel_count *
                                out.header.samples_per_channel;
-    bool complete = _wbWriteSamples == expectedSamples;
+    bool complete = _wbEncoder.finish() &&
+                    _wbWriteSamples == expectedSamples &&
+                    _wbEncoder.size() <= out.header.raw_payload_bytes;
     if (complete) {
         out.header.sample_duration_us = sampleDurationUs;
         out.header.timing_overruns = timingOverruns;
         if (timingOverruns > 0) out.header.flags |= WFS2_FLAG_TIMING_OVERRUN;
-        out.header.payload_crc32 = wfs2Crc32(
-            (const uint8_t*)out.samples, out.header.raw_payload_bytes);
+        out.header.payload_bytes = _wbEncoder.size();
+        out.header.payload_crc32 = ~_wbWriteCrc;
+        _wbFramesGenerated++;
     }
 
     portENTER_CRITICAL(&_wbMux);
@@ -196,8 +209,9 @@ void wbEndFrame(uint32_t sampleDurationUs, uint16_t timingOverruns) {
     if (complete && _wbWriteOnDemand) _wbCaptureRequested = false;
     portEXIT_CRITICAL(&_wbMux);
     if (!complete) {
-        Serial.printf("[WFS2] incomplete frame: got=%u want=%u\n",
-                      (unsigned)_wbWriteSamples, (unsigned)expectedSamples);
+        Serial.printf("[WFS2] incomplete frame: samples=%u/%u bytes=%u/%u\n",
+                      (unsigned)_wbWriteSamples, (unsigned)expectedSamples,
+                      (unsigned)_wbEncoder.size(), (unsigned)out.header.raw_payload_bytes);
     }
     _wbWriteSlot = -1;
     _wbWriteSamples = 0;
@@ -222,63 +236,100 @@ bool wbUploadDump(const String& serverBase, const String& deviceId) {
     return false;
 }
 
-// Core 0, called every 100ms. At most one complete frame is sent per call.
+// Core 0, called every 100ms. Two already-encoded frames share one request,
+// amortizing the request/response latency that dominated the production pilot.
 void wbStreamLoop() {
     if (_wbSlots == nullptr) return;
     if (isUpdateInProgress()) return;
     unsigned long now = millis();
     if (_wbBackoff && (now - _wbLastAttemptMs) < WB_STREAM_RETRY_MS) return;
-    if (getQueueSize() > BG_UPLOAD_LOWATER) return;
+    // Waveforms are strictly lower priority than ordinary telemetry. The 2.18.0
+    // pilot allowed seven live readings to queue and WFS made that backlog
+    // worse; 2.18.2 yields as soon as even one ordinary summary is pending.
+    if (getQueueSize() != 0) return;
     long okAge = getLastSuccessAgeS();
     if (okAge < 0 || okAge > 30) return;
     if (ESP.getFreeHeap() < WB_STREAM_MIN_HEAP) return;
 
-    int slot = -1;
-    uint32_t oldestSeq = 0;
+    int selected[WFS2_BATCH_MAX_FRAMES];
+    int selectedCount = 0;
     portENTER_CRITICAL(&_wbMux);
-    for (int i = 0; i < WFS2_QUEUE_DEPTH; ++i) {
-        if (_wbSlots[i].state != WFS2_READY) continue;
-        uint32_t seq = _wbSlots[i].header.frame_seq;
-        if (slot < 0 || (int32_t)(seq - oldestSeq) < 0) {
-            slot = i;
-            oldestSeq = seq;
+    for (int pick = 0; pick < WFS2_BATCH_MAX_FRAMES; ++pick) {
+        int oldest = -1;
+        uint32_t oldestSeq = 0;
+        for (int i = 0; i < WFS2_QUEUE_DEPTH; ++i) {
+            if (_wbSlots[i].state != WFS2_READY) continue;
+            bool alreadySelected = false;
+            for (int j = 0; j < selectedCount; ++j)
+                if (selected[j] == i) alreadySelected = true;
+            if (alreadySelected) continue;
+            uint32_t seq = _wbSlots[i].header.frame_seq;
+            if (oldest < 0 || (int32_t)(seq - oldestSeq) < 0) {
+                oldest = i;
+                oldestSeq = seq;
+            }
         }
+        if (oldest < 0) break;
+        selected[selectedCount++] = oldest;
     }
-    if (slot >= 0) _wbSlots[slot].state = WFS2_SENDING;
     portEXIT_CRITICAL(&_wbMux);
-    if (slot < 0) return;
+    if (selectedCount == 0) {
+        _wbSingleReadySinceMs = 0;
+        return;
+    }
 
-    Wfs2Slot& frame = _wbSlots[slot];
-    if (_wbSendBuf == nullptr) {
-        _wbSendBuf = (uint8_t*)malloc(WFS2_ENCODE_SCRATCH_BYTES);
-        if (_wbSendBuf == nullptr) {
-            portENTER_CRITICAL(&_wbMux);
-            frame.state = WFS2_READY;
+    bool urgentSingle = !_wbStreamEnabled ||
+        (_wbSlots[selected[0]].header.flags & WFS2_FLAG_ON_DEMAND);
+    if (selectedCount == 1 && !urgentSingle) {
+        if (_wbSingleReadySinceMs == 0) _wbSingleReadySinceMs = now;
+        if (now - _wbSingleReadySinceMs < WFS2_BATCH_WAIT_MS) return;
+    }
+    _wbSingleReadySinceMs = 0;
+
+    size_t bodyBytes = 0;
+    for (int i = 0; i < selectedCount; ++i) {
+        Wfs2Slot& frame = _wbSlots[selected[i]];
+        size_t frameBytes = sizeof(Wfs2Header) + frame.header.payload_bytes;
+        if (bodyBytes + frameBytes > WFS2_BATCH_BUFFER_BYTES) {
             _wbBackoff = true;
-            portEXIT_CRITICAL(&_wbMux);
             _wbLastAttemptMs = millis();
             return;
         }
+        bodyBytes += frameBytes;
+    }
+    if (bodyBytes > _wbBatchCapacity) {
+        size_t growth = bodyBytes - _wbBatchCapacity;
+        if (ESP.getFreeHeap() < WB_STREAM_MIN_HEAP + growth +
+                                WB_STREAM_ALLOC_GUARD) {
+            // Never let a worst-case noisy frame consume the heap margin that
+            // ordinary telemetry, JSON, and WiFi recovery need to stay alive.
+            return;
+        }
+        uint8_t* grown = (uint8_t*)realloc(_wbBatchBuf, bodyBytes);
+        if (grown == nullptr) {
+            _wbBackoff = true;
+            _wbLastAttemptMs = millis();
+            return;
+        }
+        _wbBatchBuf = grown;
+        _wbBatchCapacity = bodyBytes;
     }
 
-    Wfs2Header encodedHeader = frame.header;
-    const size_t rawBytes = frame.header.raw_payload_bytes;
-    size_t encodedBytes = tdefl_compress_mem_to_mem(
-        _wbSendBuf + sizeof(Wfs2Header),
-        WFS2_ENCODE_SCRATCH_BYTES - sizeof(Wfs2Header),
-        frame.samples, rawBytes, TDEFL_DEFAULT_MAX_PROBES);
-    if (encodedBytes > 0 && encodedBytes != (size_t)-1 && encodedBytes < rawBytes) {
-        encodedHeader.flags |= WFS2_FLAG_RAW_DEFLATE;
-        encodedHeader.payload_bytes = (uint32_t)encodedBytes;
-    } else {
-        encodedBytes = rawBytes;
-        encodedHeader.payload_bytes = (uint32_t)rawBytes;
-        memcpy(_wbSendBuf + sizeof(Wfs2Header), frame.samples, rawBytes);
+    portENTER_CRITICAL(&_wbMux);
+    for (int i = 0; i < selectedCount; ++i)
+        _wbSlots[selected[i]].state = WFS2_SENDING;
+    portEXIT_CRITICAL(&_wbMux);
+    bodyBytes = 0;
+    for (int i = 0; i < selectedCount; ++i) {
+        Wfs2Slot& frame = _wbSlots[selected[i]];
+        size_t frameBytes = sizeof(Wfs2Header) + frame.header.payload_bytes;
+        memcpy(_wbBatchBuf + bodyBytes, &frame.header, frameBytes);
+        bodyBytes += frameBytes;
     }
-    memcpy(_wbSendBuf, &encodedHeader, sizeof(encodedHeader));
-    size_t bodyBytes = sizeof(Wfs2Header) + encodedBytes;
-    String url = String("http://46.224.90.187/api/waveform/v2?device_id=") +
-                 getDeviceId();
+
+    String url = String("http://46.224.90.187/api/waveform/v2") +
+                 (selectedCount > 1 ? "/batch" : "") +
+                 "?device_id=" + getDeviceId();
     if (!_wbHttpInit) {
         _wbHttp.setReuse(true);
         _wbHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
@@ -287,19 +338,23 @@ void wbStreamLoop() {
     }
     feedWatchdog();
     _wbHttp.begin(_wbClient, url);
-    _wbHttp.addHeader("Content-Type", "application/vnd.linesights.wfs2");
-    int code = _wbHttp.POST(_wbSendBuf, bodyBytes);
+    _wbHttp.addHeader("Content-Type", selectedCount > 1
+        ? "application/vnd.linesights.wfs2-batch"
+        : "application/vnd.linesights.wfs2");
+    int code = _wbHttp.POST(_wbBatchBuf, bodyBytes);
     _wbHttp.end();
     feedWatchdog();
     _wbLastAttemptMs = millis();
 
     portENTER_CRITICAL(&_wbMux);
     if (code >= 200 && code < 300) {
-        frame.state = WFS2_EMPTY;
-        _wbFramesDelivered++;
+        for (int i = 0; i < selectedCount; ++i)
+            _wbSlots[selected[i]].state = WFS2_EMPTY;
+        _wbFramesDelivered += selectedCount;
         _wbBackoff = false;
     } else {
-        frame.state = WFS2_READY;
+        for (int i = 0; i < selectedCount; ++i)
+            _wbSlots[selected[i]].state = WFS2_READY;
         _wbBackoff = true;
     }
     portEXIT_CRITICAL(&_wbMux);
@@ -309,7 +364,7 @@ void wbStreamLoop() {
         static unsigned long lastLogMs = 0;
         if (millis() - lastLogMs > 300000UL) {
             lastLogMs = millis();
-            Serial.printf("[WFS2] frame POST failed (%d)\n", code);
+            Serial.printf("[WFS2] %d-frame POST failed (%d)\n", selectedCount, code);
         }
     }
 }

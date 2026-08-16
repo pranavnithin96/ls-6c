@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.18.0"
+#define FIRMWARE_VERSION "2.18.2"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -30,19 +30,24 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define ENV_SUBWIN_SAMPLES    20      // 20ms @ 1kHz = one 50Hz mains cycle
 #define MAX_ENV_SUBWIN        (MAX_ADC_SAMPLES / ENV_SUBWIN_SAMPLES)
 
-// --- WFS2 continuous waveform streaming (2.18.0, pilot devices only) ---
+// --- WFS2 continuous waveform streaming (2.18.2, pilot devices only) ---
 // Each queued item is exactly one complete 1000ms acquisition frame containing
-// ONLY configured channels, scan-interleaved in ascending CT order. Three heap
-// slots allow Core 1 to acquire while Core 0 uploads. If the network cannot
-// keep up, whole frames are dropped and counted; frames are never overwritten,
-// mixed across configurations, or silently spliced across wall-time gaps.
+// ONLY configured channels, scan-interleaved in ascending CT order. Four heap
+// slots allow Core 1 to acquire while Core 0 uploads. Frames use a bounded,
+// lossless delta/zero-run codec and up to two share a request. If the network
+// cannot keep up, whole frames are dropped and counted; frames are never
+// overwritten, mixed across configurations, or spliced across wall-time gaps.
 #define WFS2_SAMPLE_RATE_HZ       1000
 #define WFS2_SAMPLES_PER_CHANNEL  1000
-#define WFS2_QUEUE_DEPTH          3
+#define WFS2_QUEUE_DEPTH          4
+#define WFS2_BATCH_MAX_FRAMES     2
 #define WFS2_MAX_FRAME_SAMPLES    (NUM_CT_CHANNELS * WFS2_SAMPLES_PER_CHANNEL)
-#define WFS2_ENCODE_SCRATCH_BYTES (sizeof(Wfs2Header) + WFS2_MAX_FRAME_SAMPLES * 2 + 256)
+#define WFS2_MAX_PAYLOAD_BYTES    (WFS2_MAX_FRAME_SAMPLES * 2)
+#define WFS2_BATCH_BUFFER_BYTES   (WFS2_BATCH_MAX_FRAMES * (sizeof(Wfs2Header) + WFS2_MAX_PAYLOAD_BYTES))
+#define WFS2_BATCH_WAIT_MS        1200UL
 #define WB_STREAM_RETRY_MS       10000UL  // backoff after a failed chunk POST
-#define WB_STREAM_MIN_HEAP       45000    // skip cycle if heap below this
+#define WB_STREAM_MIN_HEAP       60000    // preserve field-tested safety margin
+#define WB_STREAM_ALLOC_GUARD     2048     // allocator/TCP overhead above payload growth
 #define CAL_POINTS            3
 // Corrected: manufacturer 0.0123 A/count, with ADC_11db 1 count = 0.756 mV
 // So 0.0123 / 0.756 = 0.01627 A/mV
@@ -206,9 +211,12 @@ static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
 
 // --- OTA ---
 #define OTA_CHECK_INTERVAL_MS 3600000  // 1 hour
-#define OTA_DOWNLOAD_TIMEOUT  300000   // 300 seconds (1MB at 4KBps worst-case Indian WiFi)
-#define OTA_RETRY_DELAY_MS    10000   // 10s before retry on failure
-#define OTA_MAX_RETRIES       3       // Retry download up to 3 times
+#define OTA_CHUNK_BYTES       16384UL  // one bounded range request per network turn
+#define OTA_CHUNK_STALL_MS    12000UL  // no bytes received: yield and retry this offset
+#define OTA_CHUNK_MAX_MS      30000UL  // a chunk can never monopolize Core 0 longer
+#define OTA_CHUNK_RETRY_MS    30000UL  // preserve ordinary telemetry between failures
+#define OTA_MAX_CHUNK_FAILURES 5
+#define OTA_SESSION_MAX_MS    1800000UL // 30 minutes, while telemetry continues normally
 #define MAX_CRASH_COUNT       3
 #define OTA_MAX_SIZE          0x140000 // 1,310,720 bytes (partition size)
 

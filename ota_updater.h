@@ -17,15 +17,24 @@ static String _otaBaseUrl;
 static unsigned long _lastOTACheck = 0;
 static volatile bool _otaInProgress = false;
 static volatile bool _otaForceCheck = false;
-static int _otaRetryCount = 0;
-static unsigned long _otaRetryAt = 0;
-static bool _otaDownloadFailed = false;
+static String _otaDownloadUrl;
+static String _otaTargetVersion;
+static String _otaExpectedMd5;
+static size_t _otaTotalBytes = 0;
+static size_t _otaWrittenBytes = 0;
+static unsigned long _otaSessionStartedMs = 0;
+static unsigned long _otaNextChunkAtMs = 0;
+static uint8_t _otaChunkFailures = 0;
+static const char* _otaStatus = "idle";
+static WiFiClient _otaClient;
 
 void forceOTACheck() { _otaForceCheck = true; }
 
 void logError(const String& message);
 void disconnectHTTP();
 void feedWatchdog();
+int getQueueSize();
+long getLastSuccessAgeS();
 
 static String forceHTTP(const String& url) {
     String out = url;
@@ -98,6 +107,23 @@ void initOTAUpdater(const String& deviceId, const String& serverBaseUrl) {
 
 String getCurrentVersion() { return FIRMWARE_VERSION; }
 bool isUpdateInProgress() { return _otaInProgress; }
+const char* getOTAStatus() { return _otaStatus; }
+uint32_t getOTAProgress() { return (uint32_t)_otaWrittenBytes; }
+uint32_t getOTATotal() { return (uint32_t)_otaTotalBytes; }
+const String& getOTATarget() { return _otaTargetVersion; }
+
+static void otaFail(const char* reason) {
+    Serial.printf("[OTA] Failed: %s (%u/%u bytes)\n", reason,
+                  (unsigned)_otaWrittenBytes, (unsigned)_otaTotalBytes);
+    if (_otaInProgress) Update.abort();
+    _otaInProgress = false;
+    _otaStatus = "failed";
+    _otaDownloadUrl = "";
+    _otaExpectedMd5 = "";
+    _otaNextChunkAtMs = 0;
+    _otaClient.stop();
+    setLEDState(LED_ERROR);
+}
 
 void checkForUpdate() {
     if (_otaInProgress) return;
@@ -119,196 +145,206 @@ void checkForUpdate() {
     if (httpCode != 200) {
         Serial.printf("[OTA] Check failed: HTTP %d\n", httpCode);
         http.end();
+        _otaStatus = "failed";
         return;
     }
 
     String payload = http.getString();
     http.end();
 
-    if (payload.length() == 0) return;
+    if (payload.length() == 0) {
+        _otaStatus = "failed";
+        return;
+    }
 
     JsonDocument doc;
-    if (deserializeJson(doc, payload)) return;
+    if (deserializeJson(doc, payload)) {
+        _otaStatus = "failed";
+        return;
+    }
 
     if (!(doc["update_available"] | false)) {
         Serial.println("[OTA] Up to date");
+        _otaStatus = "idle";
         return;
     }
 
     String newVersion = doc["version"] | "unknown";
     String downloadUrl = doc["url"] | "";
+    String expectedMd5 = doc["md5"] | "";
+    uint32_t totalBytes = doc["size"] | 0U;
 
     // Version comparison — reject downgrades
     if (!isVersionGreater(newVersion, FIRMWARE_VERSION)) {
         Serial.printf("[OTA] Version %s not greater than %s — skipping\n",
             newVersion.c_str(), FIRMWARE_VERSION);
+        _otaStatus = "idle";
         return;
     }
 
-    if (downloadUrl.length() == 0) {
-        Serial.println("[OTA] No download URL");
+    if (downloadUrl.length() == 0 || totalBytes == 0 || totalBytes > OTA_MAX_SIZE ||
+        expectedMd5.length() != 32) {
+        Serial.println("[OTA] Missing URL, MD5, or valid size metadata");
+        _otaStatus = "failed";
         return;
     }
 
     downloadUrl = forceHTTP(downloadUrl);
-    Serial.printf("[OTA] Updating: %s -> %s\n", FIRMWARE_VERSION, newVersion.c_str());
-
-    _otaInProgress = true;
-    setLEDState(LED_OTA_UPDATING);
-
-    HTTPClient dlHttp;
-    dlHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    dlHttp.begin(downloadUrl);
-    dlHttp.setTimeout(60000);  // Max for uint16_t-safe HTTPClient timeout
-    int dlCode = dlHttp.GET();
-
-    if (dlCode != 200) {
-        Serial.printf("[OTA] Download HTTP %d\n", dlCode);
-        _otaInProgress = false;
-        _otaDownloadFailed = true;
-        setLEDState(LED_ERROR);
-        dlHttp.end();
-        return;
-    }
-
-    int contentLength = dlHttp.getSize();
-
-    // Partition size validation — prevent overflow into SPIFFS
-    if (contentLength <= 0 || contentLength > OTA_MAX_SIZE) {
-        Serial.printf("[OTA] Invalid size: %d (max: %d)\n", contentLength, OTA_MAX_SIZE);
-        _otaInProgress = false;
-        _otaDownloadFailed = true;
-        setLEDState(LED_ERROR);
-        dlHttp.end();
-        return;
-    }
-
-    Serial.printf("[OTA] Size: %d bytes (heap: %u)\n", contentLength, ESP.getFreeHeap());
-
-    if (!Update.begin(contentLength)) {
+    Serial.printf("[OTA] Staging %s -> %s in %u-byte ranges (%u bytes total)\n",
+                  FIRMWARE_VERSION, newVersion.c_str(),
+                  (unsigned)OTA_CHUNK_BYTES, (unsigned)totalBytes);
+    if (!Update.begin(totalBytes)) {
         Serial.printf("[OTA] Begin failed: %s\n", Update.errorString());
-        _otaInProgress = false;
-        _otaDownloadFailed = true;
-        setLEDState(LED_ERROR);
-        dlHttp.end();
+        _otaStatus = "failed";
+        return;
+    }
+    // From this point otaFail() must abort the open Update transaction.
+    _otaInProgress = true;
+    if (!Update.setMD5(expectedMd5.c_str())) {
+        otaFail("invalid MD5 metadata");
         return;
     }
 
-    WiFiClient* stream = dlHttp.getStreamPtr();
-    size_t written = 0;
-    unsigned long dlStart = millis();
-
-    // Stream with watchdog resets and timeout protection
-    uint8_t buf[1024];
-    while (written < (size_t)contentLength) {
-        feedWatchdog();
-
-        // Absolute timeout
-        if ((millis() - dlStart) > OTA_DOWNLOAD_TIMEOUT) {
-            Serial.println("[OTA] Download timeout!");
-            Update.abort();
-            _otaInProgress = false;
-            _otaDownloadFailed = true;
-            setLEDState(LED_ERROR);
-            dlHttp.end();
-            return;
-        }
-
-        int available = stream->available();
-        if (available <= 0) {
-            if (!stream->connected()) break;
-            delay(10);
-            continue;
-        }
-
-        int toRead = min(available, (int)sizeof(buf));
-        int bytesRead = stream->readBytes(buf, toRead);
-        if (bytesRead > 0) {
-            size_t w = Update.write(buf, bytesRead);
-            if (w != (size_t)bytesRead) {
-                Serial.printf("[OTA] Flash write error: wrote %u of %d\n", w, bytesRead);
-                Update.abort();
-                _otaInProgress = false;
-                _otaDownloadFailed = true;
-                setLEDState(LED_ERROR);
-                dlHttp.end();
-                return;
-            }
-            written += bytesRead;
-        }
-    }
-
-    dlHttp.end();
-
-    Serial.printf("[OTA] Written: %u / %d bytes\n", written, contentLength);
-
-    // Verify complete download
-    if (written != (size_t)contentLength) {
-        Serial.println("[OTA] Incomplete download — aborting");
-        Update.abort();
-        _otaInProgress = false;
-        _otaDownloadFailed = true;
-        setLEDState(LED_ERROR);
-        return;
-    }
-
-    if (!Update.end()) {
-        Serial.printf("[OTA] Finalize failed: %s\n", Update.errorString());
-        _otaInProgress = false;
-        _otaDownloadFailed = true;
-        setLEDState(LED_ERROR);
-        return;
-    }
-
-    if (Update.isFinished()) {
-        Preferences otaPrefs;
-        otaPrefs.begin("otastate", false);
-        otaPrefs.putBool("updated", true);
-        otaPrefs.putInt("crashes", 0);
-        otaPrefs.end();
-
-        Serial.printf("[OTA] Success! Rebooting to %s...\n", newVersion.c_str());
-        flushBeforeRestart();
-        delay(1000);
-        ESP.restart();
-    } else {
-        _otaInProgress = false;
-        setLEDState(LED_ERROR);
-    }
+    _otaDownloadUrl = downloadUrl;
+    _otaTargetVersion = newVersion;
+    _otaExpectedMd5 = expectedMd5;
+    _otaTotalBytes = totalBytes;
+    _otaWrittenBytes = 0;
+    _otaSessionStartedMs = millis();
+    _otaNextChunkAtMs = millis();
+    _otaChunkFailures = 0;
+    _otaStatus = "downloading";
+    setLEDState(LED_OTA_UPDATING);
 }
 
-// OTA runs on Core 0, retries up to 3 times on download failure
-void otaLoop() {
-    if (_otaInProgress) return;
-
+static void otaDownloadChunk() {
+    if (!_otaInProgress || _otaWrittenBytes >= _otaTotalBytes) return;
     unsigned long now = millis();
+    if (now - _otaSessionStartedMs > OTA_SESSION_MAX_MS) {
+        otaFail("session timeout");
+        return;
+    }
+    if ((int32_t)(now - _otaNextChunkAtMs) < 0) return;
+    // processSendQueue() runs before otaLoop(); if it could not empty ordinary
+    // telemetry, do no firmware work this turn.
+    if (getQueueSize() != 0) return;
 
-    // Retry after download failure
-    if (_otaDownloadFailed && _otaRetryCount < OTA_MAX_RETRIES && now >= _otaRetryAt) {
-        _otaRetryCount++;
-        _otaDownloadFailed = false;
-        Serial.printf("[OTA] Retry %d/%d\n", _otaRetryCount, OTA_MAX_RETRIES);
-        checkForUpdate();
-        if (_otaDownloadFailed) {
-            _otaRetryAt = millis() + OTA_RETRY_DELAY_MS;
-        }
-        if (_otaRetryCount >= OTA_MAX_RETRIES && _otaDownloadFailed) {
-            Serial.println("[OTA] All retries exhausted — next attempt in 1 hour");
-            _otaDownloadFailed = false;
-            _otaRetryCount = 0;
-        }
+    size_t start = _otaWrittenBytes;
+    size_t end = min(start + (size_t)OTA_CHUNK_BYTES, _otaTotalBytes) - 1;
+    size_t expected = end - start + 1;
+    String range = String("bytes=") + (unsigned)start + "-" + (unsigned)end;
+
+    HTTPClient http;
+    http.setReuse(true);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    http.begin(_otaClient, _otaDownloadUrl);
+    http.setTimeout(15000);
+    const char* responseHeaders[] = {"Content-Range"};
+    http.collectHeaders(responseHeaders, 1);
+    http.addHeader("Accept-Encoding", "identity");
+    http.addHeader("Range", range);
+    int code = http.GET();
+    String expectedContentRange = String("bytes ") + (unsigned)start + "-" +
+                                  (unsigned)end + "/" + (unsigned)_otaTotalBytes;
+    String actualContentRange = http.header("Content-Range");
+    if (code != 206 || http.getSize() != (int)expected ||
+        actualContentRange != expectedContentRange) {
+        Serial.printf("[OTA] Range %u-%u failed: HTTP %d size %d content-range '%s'\n",
+                      (unsigned)start, (unsigned)end, code, http.getSize(),
+                      actualContentRange.c_str());
+        http.end();
+        _otaClient.stop();
+        _otaChunkFailures++;
+        if (_otaChunkFailures >= OTA_MAX_CHUNK_FAILURES) otaFail("range failures");
+        else _otaNextChunkAtMs = millis() + OTA_CHUNK_RETRY_MS;
         return;
     }
 
-    // Normal hourly check or forced check
+    WiFiClient* stream = http.getStreamPtr();
+    uint8_t buffer[1024];
+    size_t requestRead = 0;
+    unsigned long chunkStarted = millis();
+    unsigned long lastByteAt = chunkStarted;
+    bool writeFailed = false;
+    while (requestRead < expected) {
+        feedWatchdog();
+        int available = stream->available();
+        if (available > 0) {
+            int toRead = min(available, (int)sizeof(buffer));
+            toRead = min(toRead, (int)(expected - requestRead));
+            int got = stream->readBytes(buffer, toRead);
+            if (got > 0) {
+                size_t written = Update.write(buffer, got);
+                if (written != (size_t)got) {
+                    writeFailed = true;
+                    break;
+                }
+                requestRead += got;
+                _otaWrittenBytes += got;
+                lastByteAt = millis();
+                continue;
+            }
+        }
+        if (!stream->connected() || millis() - lastByteAt > OTA_CHUNK_STALL_MS ||
+            millis() - chunkStarted > OTA_CHUNK_MAX_MS) break;
+        delay(5);
+    }
+    http.end();
+
+    if (writeFailed) {
+        otaFail("flash write");
+        return;
+    }
+    if (requestRead != expected) {
+        _otaClient.stop();
+        Serial.printf("[OTA] Partial range: +%u/%u, resume at %u\n",
+                      (unsigned)requestRead, (unsigned)expected,
+                      (unsigned)_otaWrittenBytes);
+        if (requestRead == 0) _otaChunkFailures++;
+        else _otaChunkFailures = 0;
+        if (_otaChunkFailures >= OTA_MAX_CHUNK_FAILURES) otaFail("stalled ranges");
+        else _otaNextChunkAtMs = millis() + OTA_CHUNK_RETRY_MS;
+        return;
+    }
+
+    _otaChunkFailures = 0;
+    _otaNextChunkAtMs = millis();
+    Serial.printf("[OTA] Progress: %u/%u\n",
+                  (unsigned)_otaWrittenBytes, (unsigned)_otaTotalBytes);
+
+    if (_otaWrittenBytes != _otaTotalBytes) return;
+    if (!Update.end() || !Update.isFinished()) {
+        otaFail("finalize or MD5 verification");
+        return;
+    }
+
+    Preferences otaPrefs;
+    otaPrefs.begin("otastate", false);
+    otaPrefs.putBool("updated", true);
+    otaPrefs.putInt("crashes", 0);
+    otaPrefs.end();
+    _otaStatus = "flashing";
+    Serial.printf("[OTA] Success! Rebooting to %s...\n", _otaTargetVersion.c_str());
+    flushBeforeRestart();
+    delay(1000);
+    ESP.restart();
+}
+
+// Core 0 state machine. Each turn performs at most one bounded range request,
+// returning to live uploads and heartbeat processing between firmware chunks.
+void otaLoop() {
+    if (_otaInProgress) {
+        otaDownloadChunk();
+        return;
+    }
+
+    unsigned long now = millis();
     if (_otaForceCheck || (now - _lastOTACheck >= OTA_CHECK_INTERVAL_MS)) {
+        long successAge = getLastSuccessAgeS();
+        if (getQueueSize() != 0 || successAge < 0 || successAge > 30) return;
         _lastOTACheck = now;
         _otaForceCheck = false;
-        _otaRetryCount = 0;
-        _otaDownloadFailed = false;
+        _otaStatus = "checking";
         checkForUpdate();
-        if (_otaDownloadFailed) {
-            _otaRetryAt = millis() + OTA_RETRY_DELAY_MS;
-        }
     }
 }

@@ -397,6 +397,10 @@ void sendHeartbeat() {
     doc["wfs2_queued"] = wbQueuedFrames();
     doc["sampling_overruns_last"] = getSamplingOverrunsLast();
     doc["sampling_overruns_total"] = getSamplingOverrunsTotal();
+    doc["ota_status"] = getOTAStatus();
+    doc["ota_progress"] = getOTAProgress();
+    doc["ota_total"] = getOTATotal();
+    doc["ota_target"] = getOTATarget();
     // --- 2.17.0: the device's own internet-speed report + new feature state ---
     doc["post_ms_p50"] = getPostMsP50();              // live POST round-trip, median
     doc["post_ms_p90"] = getPostMsP90();              // ...and tail (queue-delay signal)
