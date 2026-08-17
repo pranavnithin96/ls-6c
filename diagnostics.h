@@ -25,6 +25,7 @@ int getQueueSize();
 bool isUploadPending();
 bool isOfflineMode();
 bool isRejectedDrainPending();
+bool isUpdateInProgress();
 
 static uint32_t _crashCount = 0;
 
@@ -50,6 +51,7 @@ RTC_NOINIT_ATTR uint8_t _wdtCheckpointValid;   // 0xA5 = checkpoint is real
 #define WDT_CP_LIVEPOST    6
 #define WDT_CP_OFFLINE_UP  7
 #define WDT_CP_REJ_DRAIN   8
+#define WDT_CP_WFSTREAM    9
 static inline void wdtCheckpoint(uint8_t cp) {
     _wdtCheckpoint = cp;
     _wdtCheckpointValid = 0xA5;
@@ -64,6 +66,7 @@ static const char* _wdtCheckpointName(uint8_t cp) {
         case WDT_CP_LIVEPOST:   return "livePost";
         case WDT_CP_OFFLINE_UP: return "offline upload";
         case WDT_CP_REJ_DRAIN:  return "rejected drain";
+        case WDT_CP_WFSTREAM:   return "waveform stream";
         default:                return "idle/unknown";
     }
 }
@@ -186,6 +189,7 @@ void scheduledRebootLoop() {
     // If conditions never clear, the device just keeps running — reboot is
     // opportunistic maintenance, not a deadline.
     if (WiFi.status() != WL_CONNECTED) return;
+    if (isUpdateInProgress()) return;
     if (isOfflineMode() || isUploadPending() || getQueueSize() > 0) return;
     if (isRejectedDrainPending()) return;   // finish an operator-requested drain first
     struct tm t;

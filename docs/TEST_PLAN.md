@@ -103,6 +103,44 @@ the flag off on that unit, or reduce `MAX_BUFFER_SIZE`.
 Confirm `isVersionGreater("2.7.0","2.6")` is true (a v2.6 unit offered 2.7.0 takes
 it) and that a v2.7.0 unit reports `firmware: "2.7.0"` in heartbeat and diagnostics.
 
+For 2.18.4, also interrupt a firmware download after several 16 KiB ranges.
+The next request must resume at the number reported by `ota_progress`, never at
+byte zero. Every 206 response must have the exact expected `Content-Length` and
+`Content-Range`; altered metadata must fail without booting the image. While OTA
+is active, WFS2 pauses and ordinary one-Hz readings must continue between range
+requests. Finalization must reject a deliberately wrong SHA-256, altered
+ECDSA manifest signature, signature from an untrusted key, relabelled version,
+or size/MD5 mismatch without
+selecting the new boot partition. After a valid update, reset the device during
+the five-minute health-validation window and confirm the bootloader rolls back.
+With continuous production-data acknowledgements, an empty upload queue, and
+healthy heap for five minutes, confirm the image is marked valid. Scheduled
+maintenance restart must not fire during download or pending validation.
+
+## G2. WFS2 lossless batching
+
+1. Configure masks 1, 3, 7, 15 and 63 in turn. Each accepted frame must decode
+   to exactly 1000 samples per enabled CT, with the matching revision and mask.
+2. Byte-compare decoded payloads against samples captured before encoding and
+   verify the decoded CRC. Test steady zero/idle, 50 Hz load, sharp transitions,
+   ADC values 0 and 4095, and a changing configuration between frames.
+3. Confirm three increasing frames share `/api/waveform/v2/batch`; a partial
+   batch or on-demand frame is sent after the bounded wait.
+4. Inject truncation, trailing bytes, an oversized zero run, a four-frame batch,
+   reversed sequences, and mixed boot IDs. All must return 400 and store no
+   frame from that request.
+5. Blackhole the WFS endpoint while leaving `/api/data` healthy. Ordinary data
+   must remain current; WFS queue depth may reach five, after which whole-frame
+   drops and sequence gaps must rise visibly. Restore WFS and confirm recovery.
+6. Enable streaming and confirm the server-issued bearer token is stored in NVS
+   but never printed. Missing, altered, oversized, or another device's token
+   must return 403 and store no bytes. Reboot and confirm the credential and
+   stream state survive. Disable streaming and confirm queued frames are
+   discarded, the NVS token is removed, and the old token immediately fails.
+7. With healthy ordinary acknowledgements and WFS enabled, run for at least five
+   minutes. The 60-second LittleFS maintenance cadence must not create periodic
+   timing-overrun frames. Stop WFS and confirm deferred maintenance resumes.
+
 ## H. Concurrency + anchor fixes (post-review hardening)
 
 1. **Reconnect re-queue race (C1 fix)**: kill the server (not WiFi) for ~2 min so

@@ -4,6 +4,13 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "config.h"
+
+// Defined by waveform_blackbox.h later in the Arduino translation unit.
+// Healthy continuous acquisition defers non-essential LittleFS maintenance;
+// flash writes disable the shared instruction cache and were measured as
+// 117-148 ms sampling holes in the first production WFS2 pilot.
+bool wbStreamOn();
+long getLastSuccessAgeS();
 #include "ct_sensor.h"
 
 #include <esp32/rom/miniz.h>
@@ -11,6 +18,7 @@
 
 // Forward declarations
 void logError(const String& message);
+void flushBeforeRestart();   // defined below; net watchdog must flush the offline block
 void flushOfflineBlock();               // defined below; called from writeOfflineHeader
 static String moveOfflineFileToLegacy();  // defined below; called from flushOfflineBlock (chunk rotation)
 
@@ -119,6 +127,43 @@ static volatile bool _rejectedDrainPending = false;
 // Operator drain-pause (see setDrainEnabled below): declared here because
 // processSendQueue gates on it long before those helpers are defined.
 static bool _drainEnabled = true;
+
+// --- 2.17.0 state ---------------------------------------------------------
+static int _batchSize = BATCH_SIZE_DEFAULT;     // NVS "batchsz" (set_batch cmd)
+static bool _batchUnsupported = false;          // server 404'd /api/data/batch
+static unsigned long _batchUnsupportedAt = 0;
+static unsigned long _lastBatchFlushMs = 0;
+static WiFiClient _batchClient;                 // pooled, like the live socket
+static HTTPClient _batchHttp;
+static String _batchUrl;
+static unsigned long _liveOkMs = 0;   // LIVE/batch 200s ONLY. Deliberately not
+                                      // bulk 200s: the drain gate reads this,
+                                      // and a drain must never keep ITSELF
+                                      // alive while live delivery starves.
+static unsigned long _lastFailMs = 0;           // last live/batch send failure
+static unsigned long _failTimes[8] = {0};       // ring of recent failure stamps
+static uint8_t _failTimeIdx = 0;
+static void _noteFail(unsigned long now) {
+    _lastFailMs = now;
+    _failTimes[_failTimeIdx] = now;
+    _failTimeIdx = (uint8_t)((_failTimeIdx + 1) & 7);
+}
+static int _recentFailCount(unsigned long now) {
+    int n = 0;
+    for (int i = 0; i < 8; i++)
+        if (_failTimes[i] != 0 && now - _failTimes[i] < DRAIN_TROUBLE_WINDOW_MS) n++;
+    return n;
+}
+static uint16_t _postMsRing[16];                // round-trips of successful posts
+static uint8_t _postMsN = 0, _postMsIdx = 0;
+static uint32_t _lastBulkBps = 0;               // last successful bulk throughput
+static unsigned long _hbOkMs = 0;               // stamped by heartbeat 200s
+static uint32_t _wedgeReboots = 0;              // NVS "wedgerb" (net-watchdog fires)
+static int _netWdtMin = NET_WATCHDOG_DEFAULT_MIN;  // NVS "netwdtmin", 0 = off
+static unsigned long _wifiUpSinceMs = 0;           // last WiFi down->up transition
+static unsigned long _serverReachableMs = 0;       // any live/batch HTTP response
+                                                   // (code>0, even 4xx): the
+                                                   // uplink+server are REACHABLE
 static void drainOneRejectedFile();
 static void troubleSave();               // defined below; called from processSendQueue
 void loadDrainEnabled();                 // defined below; restores the operator drain-pause flag
@@ -881,11 +926,19 @@ bool uploadOfflineFile(const String& deviceId) {
         (sameSession && ntpValid) ? "1" : "0",
         getSendInterval());
 
+    unsigned long _bulkT0 = millis();
     int httpCode = _boundedBulkPost(&uf, fileSize, xhdrs);
+    unsigned long _bulkElapsed = millis() - _bulkT0;
     uf.close();
     _lastUploadAttempt = millis();
     _lastHttpCode = httpCode;
-    if (httpCode == 200) _lastSuccessMs = millis();
+    if (httpCode == 200) {
+        _lastSuccessMs = millis();
+        // Effective upstream throughput as experienced by real traffic —
+        // the fleet's built-in speed test (heartbeat bulk_bps, 2.17.0).
+        if (_bulkElapsed > 0)
+            _lastBulkBps = (uint32_t)(((uint64_t)fileSize * 1000ULL) / _bulkElapsed);
+    }
 
     if (httpCode == 200) {
         Serial.printf("[UPLOAD] OK! %s delivered\n", target.c_str());
@@ -897,8 +950,12 @@ bool uploadOfflineFile(const String& deviceId) {
         _uploadPending = more;
         // Server just took a file fine — drain the rest on the next tick instead
         // of one file per OFFLINE_UPLOAD_RETRY_MS (a rotated backlog would take
-        // minutes otherwise). Failures below keep the 60s pacing.
-        if (more) _lastUploadAttempt = 0;
+        // minutes otherwise). Failures below keep the 60s pacing. 2.17.0: the
+        // fast path additionally requires NO recent live failure — full-speed
+        // sequential bulk on a struggling uplink is exactly the competition
+        // the drain gate exists to prevent.
+        if (more && _recentFailCount(millis()) < DRAIN_TROUBLE_MIN_FAILS)
+            _lastUploadAttempt = 0;
         return !more;
     }
 
@@ -1026,7 +1083,8 @@ void initHTTPSender(const String& serverUrl, const String& deviceId) {
 // QUEUE READING
 // ====================================================================
 void queueReading(const String& deviceId, const String& location, const String& timezone,
-                  float gridVoltage, CTReading readings[NUM_CT_CHANNELS], const String& timestamp) {
+                  float gridVoltage, CTReading readings[NUM_CT_CHANNELS], const String& timestamp,
+                  float mainsHz = 0.0f, int sampleMs = 0) {
 
     JsonDocument doc;
     doc["device_id"] = deviceId;
@@ -1052,15 +1110,51 @@ void queueReading(const String& deviceId, const String& location, const String& 
         ct["amps"] = serialized(String(a, 3));
         ct["pf"] = serialized(String(readings[i].pf, 3));
         // Half-B waveform features — LIVE payload only (D3), flag-gated. Off => byte-identical to v2.6.
+        // Precision widened in 2.13.0 to match the new dynamic range: these are
+        // now ENVELOPE statistics, so ripple collapsed from 2.5-15A (the carrier
+        // amplitude) to 0.05-0.2A (real load variation). At the old 2 decimals a
+        // steady small load quantized to 0.00-0.01 and the signal was destroyed;
+        // 4 decimals keeps resolution down to the ~0.5% mains-drift floor.
+        // min_amps is NEW on the wire in 2.13.0. It was computed on-device from
+        // 2.7 but never transmitted, which left the load band half-observed:
+        // peak gave the top, nothing gave the bottom. It is not redundant with
+        // ripple — ripple is an RMS spread and averages brief excursions away,
+        // whereas min is the actual floor the load touched inside the window.
+        // That distinction is the useful one: min ~= 0 while the mean is high
+        // means the load PULSED within the second (a contactor cycling, a tool
+        // disengaging) rather than sat steady, and a 1Hz mean cannot show that.
+        //
+        // Worst-case payload: 1304B (2.13 features) + ~32B (2.14 mains_hz/
+        // sample_ms) + ~66B (2.17 hz x 6) ≈ 1402B of the 1536B buffer below —
+        // ~134B real headroom. The NEXT field addition must recompute this;
+        // overflow is silent (the jsonLen guard just drops the reading).
         if (wf) {
-            ct["peak_amps"]      = serialized(String(readings[i].peak_amps, 1));
-            ct["env_peak_ratio"] = serialized(String(readings[i].env_peak_ratio, 2));
-            ct["ripple_amps"]    = serialized(String(readings[i].ripple_amps, 2));
+            ct["peak_amps"]      = serialized(String(readings[i].peak_amps, 2));
+            ct["min_amps"]       = serialized(String(readings[i].min_amps, 2));
+            ct["env_peak_ratio"] = serialized(String(readings[i].env_peak_ratio, 3));
+            ct["ripple_amps"]    = serialized(String(readings[i].ripple_amps, 4));
             JsonArray e5 = ct["env5"].to<JsonArray>();
-            for (int k = 0; k < 5; k++) e5.add(serialized(String(readings[i].env5[k], 1)));
+            for (int k = 0; k < 5; k++) e5.add(serialized(String(readings[i].env5[k], 2)));
+            // 2.17.0: per-channel current fundamental. On VFD-output CTs (all
+            // three CNC sites, confirmed 08-03..05) this is spindle electrical
+            // frequency — the RPM proxy. Omitted when unmeasured; 1 decimal
+            // (~9B/channel worst case) keeps the 1536B buffer's headroom.
+            if (readings[i].hz > 0.0f)
+                ct["hz"] = serialized(String(readings[i].hz, 1));
         }
     }
     doc["readings"]["voltage_rms"] = serialized(String(gridVoltage, 1));
+    // 2.14.0 reading-level extras (~30B, passed in by the sampling loop so a
+    // queued/backlogged reading carries ITS OWN values, not the current ones):
+    // mains_hz — grid frequency from hump timing on the strongest channel;
+    //            omitted when no channel had enough load to measure.
+    // sample_ms — actual sampling wall time; deviation from the configured
+    //             window means the cadence slipped and every envelope
+    //             statistic in this reading is suspect.
+    if (mainsHz > 0.0f)
+        doc["readings"]["mains_hz"] = serialized(String(mainsHz, 2));
+    if (sampleMs > 0)
+        doc["readings"]["sample_ms"] = sampleMs;
 
     // Serialize to fixed stack buffer — avoids heap fragmentation from String growth
     char jsonBuf[1536];
@@ -1106,6 +1200,13 @@ void queueReading(const String& deviceId, const String& location, const String& 
 // setReuse(true) end() does NOT stop the socket — HTTPClient::disconnect()
 // takes the "tcp keep open for reuse" branch — so the connection survives and
 // the next begin()/POST reuses it via connect()'s already-connected fast path.
+static void _recordPostMs(unsigned long ms) {
+    if (ms > 65535UL) ms = 65535UL;
+    _postMsRing[_postMsIdx] = (uint16_t)ms;
+    _postMsIdx = (uint8_t)((_postMsIdx + 1) & 15);
+    if (_postMsN < 16) _postMsN++;
+}
+
 static int _livePost(const char* body, uint16_t len) {
     for (int attempt = 0; attempt < 2; attempt++) {
         feedWatchdog();   // each attempt can block ~20s on a stalled peer
@@ -1126,6 +1227,264 @@ static int _livePost(const char* body, uint16_t len) {
 }
 
 // ====================================================================
+// LIVE BATCHING (2.17.0) — N ring entries as one NDJSON POST
+// ====================================================================
+// The ring already holds each reading as its final JSON line, so a batch is
+// pure concatenation: no re-marshaling, one heap buffer, one request. The win
+// on trickle uplinks is REQUEST COUNT (queue delay per request is what kills
+// Meton-class links), not bytes. Server contract: /api/data/batch parses each
+// line exactly like /api/data and NEVER 4xxs a batch wholesale; an old server
+// 404s and we latch back to single sends, re-probing hourly — so firmware and
+// server can ship in either order.
+static void _lazy217Init() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    Preferences p;
+    if (p.begin("lscfg", true)) {
+        _batchSize   = p.getInt("batchsz", BATCH_SIZE_DEFAULT);
+        _netWdtMin   = p.getInt("netwdtmin", NET_WATCHDOG_DEFAULT_MIN);
+        _wedgeReboots = p.getUInt("wedgerb", 0);
+        p.end();
+    }
+    if (_batchSize < 1 || _batchSize > BATCH_MAX) _batchSize = BATCH_SIZE_DEFAULT;
+    _batchUrl = _httpServerUrl;
+    int cut = _batchUrl.indexOf("/api/data");
+    _batchUrl = (cut >= 0) ? _batchUrl.substring(0, cut) + "/api/data/batch"
+                           : _batchUrl + "/batch";
+    _batchHttp.setReuse(true);
+    _batchHttp.setTimeout(HTTP_TIMEOUT_MS * 2);   // bigger bodies than a live POST
+}
+
+// Sends up to n oldest ring entries as one NDJSON body. Returns false only on
+// a transport failure (caller breaks for backoff); all terminal outcomes
+// (200 / 4xx handling / 404 latch) return true.
+static bool _postOneBatch(int n) {
+    unsigned long now = millis();
+    _lastBatchFlushMs = now;
+
+    // Collect contiguous valid entries from the tail (SPSC: tail is ours).
+    int slots[BATCH_MAX];
+    size_t total = 0;
+    int found = 0;
+    int idx = _bufferTail;
+    while (found < n && found < bufCount()) {
+        if (!_sendBuffer[idx].used || _sendBuffer[idx].len < 10) break;
+        slots[found++] = idx;
+        total += _sendBuffer[idx].len + 1;   // +1 newline
+        idx = (idx + 1) % MAX_BUFFER_SIZE;
+    }
+    if (found == 0) {
+        // Stale slot at the tail — pop it exactly like the single path does.
+        _sendBuffer[_bufferTail].used = false;
+        _bufferTail = (_bufferTail + 1) % MAX_BUFFER_SIZE;
+        bufCountDec();
+        return true;
+    }
+
+    char* body = (char*)malloc(total + 1);
+    if (body == nullptr) {
+        // Review HIGH-2: a silent retry here is a livelock with no exit — no
+        // backoff, no offline mode, no watchdog (heartbeats still succeed).
+        // Run the normal failure cascade so five of these reach offline mode,
+        // which parks losslessly.
+        _totalFailed++;
+        _consecutiveFailures++;
+        _noteFail(millis());
+        _lastSendAttempt = millis();
+        _backoffMs = min(_backoffMs * 2, (int)MAX_BACKOFF_MS);
+        recordSendFailure();
+        logError("batch malloc failed — heap fragmented");
+        if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            _backoffMs = 5000;
+            _consecutiveFailures = 1;
+            if (!isOfflineMode()) {
+                saveBufferToFlash();
+                for (int i = 0; i < MAX_BUFFER_SIZE; i++) _sendBuffer[i].used = false;
+                _bufferHead = 0; _bufferTail = 0; _bufferCount = 0;
+                enterOfflineMode(_httpDeviceId);
+            }
+        }
+        return false;
+    }
+    size_t off = 0;
+    for (int i = 0; i < found; i++) {
+        memcpy(body + off, _sendBuffer[slots[i]].json, _sendBuffer[slots[i]].len);
+        off += _sendBuffer[slots[i]].len;
+        body[off++] = '\n';
+    }
+    body[off] = '\0';
+
+    int code = 0;
+    unsigned long t0 = millis();
+    for (int attempt = 0; attempt < 2; attempt++) {
+        feedWatchdog();
+        _batchHttp.begin(_batchClient, _batchUrl);
+        _batchHttp.addHeader("Content-Type", "application/x-ndjson");
+        _batchHttp.addHeader("X-Batch-Count", String(found));
+        code = _batchHttp.POST((uint8_t*)body, off);
+        _batchHttp.end();
+        if (code > 0 || attempt == 1) break;
+        _batchClient.stop();                 // reaped keep-alive: one fresh retry
+    }
+    unsigned long elapsed = millis() - t0;
+    free(body);
+    _lastSendAttempt = millis();
+    _lastHttpCode = code;
+    if (code > 0) _serverReachableMs = millis();   // even 4xx = reachable
+
+    if (code == 200) {
+        _lastSuccessMs = millis();
+        _liveOkMs = _lastSuccessMs;
+        _recordPostMs(elapsed);
+        _totalSent += found;
+        _consecutiveFailures = 0;
+        _backoffMs = 1000;
+        recordSendSuccess();
+        if (_rejParked && !_rejRecoveryArmed) {   // same green light as single 200
+            _rejectedDrainPending = true;
+            _rejRecoveryArmed = true;
+            _rejLastProgressMs = 0;
+        }
+        struct tm t; if (getLocalTime(&t, 0)) _lastKnownEpoch = mktime(&t);
+        // Review LOW-9: advance the tail FIRST, then clear flags, then release
+        // the count — Core 1's full-check gates on count, so no slot becomes
+        // writable until the tail no longer covers it.
+        _bufferTail = (slots[found - 1] + 1) % MAX_BUFFER_SIZE;
+        for (int i = 0; i < found; i++) _sendBuffer[slots[i]].used = false;
+        for (int i = 0; i < found; i++) bufCountDec();
+        return true;
+    }
+    if (code == 404) {
+        // Old server without the batch endpoint. Latch to single sends; the
+        // hourly re-probe makes a later server deploy pick itself up.
+        _batchUnsupported = true;
+        _batchUnsupportedAt = millis();
+        logError("batch endpoint 404 — falling back to single sends");
+        return true;
+    }
+    if (code == 400 || code == 422) {
+        // Should not happen under the batch contract (server quarantines bad
+        // lines, 200s the batch) — but mirror the single path's zero-loss
+        // handling rather than trusting the contract with data on the line.
+        for (int i = 0; i < found; i++)
+            writeRejected(String(_sendBuffer[slots[i]].json));
+        _bufferTail = (slots[found - 1] + 1) % MAX_BUFFER_SIZE;
+        for (int i = 0; i < found; i++) _sendBuffer[slots[i]].used = false;
+        for (int i = 0; i < found; i++) bufCountDec();
+        logError(code == 400 ? "batch 400 — saved to /rejected.log"
+                             : "batch 422 — saved to /rejected.log");
+        if (code == 422) syncNTP();
+        return true;
+    }
+
+    // Transport failure — identical cascade to the single path.
+    _totalFailed++;
+    _consecutiveFailures++;
+    _noteFail(millis());
+    _backoffMs = min(_backoffMs * 2, (int)MAX_BACKOFF_MS);
+    recordSendFailure();
+    if (_consecutiveFailures == 1) logError("batch send failed");
+    if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        logError("HTTP stall: server unreachable");
+        _backoffMs = 5000;
+        _consecutiveFailures = 1;
+        if (!isOfflineMode()) {
+            saveBufferToFlash();
+            for (int i = 0; i < MAX_BUFFER_SIZE; i++) _sendBuffer[i].used = false;
+            _bufferHead = 0; _bufferTail = 0; _bufferCount = 0;
+            enterOfflineMode(_httpDeviceId);
+            Serial.printf("[HTTP] Offline mode — heap: %u\n", ESP.getFreeHeap());
+        }
+    }
+    return false;
+}
+
+// Owns the send tick when batching is active. Returns true when batch mode
+// handled (or deliberately deferred) this tick; false = use single sends.
+static bool _trySendBatched(unsigned long now) {
+    if (_batchSize <= 1) return false;
+    if (_batchUnsupported) {
+        if (now - _batchUnsupportedAt < BATCH_RETRY_UNSUPPORTED_MS) return false;
+        _batchUnsupported = false;           // hourly re-probe of the endpoint
+    }
+    // Heap guard (review HIGH-2): the malloc needs one CONTIGUOUS block, so
+    // check the largest free block, not total free — a fragmented heap with
+    // plenty of total free otherwise livelocks the batch path forever.
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) <
+            (size_t)(_batchSize * JSON_BUF_SIZE) + 8192 ||
+        ESP.getFreeHeap() < (uint32_t)(_batchSize * JSON_BUF_SIZE) + 45000UL)
+        return false;                        // fall back to single sends this tick
+
+    // Review MED-7: batch cadence (batch x interval) must stay well inside
+    // DRAIN_LIVE_HEALTH_MS or the device's own "live" 200s become too sparse
+    // to keep the drain gate open. Clamp the EFFECTIVE batch at runtime so a
+    // later set_interval can't compose with set_batch into a slow deadlock.
+    int effBatch = _batchSize;
+    {
+        unsigned long cadMs = (unsigned long)effBatch * 1000UL * (unsigned long)getSendInterval();
+        while (effBatch > 1 &&
+               cadMs + BATCH_FLUSH_SLACK_MS >= DRAIN_LIVE_HEALTH_MS / 2) {
+            effBatch--;
+            cadMs = (unsigned long)effBatch * 1000UL * (unsigned long)getSendInterval();
+        }
+    }
+    if (effBatch <= 1) return false;         // interval too long — single sends
+    int rounds = 0;
+    while (bufCount() >= effBatch && rounds < MAX_SENDS_PER_LOOP) {
+        wdtCheckpoint(WDT_CP_LIVEPOST);
+        bool ok = _postOneBatch(effBatch);
+        wdtCheckpoint(WDT_CP_SENDQUEUE);
+        if (!ok) return true;                // failure: backoff owns the pause
+        if (_batchUnsupported) break;        // review LOW-8: don't re-send to a 404
+        rounds++;
+    }
+    if (rounds == 0 && !_batchUnsupported && bufCount() > 0 &&
+        now - _lastBatchFlushMs >=
+            (unsigned long)effBatch * 1000UL * (unsigned long)getSendInterval()
+            + BATCH_FLUSH_SLACK_MS) {
+        // Partial flush: entries older than the natural fill time never wait.
+        int n = bufCount() < effBatch ? bufCount() : effBatch;
+        wdtCheckpoint(WDT_CP_LIVEPOST);
+        _postOneBatch(n);
+        wdtCheckpoint(WDT_CP_SENDQUEUE);
+    }
+    return true;
+}
+
+// ====================================================================
+// CONNECTIVITY WATCHDOG (2.17.0)
+// ====================================================================
+// WiFi associated yet ZERO server acknowledgments — live, batch, bulk, or
+// heartbeat — for the whole window: the stack is presumed wedged (meton_05/
+// meton_07, 08-04: hours mute with good RSSI, cured only by power-cycle).
+// A reboot here is cheap: the ring was troubleSave'd within 5s and parked
+// data survives. During a genuine server outage this fires once per window;
+// the min-uptime guard makes a boot-loop impossible.
+static void _netWatchdogCheck() {
+    if (_netWdtMin <= 0) return;
+    unsigned long now = millis();
+    unsigned long windowMs = (unsigned long)_netWdtMin * 60000UL;
+    if (now < windowMs) return;              // min-uptime guard
+    // Review MED-4: WiFi must have been CONTINUOUSLY up for a full window too,
+    // or a router that returns after a >window outage gets rebooted at the
+    // exact moment the link comes back, before one send can prove itself.
+    // (_wifiUpSinceMs==0 = up since boot; min-uptime guard covers that case.)
+    if (now - _wifiUpSinceMs < windowMs) return;
+    unsigned long lastOk = _lastSuccessMs;   // live/batch/bulk 200s
+    if (_hbOkMs > lastOk) lastOk = _hbOkMs;  // heartbeat 200s count as contact
+    if (lastOk != 0 && (now - lastOk) < windowMs) return;
+    logError("net watchdog: no server ack in window — rebooting");
+    Serial.printf("[WDT-NET] no ack for %d min (WiFi up) — restart\n", _netWdtMin);
+    { Preferences p;
+      if (p.begin("lscfg", false)) { p.putUInt("wedgerb", ++_wedgeReboots); p.end(); } }
+    flushBeforeRestart();   // review MED-4: bare saveBufferToFlash() dropped the
+                            // partial offline block (up to 9 readings) each fire
+    delay(200);
+    ESP.restart();
+}
+
+// ====================================================================
 // PROCESS SEND QUEUE — Clean control flow, no goto
 // ====================================================================
 void processSendQueue() {
@@ -1134,7 +1493,10 @@ void processSendQueue() {
         troubleSave();   // ring -> flash while the link is down (<=5 s exposure)
         return;
     }
+    if (_wifiDownSince != 0) _wifiUpSinceMs = millis();   // down->up transition
     _wifiDownSince = 0;
+    _lazy217Init();
+    _netWatchdogCheck();   // WiFi up + no server ack all window => reboot
 
     // If in offline mode (server unreachable), probe every 10s
     if (isOfflineMode()) {
@@ -1168,7 +1530,9 @@ void processSendQueue() {
     bool shouldSend = (bufCount() > 0) &&
         (_consecutiveFailures == 0 || (now - _lastSendAttempt) >= (unsigned long)_backoffMs);
 
-    if (shouldSend) {
+    if (shouldSend && _trySendBatched(now)) {
+        // Batch mode (set_batch >= 2) handled this tick; single path skipped.
+    } else if (shouldSend) {
         int sent = 0;
         while (bufCount() > 0 && sent < MAX_SENDS_PER_LOOP) {
             // Read from tail — no String allocation, just pointer to fixed buffer
@@ -1180,14 +1544,19 @@ void processSendQueue() {
             }
 
             wdtCheckpoint(WDT_CP_LIVEPOST);
+            unsigned long _pt0 = millis();
             int httpCode = _livePost(_sendBuffer[_bufferTail].json,
                                      _sendBuffer[_bufferTail].len);
+            unsigned long _ptElapsed = millis() - _pt0;
             wdtCheckpoint(WDT_CP_SENDQUEUE);
             _lastSendAttempt = millis();
             _lastHttpCode = httpCode;
+            if (httpCode > 0) _serverReachableMs = millis();   // even 4xx = reachable
 
             if (httpCode == 200) {
                 _lastSuccessMs = millis();
+                _liveOkMs = _lastSuccessMs;      // drain gate reads LIVE-path 200s
+                _recordPostMs(_ptElapsed);       // the device's own speed test
                 _totalSent++; _consecutiveFailures = 0; _backoffMs = 1000;
                 recordSendSuccess();
                 // The server just confirmed it's up and taking data. That 200 is
@@ -1225,6 +1594,7 @@ void processSendQueue() {
                 break;      // Stop sending until timestamps are valid
             } else {
                 _totalFailed++; _consecutiveFailures++;
+                _noteFail(millis());             // rate-based drain pacing (2.17.3)
                 _backoffMs = min(_backoffMs * 2, (int)MAX_BACKOFF_MS);
                 recordSendFailure();
                 if (_consecutiveFailures == 1) {
@@ -1255,6 +1625,15 @@ void processSendQueue() {
         }
     }
 
+    // 2.17.4 (panel-confirmed root cause): the send block above BLOCKS for
+    // seconds and stamps _serverReachableMs/_lastSuccessMs AFTER the top-of-
+    // function `now` capture. Comparing those newer stamps against the stale
+    // capture underflows unsigned and scores "just proved reachable" as
+    // "unreachable" — inverting the drain gate: drains only opened on ticks
+    // that DIDN'T send. Saturated rings send every tick => drains never ran
+    // (the PCS/meton_07 frozen-store bug). Re-stamp before every consumer.
+    now = millis();
+
     // Rejected-log dispose backstop — watches DRAIN PROGRESS, not elapsed time.
     // Every file the drain delivers stamps _rejLastProgressMs and restarts the
     // clock, so a drain that is getting somewhere is never cut off, however big
@@ -1272,7 +1651,7 @@ void processSendQueue() {
     // backlog the pause exists to preserve.
     if (_rejRecoveryArmed && _drainEnabled) {
         bool online = (_lastSuccessMs != 0 &&
-                       (now - _lastSuccessMs) < REJECTED_ONLINE_WINDOW_MS);
+                       (long)(now - _lastSuccessMs) < (long)REJECTED_ONLINE_WINDOW_MS);
         if (!online) {
             _rejLastProgressMs = 0;       // offline — stall clock restarts on reconnect
         } else if (_rejLastProgressMs == 0) {
@@ -1302,6 +1681,24 @@ void processSendQueue() {
     // that a hostile network can trigger never waits for the schedule.
     if (_consecutiveFailures > 0) troubleSave();
 
+    // Drain live-health gate (2.17.0): bulk uploads only run when LIVE delivery
+    // is provably working (a live/batch 200 within DRAIN_LIVE_HEALTH_MS). The
+    // 08-03 A/B measured the drain COMPETING with live data on a choked uplink:
+    // 99.8% live with drain paused vs ~72% with it running. _liveOkMs excludes
+    // bulk 200s on purpose — a drain must not keep itself alive while live
+    // starves. The dispose backstop already requires a live 200 in ITS window,
+    // so gated-off drains never age toward disposal (clock resets below).
+    // Review MED-5: key on REACHABILITY (any live-path HTTP response), not on
+    // 200s alone — during a server-side 4xx storm the readings are being
+    // PARKED to the very store the drain must recover, and a 4xx proves the
+    // pipe is open. Transport failures (code<=0) still close the gate.
+    bool liveHealthy = (_serverReachableMs != 0 &&
+                        (long)(now - _serverReachableMs) < (long)DRAIN_LIVE_HEALTH_MS);
+    // Recent live failure => recovery trickles: stretch the per-file cadence.
+    unsigned long drainRetryMs = OFFLINE_UPLOAD_RETRY_MS;
+    if (_recentFailCount(now) >= DRAIN_TROUBLE_MIN_FAILS)
+        drainRetryMs = OFFLINE_UPLOAD_RETRY_MS * DRAIN_TROUBLE_RETRY_MULT;
+
     bool ringQuiet = (bufCount() <= BG_UPLOAD_LOWATER);
     if (!ringQuiet && (_uploadPending || _rejectedDrainPending)) {
         if (_bgUploadBlockedSince == 0) _bgUploadBlockedSince = now;
@@ -1313,12 +1710,13 @@ void processSendQueue() {
         _bgUploadBlockedSince = 0;         // ring drained or nothing pending — reset the timer
     }
 
-    if (_uploadPending && ringQuiet && (now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS)) {
+    if (_uploadPending && ringQuiet && liveHealthy &&
+        (now - _lastUploadAttempt >= drainRetryMs)) {
         wdtCheckpoint(WDT_CP_OFFLINE_UP);
         uploadOfflineFile(_httpDeviceId);
         wdtCheckpoint(WDT_CP_SENDQUEUE);
-    } else if (_drainEnabled && _rejectedDrainPending && ringQuiet &&
-               (_lastUploadAttempt == 0 || now - _lastUploadAttempt >= OFFLINE_UPLOAD_RETRY_MS)) {
+    } else if (_drainEnabled && _rejectedDrainPending && ringQuiet && liveHealthy &&
+               (_lastUploadAttempt == 0 || now - _lastUploadAttempt >= drainRetryMs)) {
         // Rejected-log drain: one immutable file per tick — offline backlog (raw
         // readings) always takes priority via the else-if.
         wdtCheckpoint(WDT_CP_REJ_DRAIN);
@@ -1351,6 +1749,14 @@ static void troubleSave() {
 void periodicBufferSave() {
     unsigned long now = millis();
     if (_fsReady && (now - _lastBufferSave >= BUFFER_SAVE_INTERVAL_MS)) {
+        long successAge = getLastSuccessAgeS();
+        if (wbStreamOn() && successAge >= 0 && successAge <= 30) {
+            // Ordinary telemetry is acknowledged and remains RAM-protected by
+            // the ring. Defer both writes and stale-file deletion until the
+            // stream stops or connectivity becomes unhealthy. On trouble the
+            // existing 5 s trouble-save path still takes precedence over WFS.
+            return;
+        }
         _lastBufferSave = now;
         if (bufCount() > 0) saveBufferToFlash();
         // C1: never delete buffer.json while offline or an upload is pending — it
@@ -1483,6 +1889,43 @@ void setDrainEnabled(bool on) {
     logError(on ? "rejected drain ENABLED by operator" : "rejected drain PAUSED by operator");
 }
 bool isDrainEnabled() { return _drainEnabled; }
+
+// --- 2.17.0 accessors (heartbeat telemetry + commands) ---------------------
+bool setBatchSize(int n) {
+    if (n < 1 || n > BATCH_MAX) return false;
+    _batchSize = n;
+    _batchUnsupported = false;     // config change re-probes the endpoint
+    Preferences p; p.begin("lscfg", false); p.putInt("batchsz", n); p.end();
+    Serial.printf("[HTTP] batch size set: %d\n", n);
+    return true;
+}
+int getBatchSize() { return _batchSize; }
+bool setNetWatchdogMin(int m) {
+    if (m < 0 || m > 1440) return false;
+    _netWdtMin = m;
+    Preferences p; p.begin("lscfg", false); p.putInt("netwdtmin", m); p.end();
+    Serial.printf("[HTTP] net watchdog set: %d min\n", m);
+    return true;
+}
+int getNetWatchdogMin() { return _netWdtMin; }
+uint32_t getWedgeReboots() { return _wedgeReboots; }
+uint32_t getBulkBps() { return _lastBulkBps; }
+void recordHeartbeatOk() { _hbOkMs = millis(); }   // heartbeat 200 = server contact
+static uint16_t _postMsPercentile(int pct) {
+    if (_postMsN == 0) return 0;
+    uint16_t tmp[16];
+    memcpy(tmp, _postMsRing, sizeof(tmp));
+    // insertion sort of <=16 elements — cheaper than qsort's call overhead
+    for (int i = 1; i < _postMsN; i++) {
+        uint16_t v = tmp[i]; int j = i - 1;
+        while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; j--; }
+        tmp[j + 1] = v;
+    }
+    int idx = (pct * (_postMsN - 1)) / 100;
+    return tmp[idx];
+}
+uint16_t getPostMsP50() { return _postMsPercentile(50); }
+uint16_t getPostMsP90() { return _postMsPercentile(90); }
 void loadDrainEnabled() {
     Preferences p; p.begin("lscfg", true); _drainEnabled = p.getBool("drainen", true); p.end();
 }

@@ -24,6 +24,7 @@
 
 #include <Preferences.h>
 #include "config.h"
+#include "ct_channel_config.h"
 #include "led_status.h"
 #include "diagnostics.h"
 #include "wifi_manager.h"
@@ -79,6 +80,9 @@ void networkTask(void* param) {
             wdtCheckpoint(WDT_CP_OTA);
             otaLoop();            // OTA check — every 1h
             esp_task_wdt_reset();
+            wdtCheckpoint(WDT_CP_WFSTREAM);
+            wbStreamLoop();       // lossless batched 1kHz frames (2.18.4 pilot)
+            esp_task_wdt_reset();
         }
 
         // Buffer save runs ALWAYS, even when WiFi is down
@@ -110,9 +114,15 @@ void printStatus() {
         getQueueSize(), getTotalSent(), getTotalFailed(), getTotalDropped());
     Serial.printf("  Cal:       %s | MultiCal: %s\n",
         isCTCalibrated() ? "yes" : "no", isMultiCalLoaded() ? "yes" : "no");
+    Serial.printf("  CT config: rev=%u mask=0x%02X%s\n",
+        (unsigned)getCTConfigRevision(), getActiveCTMask(),
+        isCTConfigRequired() ? " REQUIRED" : "");
     for (int i = 0; i < NUM_CT_CHANNELS; i++) {
-        Serial.printf("  CT%d: %.3fA | %.1fW | %dmV\n",
-            i + 1, r.ct[i].amps, r.ct[i].watts, r.ct[i].avg_mv);
+        if (isCTChannelEnabled(i))
+            Serial.printf("  CT%d: %.3fA | %.1fW | %dcount\n",
+                i + 1, r.ct[i].amps, r.ct[i].watts, r.ct[i].avg_mv);
+        else
+            Serial.printf("  CT%d: disabled\n", i + 1);
     }
     Serial.printf("  Total: %.1fW\n", r.total_watts);
     Serial.println("=====================\n");
@@ -148,7 +158,11 @@ void setup() {
     initScheduledReboot();
     feedWatchdog();
 
-    // 5. WiFi
+    // 5. CT channel configuration, then WiFi/provisioning. A fresh unit starts
+    // with no active ADC inputs until the installer explicitly selects them.
+    initCTChannelConfig();
+
+    // 6. WiFi
     setLEDState(LED_WIFI_CONNECTING);
     initWiFiManager();
     feedWatchdog();
@@ -162,7 +176,7 @@ void setup() {
         return;
     }
 
-    // 6. ALWAYS init sender + LittleFS (even without WiFi — needed for offline storage)
+    // 7. ALWAYS init sender + LittleFS (even without WiFi — needed for offline storage)
     initHTTPSender(getServerUrl(), getDeviceId());
     setBufferMutex(bufferMutex);
     initHeartbeat(getServerUrl());
@@ -176,11 +190,12 @@ void setup() {
 
     networkReady = true;  // ALWAYS true — Core 0 checks WiFi per-operation
 
-    // 7. CT sensors
+    // 8. CT sensors
     initCTSensors();
+    wbInit();               // WFS2 complete-frame queue — one-time heap alloc
     feedWatchdog();
 
-    // 8. ALWAYS launch Core 0 task — it handles WiFi reconnect + data POST when ready
+    // 9. ALWAYS launch Core 0 task — it handles WiFi reconnect + data POST when ready
     xTaskCreatePinnedToCore(networkTask, "Net", NETWORK_TASK_STACK, NULL, 1, NULL, 0);
 
     setLEDState(LED_RUNNING);
@@ -190,6 +205,9 @@ void setup() {
     Serial.printf("  Location:  %s\n", getLocationName().c_str());
     Serial.printf("  Server:    %s\n", getServerUrl().c_str());
     Serial.printf("  Voltage:   %.0fV | Interval: %ds\n", getGridVoltage(), getSendInterval());
+    Serial.printf("  Active CT: 0x%02X | Config rev: %u%s\n", getActiveCTMask(),
+                  (unsigned)getCTConfigRevision(),
+                  isCTConfigRequired() ? " | CONFIGURATION REQUIRED" : "");
     Serial.println("---------------------");
     Serial.println("Commands: status | setslope | slopes | calpoint | debug | reset | update");
     Serial.println("Monitoring started...\n");
@@ -363,9 +381,11 @@ void loop() {
         syncNTP();
     }
 
-    // ===== CT SAMPLING — Always 1Hz, route depends on online/offline =====
+    // ===== CT SAMPLING — complete one-second frame, continuously =====
+    // Sampling cadence is no longer coupled to telemetry cadence. A device may
+    // POST the summary every N seconds, but WFS2 still observes every second.
     unsigned long now = millis();
-    int intervalMs = getSendInterval() * 1000;
+    const unsigned long intervalMs = 1000;
 
     if (now - lastReadingTime >= (unsigned long)intervalMs) {
         lastReadingTime += intervalMs;
@@ -375,8 +395,17 @@ void loop() {
 
         lastReadings = readAllCT(getGridVoltage());
         updateLastReadings(lastReadings);
+        // Black-box capture request (if any) is honored HERE, between sampling
+        // windows, so its flash write can't distort a window in progress.
+        wbServiceCapture(getSampleWindowMs());
 
-        if (isOfflineMode()) {
+        static unsigned long lastTelemetrySampleMs = 0;
+        const unsigned long telemetryIntervalMs = (unsigned long)getSendInterval() * 1000UL;
+        bool telemetryDue = lastTelemetrySampleMs == 0 ||
+                            lastReadings.timestamp_ms - lastTelemetrySampleMs >= telemetryIntervalMs;
+        if (telemetryDue) lastTelemetrySampleMs = lastReadings.timestamp_ms;
+
+        if (telemetryDue && isOfflineMode()) {
             // OFFLINE: Store to compressed binary on flash
             storeOfflineReading(lastReadings.ct);
 
@@ -388,7 +417,7 @@ void loop() {
                     lastReadings.total_watts, getOfflineStored(),
                     getOfflineFileSize() / 1024, lastReadings.sample_duration_ms);
             }
-        } else {
+        } else if (telemetryDue) {
             // ONLINE: Queue for immediate POST
             Serial.printf("[%s] %.1fW | Q:%d S:%u%s | %lums\n",
                 getUTCTimestamp().c_str(), lastReadings.total_watts,
@@ -417,7 +446,9 @@ void loop() {
                     if (sampleEpoch != 0) lastQueuedEpoch = sampleEpoch;
                     String ts = formatUTCEpoch(sampleEpoch);
                     queueReading(getDeviceId(), getLocationName(), getTimezone(),
-                                 getGridVoltage(), lastReadings.ct, ts);
+                                 getGridVoltage(), lastReadings.ct, ts,
+                                 lastReadings.mains_hz,
+                                 (int)lastReadings.sample_duration_ms);
                     xSemaphoreGive(bufferMutex);
                     // Ring-full overflow (if any) is written to /rejected.log HERE,
                     // outside the mutex — file I/O under bufferMutex starved Core 0's

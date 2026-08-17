@@ -3,7 +3,7 @@
 // LineSights LS-6C-IOT v2.7.0 — Configuration
 // ============================================================================
 
-#define FIRMWARE_VERSION "2.13.0"
+#define FIRMWARE_VERSION "2.18.4"
 
 // --- Feature flags ---
 // Per-second waveform features (peak/env_peak_ratio/ripple/env5) in the LIVE
@@ -19,8 +19,34 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 #define BOOT_BUTTON_PIN   0
 
 // --- CT Sensor ---
-#define ADC_SAMPLES_PER_CH    500     // 500ms sampling window
+// v2.18: every configured CT is sampled for the complete one-second frame.
+// Disabled channels are not touched by analogRead(). The fixed window removes
+// the historical 100-500ms blind interval and gives WFS2 an honest frame
+// boundary. Runtime changes to shorter windows are deliberately rejected.
+#define ADC_SAMPLES_PER_CH    1000
+#define MAX_ADC_SAMPLES       1000
+#define MIN_ADC_SAMPLES       1000
 #define SAMPLE_INTERVAL_US    1000    // 1 kHz ADC rate within window
+#define ENV_SUBWIN_SAMPLES    20      // 20ms @ 1kHz = one 50Hz mains cycle
+#define MAX_ENV_SUBWIN        (MAX_ADC_SAMPLES / ENV_SUBWIN_SAMPLES)
+
+// --- WFS2 continuous waveform streaming (2.18.4, pilot devices only) ---
+// Each queued item is exactly one complete 1000ms acquisition frame containing
+// ONLY configured channels, scan-interleaved in ascending CT order. Five heap
+// slots allow Core 1 to acquire while Core 0 uploads. Frames use a bounded,
+// lossless delta/zero-run codec and up to three share a request. If the network
+// cannot keep up, whole frames are dropped and counted; frames are never
+// overwritten, mixed across configurations, or spliced across wall-time gaps.
+#define WFS2_SAMPLE_RATE_HZ       1000
+#define WFS2_SAMPLES_PER_CHANNEL  1000
+#define WFS2_QUEUE_DEPTH          5
+#define WFS2_BATCH_MAX_FRAMES     3
+#define WFS2_MAX_FRAME_SAMPLES    (NUM_CT_CHANNELS * WFS2_SAMPLES_PER_CHANNEL)
+#define WFS2_MAX_PAYLOAD_BYTES    (WFS2_MAX_FRAME_SAMPLES * 2)
+#define WFS2_BATCH_BUFFER_BYTES   (WFS2_BATCH_MAX_FRAMES * (sizeof(Wfs2Header) + WFS2_MAX_PAYLOAD_BYTES))
+#define WFS2_BATCH_WAIT_MS        2500UL
+#define WB_STREAM_RETRY_MS       10000UL  // backoff after a failed chunk POST
+#define WB_STREAM_MIN_HEAP       60000    // preserve field-tested safety margin
 #define CAL_POINTS            3
 // Corrected: manufacturer 0.0123 A/count, with ADC_11db 1 count = 0.756 mV
 // So 0.0123 / 0.756 = 0.01627 A/mV
@@ -63,6 +89,51 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 
 // --- Send Mode ---
 #define DEFAULT_SEND_INTERVAL    1  // seconds
+
+// --- Live batching (2.17.0) ---
+// N readings per POST as newline-delimited JSON to /api/data/batch. Default 1
+// = byte-identical behavior to 2.16.2 (single POSTs to /api/data); raised
+// per-device via the set_batch heartbeat command (NVS "batchsz"). The win on
+// trickle uplinks is REQUEST COUNT, not bytes: Meton-class links die of queue
+// delay per request, so 10x fewer requests is the cure the 08-04 A/B proved.
+// A server without the batch endpoint 404s; the firmware latches back to
+// single sends and re-probes hourly, so ship order (fw vs server) is free.
+#define BATCH_SIZE_DEFAULT       1
+#define BATCH_MAX                10    // ring is 30; keep >=1/3 headroom for parking
+#define BATCH_FLUSH_SLACK_MS     2000UL   // partial-batch flush past the natural fill time
+#define BATCH_RETRY_UNSUPPORTED_MS 3600000UL  // re-probe a 404ing batch endpoint hourly
+
+// --- Connectivity watchdog (2.17.0) ---
+// WiFi associated but ZERO server acknowledgments (live, batch, or heartbeat
+// 200s) for this long => the network stack is presumed wedged and the device
+// self-reboots. Cures the meton_05/meton_07 class (08-04: both wedged for
+// hours with good RSSI, fixed only by power-cycle). Reboot is cheap here:
+// troubleSave keeps RAM-ring exposure <=5s and parked data survives. During a
+// genuine server outage this fires at most once per window — acceptable, and
+// bounded by the min-uptime guard so it can never boot-loop.
+// 0 disables. Runtime override: NVS "netwdtmin" / heartbeat set_net_watchdog.
+#define NET_WATCHDOG_DEFAULT_MIN 30
+
+// --- Drain pacing (2.17.0) ---
+// Bulk uploads (offline backlog + rejected drain) only run when live delivery
+// is provably working: a live/batch 200 within DRAIN_LIVE_HEALTH_MS. On a
+// choked uplink the drain otherwise COMPETES with live data for the queue —
+// the 08-03 A/B measured 99.8% live with drain paused vs ~72% with it running.
+// While any send failure is recent (DRAIN_TROUBLE_WINDOW_MS), the per-file
+// cadence stretches by DRAIN_TROUBLE_RETRY_MULT so recovery trickles instead
+// of flooding. The starvation escape still fires — but only when live is
+// healthy, so the pcs1/pcs7 "never drains" deadlock stays fixed without
+// resurrecting the Meton competition.
+#define DRAIN_LIVE_HEALTH_MS     90000UL
+#define DRAIN_TROUBLE_WINDOW_MS  120000UL
+#define DRAIN_TROUBLE_RETRY_MULT 2
+// 2.17.3 (PCS field defect 08-05): "trouble" needs a failure RATE, not one
+// recent failure. On lossy-steady links (PCS NAT: ~10-15% baseline loss)
+// SOME failure is always recent, so the old any-failure trigger throttled
+// the drain permanently -> stores capped -> fresh readings dropped. Require
+// >=this many failures inside the window before pacing kicks in, and slow
+// only 2x, so chronic-lossy links keep draining at a rate that outruns parking.
+#define DRAIN_TROUBLE_MIN_FAILS  3
 
 // --- Time sync ---
 #define NTP_SYNC_INTERVAL_MS   900000  // SNTP auto re-sync every 15 min (explicit, not SDK default)
@@ -113,7 +184,13 @@ static const int CT_PINS[NUM_CT_CHANNELS] = {36, 39, 34, 35, 32, 33};
 // ever ALLOWED to run — which is exactly the saturated unit that has a full log.
 // The static_assert keeps that relationship from being broken by a later tweak.
 #define REJECTED_ONLINE_WINDOW_MS  60000UL   // a live 200 this recent == "online"
-#define REJECTED_STALL_MS         300000UL   // no drain progress this long while online -> dispose
+#define REJECTED_STALL_MS         900000UL   // no drain progress this long while online -> dispose
+// 2.17.0 (review HIGH-3): the stall window must comfortably outlast the
+// trouble-stretched drain cadence (60s x 5 = 300s), or ONE failed attempt on
+// a flapping link ages straight into disposal — the drain gets zero retries.
+static_assert(REJECTED_STALL_MS >= OFFLINE_UPLOAD_RETRY_MS * DRAIN_TROUBLE_RETRY_MULT * 3,
+              "REJECTED_STALL_MS must give the trouble-paced drain >=3 attempts "
+              "before disposal, or a flapping link shreds parked backlog");
 static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
               "REJECTED_STALL_MS must outlast BG_UPLOAD_STARVE_MS, or a ring-blocked "
               "drain is disposed before the starvation escape ever lets it run");
@@ -133,10 +210,14 @@ static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
 
 // --- OTA ---
 #define OTA_CHECK_INTERVAL_MS 3600000  // 1 hour
-#define OTA_DOWNLOAD_TIMEOUT  300000   // 300 seconds (1MB at 4KBps worst-case Indian WiFi)
-#define OTA_RETRY_DELAY_MS    10000   // 10s before retry on failure
-#define OTA_MAX_RETRIES       3       // Retry download up to 3 times
-#define MAX_CRASH_COUNT       3
+#define OTA_CHUNK_BYTES       16384UL  // one bounded range request per network turn
+#define OTA_CHUNK_STALL_MS    12000UL  // no bytes received: yield and retry this offset
+#define OTA_CHUNK_MAX_MS      30000UL  // a chunk can never monopolize Core 0 longer
+#define OTA_CHUNK_RETRY_MS    30000UL  // preserve ordinary telemetry between failures
+#define OTA_MAX_CHUNK_FAILURES 5
+#define OTA_SESSION_MAX_MS    1800000UL // 30 minutes, while telemetry continues normally
+#define OTA_HEALTH_VALIDATION_MS 300000UL // prove 5 min uptime + live server delivery
+#define OTA_VALIDATION_MIN_HEAP  30000UL
 #define OTA_MAX_SIZE          0x140000 // 1,310,720 bytes (partition size)
 
 // --- Diagnostics ---
@@ -151,4 +232,3 @@ static_assert(REJECTED_STALL_MS > BG_UPLOAD_STARVE_MS,
 #define AP_SSID_PREFIX           "LineSights-"
 #define MDNS_HOSTNAME            "linesights"
 #define FACTORY_RESET_HOLD_MS    5000
-

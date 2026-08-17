@@ -92,12 +92,12 @@ button:hover{background:#0D47A1}label{font-weight:bold;font-size:14px}
 <label>Location</label><input name="loc" placeholder="Factory Floor" required maxlength="64">
 <label>Server URL</label><input name="url" value="http://linesights.com/api/data">
 <label>Grid Voltage (100-250V)</label><input name="volt" type="number" value="230" min="100" max="250">
-<label>CT1 Rating (A)</label><select name="ct1"><option>50</option><option>100</option><option>150</option></select>
-<label>CT2 Rating (A)</label><select name="ct2"><option>50</option><option>100</option><option>150</option></select>
-<label>CT3 Rating (A)</label><select name="ct3"><option>50</option><option>100</option><option>150</option></select>
-<label>CT4 Rating (A)</label><select name="ct4"><option>50</option><option>100</option><option>150</option></select>
-<label>CT5 Rating (A)</label><select name="ct5"><option>50</option><option>100</option><option>150</option></select>
-<label>CT6 Rating (A)</label><select name="ct6"><option>50</option><option>100</option><option>150</option></select>
+<label><input name="ct1en" type="checkbox" value="1" style="width:auto"> CT1 connected</label><select name="ct1"><option>50</option><option>100</option><option>150</option></select>
+<label><input name="ct2en" type="checkbox" value="1" style="width:auto"> CT2 connected</label><select name="ct2"><option>50</option><option>100</option><option>150</option></select>
+<label><input name="ct3en" type="checkbox" value="1" style="width:auto"> CT3 connected</label><select name="ct3"><option>50</option><option>100</option><option>150</option></select>
+<label><input name="ct4en" type="checkbox" value="1" style="width:auto"> CT4 connected</label><select name="ct4"><option>50</option><option>100</option><option>150</option></select>
+<label><input name="ct5en" type="checkbox" value="1" style="width:auto"> CT5 connected</label><select name="ct5"><option>50</option><option>100</option><option>150</option></select>
+<label><input name="ct6en" type="checkbox" value="1" style="width:auto"> CT6 connected</label><select name="ct6"><option>50</option><option>100</option><option>150</option></select>
 <label>Send Interval (1-60s)</label><input name="int" type="number" value="1" min="1" max="60">
 <label>Timezone</label><input name="tz" value="UTC">
 <button type="submit">Save & Connect</button></form></body></html>
@@ -152,12 +152,20 @@ void _handleSave() {
     _prefs.putString("loc", _apServer.arg("loc"));
     _prefs.putString("url", url);
     _prefs.putFloat("volt", volt);
+    uint8_t ctMask = 0;
     for (int i = 0; i < 6; i++) {
         char name[4]; snprintf(name, sizeof(name), "ct%d", i + 1);
+        char enabledName[6]; snprintf(enabledName, sizeof(enabledName), "ct%den", i + 1);
+        if (_apServer.hasArg(enabledName)) ctMask |= (1u << i);
         int rating = _apServer.arg(name).toInt();
         if (rating != 50 && rating != 100 && rating != 150) rating = 50;
         _prefs.putInt(name, rating);
     }
+    uint32_t ctRevision = _prefs.getUInt("ctrev", 0) + 1;
+    if (ctRevision == 0) ctRevision = 1;
+    _prefs.putUChar("ctmask", ctMask);
+    _prefs.putUInt("ctrev", ctRevision);
+    _prefs.putBool("ctcfg", true);
     _prefs.putInt("interval", interval);
     _prefs.putString("tz", _apServer.arg("tz"));
     _prefs.end();
@@ -179,7 +187,7 @@ bool _loadConfig() {
     _gridVoltage = _prefs.getFloat("volt", DEFAULT_GRID_VOLTAGE);
     for (int i = 0; i < 6; i++) {
         char key[4]; snprintf(key, sizeof(key), "ct%d", i + 1);
-        _ctRatings[i] = _prefs.getInt(key, 30);
+        _ctRatings[i] = _prefs.getInt(key, 50);
     }
     _sendInterval = _prefs.getInt("interval", DEFAULT_SEND_INTERVAL);
     _cfgTimezone = _prefs.getString("tz", "UTC");
