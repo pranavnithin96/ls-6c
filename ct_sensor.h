@@ -87,6 +87,7 @@ static bool _multiCalLoaded = false;
 // Forward declarations
 void feedWatchdog();
 static void loadChannelSlopes();   // defined below; called from initCTSensors
+static void loadDcCal();           // defined below; called from initCTSensors
 float getChannelSlope(int ch);
 
 // --- Waveform-stats feature flag (cached in RAM; NEVER read NVS in the 1Hz path) ---
@@ -109,6 +110,7 @@ void initCTSensors() {
     analogSetAttenuation(ADC_11db);
     loadWaveformStatsPref();
     loadChannelSlopes();
+    loadDcCal();
     loadSampleWindowPref();
 
     // Multi-cal load is kept for future use — default path doesn't touch _calPoints
@@ -226,6 +228,168 @@ bool setChannelSlope(int ch, float aPerCount) {
     return true;
 }
 float getChannelSlope(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _chSlope[ch] : 0.0f; }
+
+// ---------------------------------------------------------------------------
+// DC power special case (2.17.4.1). Some installs tap a line whose true power
+// is read off an external kWh meter rather than derived from amps*volts*pf —
+// e.g. a DC bus feeding a metered load. For those channels the trustworthy
+// relationship is count -> kW, fitted directly against the meter, with voltage
+// sag and sensor scaling already folded into the meter's own reading.
+//
+// When a channel's DC slope is set (nonzero), readAllCT reports:
+//     kW    = dcSlope * avgCount + dcOffset      (clamped at 0 below no-load)
+//     watts = kW * 1000, pf = 1.0, amps = watts / grid_voltage (bookkeeping)
+// All other channels keep the stock AC path untouched.
+//
+// Persisted in Preferences("ctcal") keys "d0".."d5" (slope, kW/count) and
+// "o0".."o5" (offset, kW); survives reboot and OTA like the AC slopes.
+// Calibration workflow over serial, points held in RAM until adopted:
+//     dcpoint <ch> <kW>   sample a fresh window NOW, pair it with the meter
+//     dcfit  <ch>         least-squares fit + R^2 over recorded points
+//     dcadopt <ch>        persist the fit as the channel's live cal
+//     dcset <ch> <s> <o>  manual set (0 0 clears -> stock AC path)
+//     dcshow / dcclear
+// ---------------------------------------------------------------------------
+#define DC_MAX_POINTS 12
+struct DcPoint { float count; float kw; };
+static float _dcKwSlope[NUM_CT_CHANNELS]  = {0};   // kW per count; 0 = DC mode off
+static float _dcKwOffset[NUM_CT_CHANNELS] = {0};   // kW
+static DcPoint _dcPts[NUM_CT_CHANNELS][DC_MAX_POINTS];
+static int  _nDcPts[NUM_CT_CHANNELS] = {0};
+
+bool dcModeEnabled(int ch) {
+    return ch >= 0 && ch < NUM_CT_CHANNELS && _dcKwSlope[ch] != 0.0f;
+}
+
+static void loadDcCal() {
+    Preferences p; p.begin("ctcal", true);
+    for (int ch = 0; ch < NUM_CT_CHANNELS; ch++) {
+        char kd[4], ko[4];
+        snprintf(kd, sizeof(kd), "d%d", ch);
+        snprintf(ko, sizeof(ko), "o%d", ch);
+        _dcKwSlope[ch]  = p.getFloat(kd, 0.0f);
+        _dcKwOffset[ch] = p.getFloat(ko, 0.0f);
+        if (_dcKwSlope[ch] != 0.0f)
+            Serial.printf("[DC] CH%d cal: kW = %.6f*count %+.3f\n",
+                          ch + 1, _dcKwSlope[ch], _dcKwOffset[ch]);
+    }
+    p.end();
+}
+
+// Set (or clear with 0 0) a channel's DC kW calibration — live AND persisted.
+// Slope range covers taps from watts-scale bench rigs to MW-scale buses;
+// offset bounded so a fat-fingered value can't fabricate a phantom megawatt.
+bool setDcCal(int ch, float kwPerCount, float offsetKw) {
+    if (ch < 0 || ch >= NUM_CT_CHANNELS) return false;
+    bool clearing = (kwPerCount == 0.0f && offsetKw == 0.0f);
+    if (!clearing) {
+        if (kwPerCount <= 0.0f || kwPerCount > 10.0f) return false;
+        if (fabsf(offsetKw) > 1000.0f) return false;
+    }
+    _dcKwSlope[ch]  = kwPerCount;
+    _dcKwOffset[ch] = offsetKw;
+    Preferences p; p.begin("ctcal", false);
+    char kd[4], ko[4];
+    snprintf(kd, sizeof(kd), "d%d", ch);
+    snprintf(ko, sizeof(ko), "o%d", ch);
+    p.putFloat(kd, kwPerCount);
+    p.putFloat(ko, offsetKw);
+    p.end();
+    if (clearing) Serial.printf("[DC] CH%d cal cleared -> stock AC path\n", ch + 1);
+    else Serial.printf("[DC] CH%d cal set: kW = %.6f*count %+.3f\n", ch + 1, kwPerCount, offsetKw);
+    return true;
+}
+float getDcSlope(int ch)  { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcKwSlope[ch]  : 0.0f; }
+float getDcOffset(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcKwOffset[ch] : 0.0f; }
+
+// Average RAW counts over one full window, same cadence as readAllCT — raw
+// analogRead, never analogReadMilliVolts (the fit must live in count space).
+static float dcSampleAvgCount(int ch) {
+    uint32_t sum = 0;
+    unsigned long t0 = micros();
+    for (int i = 0; i < ADC_SAMPLES_PER_CH; i++) {
+        sum += (uint16_t)analogRead(CT_PINS[ch]);
+        while (micros() < t0 + (unsigned long)((i + 1) * SAMPLE_INTERVAL_US)) {}
+        if (i % 100 == 0) feedWatchdog();
+    }
+    return (float)sum / ADC_SAMPLES_PER_CH;
+}
+
+static bool dcFitPoints(int ch, float& A, float& B, float& r2) {
+    int n = _nDcPts[ch];
+    if (n < 2) return false;
+    double Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
+    for (int i = 0; i < n; i++) {
+        double x = _dcPts[ch][i].count, y = _dcPts[ch][i].kw;
+        Sx += x; Sy += y; Sxx += x * x; Sxy += x * y;
+    }
+    double denom = n * Sxx - Sx * Sx;
+    if (fabs(denom) < 1e-9) return false;              // all points at one count
+    A = (float)((n * Sxy - Sx * Sy) / denom);
+    B = (float)((Sy - A * Sx) / n);
+    double meanY = Sy / n, ssTot = 0, ssRes = 0;
+    for (int i = 0; i < n; i++) {
+        double y = _dcPts[ch][i].kw, yh = A * _dcPts[ch][i].count + B;
+        ssTot += (y - meanY) * (y - meanY);
+        ssRes += (y - yh) * (y - yh);
+    }
+    r2 = (ssTot > 1e-12) ? (float)(1.0 - ssRes / ssTot) : 1.0f;
+    return true;
+}
+
+void dcPrintFit(int ch) {
+    float A, B, r2;
+    Serial.printf("[DC] CH%d fit (%d points):\n", ch + 1, _nDcPts[ch]);
+    if (!dcFitPoints(ch, A, B, r2)) {
+        Serial.println("  need >=2 points at different loads");
+        return;
+    }
+    Serial.printf("  kW = %.6f * count %+.3f   (R^2 = %.5f)\n", A, B, r2);
+    if (B > 0.0f)
+        Serial.printf("  ** +%.2f kW at zero count — record a low/zero-load dcpoint to pin the offset **\n", B);
+    Serial.println("  count |  true kW |  fit kW  (err)");
+    for (int i = 0; i < _nDcPts[ch]; i++) {
+        float c = _dcPts[ch][i].count, t = _dcPts[ch][i].kw, f = A * c + B;
+        Serial.printf("  %5.0f | %8.2f | %8.2f (%+.2f)\n", c, t, f, f - t);
+    }
+    Serial.printf("  'dcadopt %d' to make this live\n", ch + 1);
+}
+
+// Record a synchronized (count, kW) pair: samples a fresh window RIGHT NOW, so
+// call it while reading the meter — the pairing is only as good as that moment.
+void dcRecordPoint(int ch, float kw) {
+    if (ch < 0 || ch >= NUM_CT_CHANNELS || kw < 0.0f) {
+        Serial.println("[DC] invalid channel/kW");
+        return;
+    }
+    if (_nDcPts[ch] >= DC_MAX_POINTS) {
+        Serial.printf("[DC] CH%d point buffer full — 'dcclear %d' first\n", ch + 1, ch + 1);
+        return;
+    }
+    float c = dcSampleAvgCount(ch);
+    _dcPts[ch][_nDcPts[ch]++] = {c, kw};
+    Serial.printf("[DC] CH%d point %d: count=%.1f  meter=%.2f kW\n", ch + 1, _nDcPts[ch], c, kw);
+    if (_nDcPts[ch] >= 2) dcPrintFit(ch);
+}
+
+bool dcAdoptFit(int ch) {
+    float A, B, r2;
+    if (ch < 0 || ch >= NUM_CT_CHANNELS || !dcFitPoints(ch, A, B, r2)) {
+        Serial.println("[DC] no fit to adopt — need >=2 dcpoints");
+        return false;
+    }
+    if (!setDcCal(ch, A, B)) {
+        Serial.printf("[DC] fit rejected by sanity range (slope %.6f, offset %.3f)\n", A, B);
+        return false;
+    }
+    return true;
+}
+
+void dcClearPoints(int ch) {
+    if (ch < 0 || ch >= NUM_CT_CHANNELS) return;
+    _nDcPts[ch] = 0;
+    Serial.printf("[DC] CH%d points cleared (persisted cal untouched)\n", ch + 1);
+}
 
 static inline float ctSlope(int ch, int rating) {
     if (_chSlope[ch] > 0.0f) return _chSlope[ch];    // measured per-sensor slope wins
@@ -422,11 +586,24 @@ AllCTReadings readAllCT(float grid_voltage) {
         // Guard against NaN/Inf only
         if (isnan(amps) || isinf(amps)) amps = 0.0f;
 
-        float power = grid_voltage * amps * DEFAULT_PF;
+        float power;
+        if (_dcKwSlope[ch] != 0.0f) {
+            // DC special case (2.17.4.1): count -> kW fitted directly against
+            // the external meter. Clamp below zero — the fitted offset can dip
+            // a hair negative at true no-load, and negative power is noise here.
+            float kw = _dcKwSlope[ch] * avgCount + _dcKwOffset[ch];
+            if (kw < 0.0f || isnan(kw) || isinf(kw)) kw = 0.0f;
+            power = kw * 1000.0f;
+            // amps back-derived for payload consistency; meter kW is the truth.
+            amps = (grid_voltage > 1.0f) ? power / grid_voltage : 0.0f;
+            r.pf = 1.0f;
+        } else {
+            power = grid_voltage * amps * DEFAULT_PF;
+            r.pf = DEFAULT_PF;
+        }
         r.avg_mv = (int)avgCount;  // Field name kept for compat — now stores avg count
         r.amps = amps;
         r.watts = power;
-        r.pf = DEFAULT_PF;
 
         // --- Waveform features, computed on the ENVELOPE (2.13.0) ---
         // These were previously computed on RAW ADC samples, which measured the

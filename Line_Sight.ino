@@ -196,6 +196,7 @@ void setup() {
     Serial.printf("  Voltage:   %.0fV | Interval: %ds\n", getGridVoltage(), getSendInterval());
     Serial.println("---------------------");
     Serial.println("Commands: status | setslope | slopes | calpoint | debug | reset | update");
+    Serial.println("DC cal:   dcpoint <ch> <kW> | dcfit <ch> | dcadopt <ch> | dcclear <ch> | dcset <ch> <s> <o> | dcshow");
     Serial.println("Monitoring started...\n");
 }
 
@@ -252,6 +253,42 @@ void loop() {
                 float s = getChannelSlope(i);
                 if (s > 0) Serial.printf("  CH%d: %.5f A/count (calibrated)\n", i + 1, s);
                 else       Serial.printf("  CH%d: rating default (%dA)\n", i + 1, getCtRating(i));
+            }
+        } else if (cmd.startsWith("dcpoint ")) {
+            int ch = 0; float kw = -1;
+            if (sscanf(cmd.c_str(), "dcpoint %d %f", &ch, &kw) == 2 &&
+                ch >= 1 && ch <= NUM_CT_CHANNELS && kw >= 0) {
+                dcRecordPoint(ch - 1, kw);   // samples a fresh window NOW
+            } else {
+                Serial.println("Usage: dcpoint <ch 1-6> <meter kW right now>  e.g. dcpoint 1 440");
+            }
+        } else if (cmd.startsWith("dcfit ")) {
+            int ch = cmd.substring(6).toInt();
+            if (ch >= 1 && ch <= NUM_CT_CHANNELS) dcPrintFit(ch - 1);
+            else Serial.println("Usage: dcfit <ch 1-6>");
+        } else if (cmd.startsWith("dcadopt ")) {
+            int ch = cmd.substring(8).toInt();
+            if (ch >= 1 && ch <= NUM_CT_CHANNELS) dcAdoptFit(ch - 1);
+            else Serial.println("Usage: dcadopt <ch 1-6>");
+        } else if (cmd.startsWith("dcclear ")) {
+            int ch = cmd.substring(8).toInt();
+            if (ch >= 1 && ch <= NUM_CT_CHANNELS) dcClearPoints(ch - 1);
+            else Serial.println("Usage: dcclear <ch 1-6>");
+        } else if (cmd.startsWith("dcset ")) {
+            int ch = 0; float s = -1, o = 0;
+            if (sscanf(cmd.c_str(), "dcset %d %f %f", &ch, &s, &o) == 3 &&
+                setDcCal(ch - 1, s, o)) {
+                // setDcCal prints the confirmation
+            } else {
+                Serial.println("Usage: dcset <ch 1-6> <kW/count> <kW offset>   (0 0 clears)");
+            }
+        } else if (cmd == "dcshow") {
+            Serial.println("Per-channel DC kW calibration (off = stock AC path):");
+            for (int i = 0; i < NUM_CT_CHANNELS; i++) {
+                if (dcModeEnabled(i))
+                    Serial.printf("  CH%d: kW = %.6f*count %+.3f\n", i + 1, getDcSlope(i), getDcOffset(i));
+                else
+                    Serial.printf("  CH%d: off\n", i + 1);
             }
         } else if (cmd == "test_offline") {
             int testSecs = 25;  // 25 readings = 2 full blocks (10 each) + 5 partial
