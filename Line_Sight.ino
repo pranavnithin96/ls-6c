@@ -181,6 +181,7 @@ void setup() {
 
     // 7. CT sensors
     initCTSensors();
+    applyDcDefaultsFor(getDeviceId());   // provisional DC cal for known DC-tap boards (no-op if already calibrated)
     wbInit();               // black-box ring (2.14.0) — one-time heap alloc
     feedWatchdog();
 

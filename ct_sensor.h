@@ -391,6 +391,26 @@ void dcClearPoints(int ch) {
     Serial.printf("[DC] CH%d points cleared (persisted cal untouched)\n", ch + 1);
 }
 
+// ---------------------------------------------------------------------------
+// Factory-default DC cal for known DC-tap installs (2.17.4.1). Applied at boot
+// ONLY when the channel has no stored cal, so a real dcadopt / set_dc_cal
+// always wins and is never clobbered. This is how a fresh flash knows "this
+// board needs the DC path": the table below is keyed by provisioned device id.
+//
+// pcs_21 CH1 provisional: two-point fit from the 2026-08-31 bench sync
+// (count 1487 <-> 440 kW, count 1805 <-> ~500 kW). Good to ~±7 kW inside the
+// 400-500 kW band; OVERREADS at low load (+159 kW at zero count) — replace
+// with a real multi-point dcfit/dcadopt (incl. a low-load point) or a server
+// set_dc_cal at the first opportunity.
+// ---------------------------------------------------------------------------
+void applyDcDefaultsFor(const String& deviceId) {
+    if (deviceId == "pcs_21" && _dcKwSlope[0] == 0.0f) {
+        if (setDcCal(0, 0.18868f, 159.43f))
+            Serial.println("[DC] CH1 PROVISIONAL cal applied (pcs_21 factory default)"
+                           " — refine with dcpoint/dcfit/dcadopt");
+    }
+}
+
 static inline float ctSlope(int ch, int rating) {
     if (_chSlope[ch] > 0.0f) return _chSlope[ch];    // measured per-sensor slope wins
     switch (rating) {

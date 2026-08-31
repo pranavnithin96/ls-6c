@@ -75,7 +75,30 @@ holding BOOT/IO0 low through a power-up. Board identity:
   v2.17.4.1.app` — drop the four bins into `Contents/Resources/firmware/` and
   double-click. After this one USB flash, all future updates are OTA.
 
-## DC calibration (after deploy, over serial or on-site)
+## How a board knows it needs DC calibration
+
+Two mechanisms, no site visit required for either:
+
+1. **Boot-time factory default (in this firmware).** `applyDcDefaultsFor()` runs at
+   startup: a board provisioned as **`pcs_21`** with no stored DC cal gets the
+   provisional CH1 cal (`kW = 0.18868*count + 159.43`) applied and persisted
+   automatically, and logs `[DC] CH1 PROVISIONAL cal applied`. It never overwrites
+   an existing cal, so later refinement always wins. Accuracy: ~±7 kW in the
+   400–500 kW band; **overreads at low load** (+159 kW at zero) — treat kWh totals
+   as provisional until refined.
+
+2. **Server push (heartbeat command).** The backend can set/refine any board's DC
+   cal remotely, same channel as `set_ct_slope`:
+
+   ```json
+   {"action":"set_dc_cal","channel":1,"slope":0.18868,"offset":159.43}
+   ```
+
+   Slope+offset `0,0` clears the channel back to the stock AC path. Persisted,
+   survives reboot and OTA. This is the intended path for pushing the refined fit
+   once real calibration points exist.
+
+## DC calibration (refining the provisional, over serial or on-site)
 
 ```
 dcpoint <ch> <kW>   # record a point: samples the ADC at that moment, pair with

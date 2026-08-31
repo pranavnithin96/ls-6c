@@ -266,6 +266,17 @@ void processCommands(const String& responseBody) {
             float val = cmd["value"] | -1.0f;
             if (!setChannelSlope(ch - 1, val))
                 logError("set_ct_slope rejected: bad channel/slope");
+        } else if (action == "set_dc_cal") {
+            // Remote DC kW calibration (2.17.4.1): the backend knows which
+            // boards tap a metered DC line and can push/refine their cal
+            // without a site visit, mirroring set_ct_slope.
+            // {"action":"set_dc_cal","channel":1-6,"slope":<kW/count>,"offset":<kW>}
+            // slope 0 + offset 0 clears the channel back to the stock AC path.
+            int ch = cmd["channel"] | -1;
+            float slope = cmd["slope"] | -1.0f;
+            float offset = cmd["offset"] | 0.0f;
+            if (!setDcCal(ch - 1, slope, offset))
+                logError("set_dc_cal rejected: bad channel/slope/offset");
         } else if (action == "set_window_ms") {
             // Sampling window 500-900ms in 100ms steps (2.14.0). Persisted;
             // wider = less blind time per second, less loop-idle headroom.
