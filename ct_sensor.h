@@ -257,12 +257,30 @@ static float _dcKwOffset[NUM_CT_CHANNELS] = {0};   // LOW range offset, kW
 static float _dcHiSlope[NUM_CT_CHANNELS]  = {0};   // HIGH range (11dB ADC): kW per count
 static float _dcHiOffset[NUM_CT_CHANNELS] = {0};   // HIGH range offset, kW
 static uint8_t _dcLastRange[NUM_CT_CHANNELS] = {0}; // 0 = low (0dB) used last window, 1 = high (11dB)
+static bool    _dcEnabled[NUM_CT_CHANNELS]   = {0}; // DC mode on (persisted "e%d"); reports 0 kW until a line is set
+static float   _dcLastCount[NUM_CT_CHANNELS] = {0}; // count that produced the last reported kW (remote dc_point uses it)
 #define DC_LOW_SATURATE 3900.0f   // 0dB count above which the low range is clipping -> use high
 static DcPoint _dcPts[NUM_CT_CHANNELS][DC_MAX_POINTS];
 static int  _nDcPts[NUM_CT_CHANNELS] = {0};
 
 bool dcModeEnabled(int ch) {
-    return ch >= 0 && ch < NUM_CT_CHANNELS && _dcKwSlope[ch] != 0.0f;
+    return ch >= 0 && ch < NUM_CT_CHANNELS && (_dcEnabled[ch] || _dcKwSlope[ch] != 0.0f);
+}
+float getDcLastCount(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcLastCount[ch] : 0.0f; }
+int   getDcPointCount(int ch);   // defined below
+
+// Remote/serial: switch a channel to the DC path before it has a calibration.
+// It then reports 0 kW (honest) instead of the AC formula's garbage, and
+// dc_point can start collecting pairs. Persisted.
+bool setDcEnabled(int ch, bool on) {
+    if (ch < 0 || ch >= NUM_CT_CHANNELS) return false;
+    _dcEnabled[ch] = on;
+    Preferences p; p.begin("ctcal", false);
+    char ke[4]; snprintf(ke, sizeof(ke), "e%d", ch);
+    p.putBool(ke, on);
+    p.end();
+    Serial.printf("[DC] CH%d DC mode %s\n", ch + 1, on ? "ENABLED (reports 0 until calibrated)" : "disabled");
+    return true;
 }
 
 static void loadDcCal() {
@@ -278,6 +296,8 @@ static void loadDcCal() {
         snprintf(kg, sizeof(kg), "g%d", ch);
         _dcHiSlope[ch]  = p.getFloat(kh, 0.0f);
         _dcHiOffset[ch] = p.getFloat(kg, 0.0f);
+        char ke[4]; snprintf(ke, sizeof(ke), "e%d", ch);
+        _dcEnabled[ch]  = p.getBool(ke, false);
         if (_dcKwSlope[ch] != 0.0f)
             Serial.printf("[DC] CH%d cal LOW(0dB): kW = %.6f*count %+.3f | HIGH(11dB): %.6f*count %+.3f\n",
                           ch + 1, _dcKwSlope[ch], _dcKwOffset[ch], _dcHiSlope[ch], _dcHiOffset[ch]);
@@ -377,6 +397,19 @@ static bool dcFitPoints(int ch, uint8_t range, float& A, float& B, float& r2, in
     return true;
 }
 
+// One-line fit summary for the heartbeat error/info log (server-visible).
+String dcFitSummary(int ch) {
+    String out = "CH" + String(ch + 1) + " fit:";
+    for (uint8_t rg = 0; rg < 2; rg++) {
+        float A, B, r2; int n;
+        if (dcFitPoints(ch, rg, A, B, r2, n))
+            out += String(rg ? " HIGH " : " LOW ") + "kW=" + String(A, 6) + "*c" + (B >= 0 ? "+" : "") + String(B, 2) + " R2=" + String(r2, 4) + " n=" + String(n) + ";";
+        else
+            out += String(rg ? " HIGH" : " LOW") + " n=" + String(n) + " (need>=2);";
+    }
+    return out;
+}
+
 void dcPrintFit(int ch) {
     for (uint8_t rg = 0; rg < 2; rg++) {
         float A, B, r2; int n;
@@ -428,6 +461,8 @@ bool dcAdoptFit(int ch) {
     if (!any) Serial.println("[DC] nothing adopted — need >=2 dcpoints in a range");
     return any;
 }
+
+int getDcPointCount(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _nDcPts[ch] : 0; }
 
 void dcClearPoints(int ch) {
     if (ch < 0 || ch >= NUM_CT_CHANNELS) return;
@@ -658,7 +693,7 @@ AllCTReadings readAllCT(float grid_voltage) {
         if (isnan(amps) || isinf(amps)) amps = 0.0f;
 
         float power;
-        if (_dcKwSlope[ch] != 0.0f) {
+        if (_dcEnabled[ch] || _dcKwSlope[ch] != 0.0f) {
             // DC special case (2.17.4.1): count -> kW fitted directly against
             // the external meter. Clamp below zero — the fitted offset can dip
             // a hair negative at true no-load, and negative power is noise here.
@@ -676,13 +711,15 @@ AllCTReadings readAllCT(float grid_voltage) {
             float kw, used;
             if (loCount < DC_LOW_SATURATE) {
                 _dcLastRange[ch] = 0; used = loCount;
-                kw = (used < 1.0f) ? 0.0f : _dcKwSlope[ch] * used + _dcKwOffset[ch];
+                kw = (used < 1.0f || _dcKwSlope[ch] == 0.0f) ? 0.0f
+                   : _dcKwSlope[ch] * used + _dcKwOffset[ch];
             } else {
                 _dcLastRange[ch] = 1; used = avgCount;
                 kw = (_dcHiSlope[ch] == 0.0f) ? 0.0f
                    : (used < 1.0f) ? 0.0f : _dcHiSlope[ch] * used + _dcHiOffset[ch];
             }
             avgCount = used;   // report the count the kW came from (dcpoint pairs against it)
+            _dcLastCount[ch] = used;
             if (kw < 0.0f || isnan(kw) || isinf(kw)) kw = 0.0f;
             power = kw * 1000.0f;
             // amps back-derived for payload consistency; meter kW is the truth.

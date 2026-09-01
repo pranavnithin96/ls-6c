@@ -151,3 +151,32 @@ window and use it with a LOW-range line; when it saturates (~1 V at the pin), th
   `set_dc_cal` heartbeat accepts `"range":"high"`.
 - NVS on pcs_21 already holds a cal, so the factory default does not auto-apply
   there; both lines were set over serial on 2026-09-02.
+
+## Remote (wireless) DC calibration — for every furnace board
+
+No serial cable needed. Everything goes through the heartbeat command channel the
+server already uses (same as `set_ct_slope`). Each command executes on the board's
+next heartbeat (≤60 s), so send `dc_point` while the meter is steady.
+
+```json
+{"action":"dc_enable","channel":1,"on":true}   // 1. put CH1 on the DC path (reports 0 kW until calibrated)
+{"action":"dc_point","channel":1,"kw":100}     // 2. "the meter reads 100 kW now" — pairs with the board's latest count
+{"action":"dc_point","channel":1,"kw":150}     //    ...repeat at 2+ different steady loads (3-4 is better)
+{"action":"dc_fit","channel":1}                // 3. reports slope/offset/R²/n per range
+{"action":"dc_adopt","channel":1}              // 4. persists the fit as the live calibration
+{"action":"dc_clear","channel":1}              //    discard RAM points and start over
+{"action":"set_dc_cal","channel":1,"slope":s,"offset":o[,"range":"high"]}   // set a line directly
+```
+
+Results come back in the board's heartbeat error/info log as `[DC] ...` lines
+(point recorded + running fit, fit summary, adopted lines). Every heartbeat also
+carries `dc_cal`: per DC channel `{ch, lo_slope, lo_off, hi_slope, hi_off, range,
+count, points}` — the server can show live calibration state per furnace.
+
+Serial equivalents for bench work: `dcon/dcoff <ch>`, `dcpoint`, `dcfit`, `dcadopt`,
+`dcclear`, `dcset`, `dchset`, `dcshow`, `raw`.
+
+Ranges: the board reads DC channels at the 0 dB ADC range (LOW line) and falls
+back to 11 dB (HIGH line) when that saturates (~1 V at the pin). Points are tagged
+by the range that produced them, so gather LOW points at low/mid loads and HIGH
+points during melts; each range fits and adopts independently.

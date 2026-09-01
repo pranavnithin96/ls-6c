@@ -280,6 +280,38 @@ void processCommands(const String& responseBody) {
             bool ok = (strcmp(rg, "high") == 0) ? setDcHiCal(ch - 1, slope, offset)
                                                  : setDcCal(ch - 1, slope, offset);
             if (!ok) logError("set_dc_cal rejected: bad channel/slope/offset");
+        } else if (action == "dc_enable") {
+            // {"action":"dc_enable","channel":1,"on":true}  — put the channel on the DC path
+            // (reports 0 kW until calibrated). First step for a new furnace board.
+            int ch = cmd["channel"] | -1; bool on = cmd["on"] | true;
+            if (setDcEnabled(ch - 1, on)) logError("[DC] CH" + String(ch) + (on ? " enabled" : " disabled"));
+            else logError("dc_enable rejected: bad channel");
+        } else if (action == "dc_point") {
+            // {"action":"dc_point","channel":1,"kw":150}  — "the meter reads 150 kW right now":
+            // pairs it with the count the board reported in its latest 1s window.
+            // Executes on the heartbeat after the server queues it (<=60s), so send it
+            // while the load is steady. Points live in RAM until dc_adopt.
+            int ch = cmd["channel"] | -1; float kw = cmd["kw"] | -1.0f;
+            if (ch >= 1 && ch <= NUM_CT_CHANNELS && kw >= 0.0f && dcModeEnabled(ch - 1)) {
+                float c = getDcLastCount(ch - 1);
+                dcRecordPoint(ch - 1, kw, c);
+                logError("[DC] CH" + String(ch) + " point " + String(getDcPointCount(ch - 1)) + ": count=" + String(c, 1)
+                         + " kW=" + String(kw, 2) + " [" + (getDcLastRange(ch - 1) ? "HIGH" : "LOW") + "] | " + dcFitSummary(ch - 1));
+            } else logError("dc_point rejected: bad channel/kW or DC mode off (send dc_enable first)");
+        } else if (action == "dc_fit") {
+            int ch = cmd["channel"] | -1;
+            if (ch >= 1 && ch <= NUM_CT_CHANNELS) logError("[DC] " + dcFitSummary(ch - 1));
+            else logError("dc_fit rejected: bad channel");
+        } else if (action == "dc_adopt") {
+            // persist whichever range(s) have >=2 points as the live calibration
+            int ch = cmd["channel"] | -1;
+            if (ch >= 1 && ch <= NUM_CT_CHANNELS && dcAdoptFit(ch - 1))
+                logError("[DC] CH" + String(ch) + " adopted: LOW " + String(getDcSlope(ch - 1), 6) + "*c+" + String(getDcOffset(ch - 1), 2)
+                         + " HIGH " + String(getDcHiSlope(ch - 1), 6) + "*c+" + String(getDcHiOffset(ch - 1), 2));
+            else logError("dc_adopt: nothing to adopt (need >=2 dc_points in a range)");
+        } else if (action == "dc_clear") {
+            int ch = cmd["channel"] | -1;
+            if (ch >= 1 && ch <= NUM_CT_CHANNELS) { dcClearPoints(ch - 1); logError("[DC] CH" + String(ch) + " points cleared"); }
         } else if (action == "set_window_ms") {
             // Sampling window 500-900ms in 100ms steps (2.14.0). Persisted;
             // wider = less blind time per second, less loop-idle headroom.
@@ -354,6 +386,20 @@ void sendHeartbeat() {
     doc["total_failed"] = getTotalFailed();
     doc["total_dropped"] = getTotalDropped();
     doc["ct_calibrated"] = isCTCalibrated();
+    // DC-tap channels (2.17.4.1): current lines, range in use, last count, RAM points.
+    // Lets the server show each furnace board's calibration state and drive
+    // dc_enable / dc_point / dc_fit / dc_adopt without a site visit.
+    { JsonArray dcs = doc["dc_cal"].to<JsonArray>();
+      for (int i = 0; i < NUM_CT_CHANNELS; i++) {
+          if (!dcModeEnabled(i)) continue;
+          JsonObject d = dcs.add<JsonObject>();
+          d["ch"] = i + 1;
+          d["lo_slope"] = getDcSlope(i);   d["lo_off"] = getDcOffset(i);
+          d["hi_slope"] = getDcHiSlope(i); d["hi_off"] = getDcHiOffset(i);
+          d["range"] = getDcLastRange(i) ? "high" : "low";
+          d["count"] = serialized(String(getDcLastCount(i), 1));
+          d["points"] = getDcPointCount(i);
+      } }
     doc["crash_count"] = getCrashCount();
     doc["wfstats"] = waveformStatsEnabled();          // waveform feature state
     struct tm _tsync; doc["clock_synced"] = getLocalTime(&_tsync, 0);

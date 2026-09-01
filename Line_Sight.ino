@@ -198,7 +198,7 @@ void setup() {
     Serial.printf("  Voltage:   %.0fV | Interval: %ds\n", getGridVoltage(), getSendInterval());
     Serial.println("---------------------");
     Serial.println("Commands: status | setslope | slopes | calpoint | debug | reset | update");
-    Serial.println("DC cal:   raw | dcpoint <ch> <kW> | dcfit <ch> | dcadopt <ch> | dcclear <ch> | dcset/dchset <ch> <s> <o> | dcshow");
+    Serial.println("DC cal:   raw | dcpoint <ch> <kW> | dcfit <ch> | dcadopt <ch> | dcclear <ch> | dcset/dchset <ch> <s> <o> | dcon/dcoff <ch> | dcshow");
     Serial.println("Monitoring started...\n");
 }
 
@@ -296,6 +296,11 @@ void loop() {
             } else {
                 Serial.println("Usage: dchset <ch 1-6> <kW/count> <kW offset>   (HIGH/11dB range; 0 0 clears)");
             }
+        } else if (cmd.startsWith("dcon ") || cmd.startsWith("dcoff ")) {
+            bool on = cmd.startsWith("dcon ");
+            int ch = cmd.substring(on ? 5 : 6).toInt();
+            if (!(ch >= 1 && ch <= NUM_CT_CHANNELS && setDcEnabled(ch - 1, on)))
+                Serial.println("Usage: dcon <ch 1-6> | dcoff <ch 1-6>");
         } else if (cmd == "dcshow") {
             Serial.println("Per-channel DC kW calibration (off = stock AC path):");
             for (int i = 0; i < NUM_CT_CHANNELS; i++) {
