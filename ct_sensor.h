@@ -251,9 +251,13 @@ float getChannelSlope(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _chSl
 //     dcshow / dcclear
 // ---------------------------------------------------------------------------
 #define DC_MAX_POINTS 12
-struct DcPoint { float count; float kw; };
-static float _dcKwSlope[NUM_CT_CHANNELS]  = {0};   // kW per count; 0 = DC mode off
-static float _dcKwOffset[NUM_CT_CHANNELS] = {0};   // kW
+struct DcPoint { float count; float kw; uint8_t range; };   // range: 0 = low(0dB), 1 = high(11dB)
+static float _dcKwSlope[NUM_CT_CHANNELS]  = {0};   // LOW range (0dB ADC): kW per count; 0 = DC mode off
+static float _dcKwOffset[NUM_CT_CHANNELS] = {0};   // LOW range offset, kW
+static float _dcHiSlope[NUM_CT_CHANNELS]  = {0};   // HIGH range (11dB ADC): kW per count
+static float _dcHiOffset[NUM_CT_CHANNELS] = {0};   // HIGH range offset, kW
+static uint8_t _dcLastRange[NUM_CT_CHANNELS] = {0}; // 0 = low (0dB) used last window, 1 = high (11dB)
+#define DC_LOW_SATURATE 3900.0f   // 0dB count above which the low range is clipping -> use high
 static DcPoint _dcPts[NUM_CT_CHANNELS][DC_MAX_POINTS];
 static int  _nDcPts[NUM_CT_CHANNELS] = {0};
 
@@ -269,9 +273,14 @@ static void loadDcCal() {
         snprintf(ko, sizeof(ko), "o%d", ch);
         _dcKwSlope[ch]  = p.getFloat(kd, 0.0f);
         _dcKwOffset[ch] = p.getFloat(ko, 0.0f);
+        char kh[4], kg[4];
+        snprintf(kh, sizeof(kh), "h%d", ch);
+        snprintf(kg, sizeof(kg), "g%d", ch);
+        _dcHiSlope[ch]  = p.getFloat(kh, 0.0f);
+        _dcHiOffset[ch] = p.getFloat(kg, 0.0f);
         if (_dcKwSlope[ch] != 0.0f)
-            Serial.printf("[DC] CH%d cal: kW = %.6f*count %+.3f\n",
-                          ch + 1, _dcKwSlope[ch], _dcKwOffset[ch]);
+            Serial.printf("[DC] CH%d cal LOW(0dB): kW = %.6f*count %+.3f | HIGH(11dB): %.6f*count %+.3f\n",
+                          ch + 1, _dcKwSlope[ch], _dcKwOffset[ch], _dcHiSlope[ch], _dcHiOffset[ch]);
     }
     p.end();
 }
@@ -299,23 +308,67 @@ bool setDcCal(int ch, float kwPerCount, float offsetKw) {
     else Serial.printf("[DC] CH%d cal set: kW = %.6f*count %+.3f\n", ch + 1, kwPerCount, offsetKw);
     return true;
 }
+// High-range (11dB) line, used when the 0dB read saturates. Same sanity bounds.
+bool setDcHiCal(int ch, float kwPerCount, float offsetKw) {
+    if (ch < 0 || ch >= NUM_CT_CHANNELS) return false;
+    bool clearing = (kwPerCount == 0.0f && offsetKw == 0.0f);
+    if (!clearing) {
+        if (kwPerCount <= 0.0f || kwPerCount > 10.0f) return false;
+        if (fabsf(offsetKw) > 1000.0f) return false;
+    }
+    _dcHiSlope[ch]  = kwPerCount;
+    _dcHiOffset[ch] = offsetKw;
+    Preferences p; p.begin("ctcal", false);
+    char kh[4], kg[4];
+    snprintf(kh, sizeof(kh), "h%d", ch);
+    snprintf(kg, sizeof(kg), "g%d", ch);
+    p.putFloat(kh, kwPerCount);
+    p.putFloat(kg, offsetKw);
+    p.end();
+    Serial.printf("[DC] CH%d HIGH-range cal %s: kW = %.6f*count %+.3f\n", ch + 1,
+                  clearing ? "cleared" : "set", kwPerCount, offsetKw);
+    return true;
+}
+float getDcHiSlope(int ch)  { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcHiSlope[ch]  : 0.0f; }
+float getDcHiOffset(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcHiOffset[ch] : 0.0f; }
+int   getDcLastRange(int ch){ return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcLastRange[ch] : 0; }
+
+// Low-range burst: 100 samples at 0dB attenuation (~0-1.1V full scale, ~3x the
+// resolution of 11dB and no 11dB dead zone), 1kHz cadence, then restore 11dB so
+// the next interleaved AC window is unaffected. ~100ms per DC channel per second.
+static float dcLowRangeCount(int ch) {
+    analogSetPinAttenuation(CT_PINS[ch], ADC_0db);
+    uint32_t sum = 0;
+    unsigned long t0 = micros();
+    for (int i = 0; i < 100; i++) {
+        sum += (uint16_t)analogRead(CT_PINS[ch]);
+        while (micros() < t0 + (unsigned long)((i + 1) * 1000)) {}
+    }
+    analogSetPinAttenuation(CT_PINS[ch], ADC_11db);
+    feedWatchdog();
+    return (float)sum / 100.0f;
+}
 float getDcSlope(int ch)  { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcKwSlope[ch]  : 0.0f; }
 float getDcOffset(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcKwOffset[ch] : 0.0f; }
 
-static bool dcFitPoints(int ch, float& A, float& B, float& r2) {
-    int n = _nDcPts[ch];
-    if (n < 2) return false;
+// Least-squares over this channel's points that belong to ONE range.
+static bool dcFitPoints(int ch, uint8_t range, float& A, float& B, float& r2, int& nOut) {
+    int n = 0;
     double Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < _nDcPts[ch]; i++) {
+        if (_dcPts[ch][i].range != range) continue;
         double x = _dcPts[ch][i].count, y = _dcPts[ch][i].kw;
-        Sx += x; Sy += y; Sxx += x * x; Sxy += x * y;
+        Sx += x; Sy += y; Sxx += x * x; Sxy += x * y; n++;
     }
+    nOut = n;
+    if (n < 2) return false;
     double denom = n * Sxx - Sx * Sx;
     if (fabs(denom) < 1e-9) return false;              // all points at one count
     A = (float)((n * Sxy - Sx * Sy) / denom);
     B = (float)((Sy - A * Sx) / n);
     double meanY = Sy / n, ssTot = 0, ssRes = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < _nDcPts[ch]; i++) {
+        if (_dcPts[ch][i].range != range) continue;
         double y = _dcPts[ch][i].kw, yh = A * _dcPts[ch][i].count + B;
         ssTot += (y - meanY) * (y - meanY);
         ssRes += (y - yh) * (y - yh);
@@ -325,21 +378,22 @@ static bool dcFitPoints(int ch, float& A, float& B, float& r2) {
 }
 
 void dcPrintFit(int ch) {
-    float A, B, r2;
-    Serial.printf("[DC] CH%d fit (%d points):\n", ch + 1, _nDcPts[ch]);
-    if (!dcFitPoints(ch, A, B, r2)) {
-        Serial.println("  need >=2 points at different loads");
-        return;
+    for (uint8_t rg = 0; rg < 2; rg++) {
+        float A, B, r2; int n;
+        bool ok = dcFitPoints(ch, rg, A, B, r2, n);
+        Serial.printf("[DC] CH%d %s-range fit (%d points):\n", ch + 1, rg ? "HIGH(11dB)" : "LOW(0dB)", n);
+        if (!ok) { Serial.println(n < 2 ? "  need >=2 points at different loads in this range" : "  degenerate"); continue; }
+        Serial.printf("  kW = %.6f * count %+.3f   (R^2 = %.5f)\n", A, B, r2);
+        if (rg == 0 && B > 2.0f)
+            Serial.printf("  ** +%.2f kW at zero count in LOW range — record a zero-load dcpoint **\n", B);
+        Serial.println("  count |  true kW |  fit kW  (err)");
+        for (int i = 0; i < _nDcPts[ch]; i++) {
+            if (_dcPts[ch][i].range != rg) continue;
+            float c = _dcPts[ch][i].count, t = _dcPts[ch][i].kw, f = A * c + B;
+            Serial.printf("  %5.0f | %8.2f | %8.2f (%+.2f)\n", c, t, f, f - t);
+        }
     }
-    Serial.printf("  kW = %.6f * count %+.3f   (R^2 = %.5f)\n", A, B, r2);
-    if (B > 0.0f)
-        Serial.printf("  ** +%.2f kW at zero count — record a low/zero-load dcpoint to pin the offset **\n", B);
-    Serial.println("  count |  true kW |  fit kW  (err)");
-    for (int i = 0; i < _nDcPts[ch]; i++) {
-        float c = _dcPts[ch][i].count, t = _dcPts[ch][i].kw, f = A * c + B;
-        Serial.printf("  %5.0f | %8.2f | %8.2f (%+.2f)\n", c, t, f, f - t);
-    }
-    Serial.printf("  'dcadopt %d' to make this live\n", ch + 1);
+    Serial.printf("  'dcadopt %d' adopts every range that has a fit\n", ch + 1);
 }
 
 // Record a synchronized (count, kW) pair. countNow is the LAST readAllCT()
@@ -358,23 +412,21 @@ void dcRecordPoint(int ch, float kw, float countNow) {
         Serial.printf("[DC] CH%d point buffer full — 'dcclear %d' first\n", ch + 1, ch + 1);
         return;
     }
-    float c = countNow;
-    _dcPts[ch][_nDcPts[ch]++] = {c, kw};
-    Serial.printf("[DC] CH%d point %d: count=%.1f  meter=%.2f kW\n", ch + 1, _nDcPts[ch], c, kw);
+    uint8_t rg = _dcLastRange[ch];               // the range the reported count came from
+    _dcPts[ch][_nDcPts[ch]++] = {countNow, kw, rg};
+    Serial.printf("[DC] CH%d point %d [%s]: count=%.1f  meter=%.2f kW\n",
+                  ch + 1, _nDcPts[ch], rg ? "HIGH" : "LOW", countNow, kw);
     if (_nDcPts[ch] >= 2) dcPrintFit(ch);
 }
 
 bool dcAdoptFit(int ch) {
-    float A, B, r2;
-    if (ch < 0 || ch >= NUM_CT_CHANNELS || !dcFitPoints(ch, A, B, r2)) {
-        Serial.println("[DC] no fit to adopt — need >=2 dcpoints");
-        return false;
-    }
-    if (!setDcCal(ch, A, B)) {
-        Serial.printf("[DC] fit rejected by sanity range (slope %.6f, offset %.3f)\n", A, B);
-        return false;
-    }
-    return true;
+    if (ch < 0 || ch >= NUM_CT_CHANNELS) return false;
+    bool any = false;
+    float A, B, r2; int n;
+    if (dcFitPoints(ch, 0, A, B, r2, n)) { any |= setDcCal(ch, A, B); }
+    if (dcFitPoints(ch, 1, A, B, r2, n)) { any |= setDcHiCal(ch, A, B); }
+    if (!any) Serial.println("[DC] nothing adopted — need >=2 dcpoints in a range");
+    return any;
 }
 
 void dcClearPoints(int ch) {
@@ -400,8 +452,11 @@ void dcClearPoints(int ch) {
 // ---------------------------------------------------------------------------
 void applyDcDefaultsFor(const String& deviceId) {
     if (deviceId == "pcs_21" && _dcKwSlope[0] == 0.0f) {
-        if (setDcCal(0, 0.18868f, 159.43f))
-            Serial.println("[DC] CH1 factory cal applied (pcs_21 meter tap, above-knee model; 0 counts = 0 kW)"
+        // LOW (0dB): field 2026-09-02, wire-in furnace-off = 0 counts, 50 kW = 155 counts.
+        // HIGH (11dB): above-knee model from 1487<->440 kW, 1805<->~500 kW.
+        setDcHiCal(0, 0.18868f, 159.43f);
+        if (setDcCal(0, 0.32258f, 0.0f))
+            Serial.println("[DC] CH1 factory cal applied (pcs_21 meter tap: LOW 0dB line + HIGH 11dB line)"
                            " — refine anytime via dcpoint/dcfit/dcadopt or set_dc_cal");
     }
 }
@@ -613,8 +668,20 @@ AllCTReadings readAllCT(float grid_voltage) {
             // offset is that knee, NOT power at zero signal — so 0 counts must
             // report 0 kW, not the intercept. Below-knee loads are unmeasurable
             // on this input until the diode is bypassed.
-            float kw = (avgCount < 1.0f) ? 0.0f
-                     : _dcKwSlope[ch] * avgCount + _dcKwOffset[ch];
+            // Dual-range (2.17.4.1): the 11dB range is blind below ~0.15V at the
+            // pin (pcs_21: 50 kW = 0.15V read 0 counts). Take a 0dB burst; use
+            // it unless it saturates, then fall back to the 11dB window count.
+            float loCount = dcLowRangeCount(ch);
+            float kw, used;
+            if (loCount < DC_LOW_SATURATE) {
+                _dcLastRange[ch] = 0; used = loCount;
+                kw = (used < 1.0f) ? 0.0f : _dcKwSlope[ch] * used + _dcKwOffset[ch];
+            } else {
+                _dcLastRange[ch] = 1; used = avgCount;
+                kw = (_dcHiSlope[ch] == 0.0f) ? 0.0f
+                   : (used < 1.0f) ? 0.0f : _dcHiSlope[ch] * used + _dcHiOffset[ch];
+            }
+            avgCount = used;   // report the count the kW came from (dcpoint pairs against it)
             if (kw < 0.0f || isnan(kw) || isinf(kw)) kw = 0.0f;
             power = kw * 1000.0f;
             // amps back-derived for payload consistency; meter kW is the truth.

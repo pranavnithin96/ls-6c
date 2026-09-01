@@ -272,11 +272,14 @@ void processCommands(const String& responseBody) {
             // without a site visit, mirroring set_ct_slope.
             // {"action":"set_dc_cal","channel":1-6,"slope":<kW/count>,"offset":<kW>}
             // slope 0 + offset 0 clears the channel back to the stock AC path.
+            // optional "range":"high" targets the 11dB line; default is the 0dB (low) line
             int ch = cmd["channel"] | -1;
             float slope = cmd["slope"] | -1.0f;
             float offset = cmd["offset"] | 0.0f;
-            if (!setDcCal(ch - 1, slope, offset))
-                logError("set_dc_cal rejected: bad channel/slope/offset");
+            const char* rg = cmd["range"] | "low";
+            bool ok = (strcmp(rg, "high") == 0) ? setDcHiCal(ch - 1, slope, offset)
+                                                 : setDcCal(ch - 1, slope, offset);
+            if (!ok) logError("set_dc_cal rejected: bad channel/slope/offset");
         } else if (action == "set_window_ms") {
             // Sampling window 500-900ms in 100ms steps (2.14.0). Persisted;
             // wider = less blind time per second, less loop-idle headroom.

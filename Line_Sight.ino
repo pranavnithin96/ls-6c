@@ -198,7 +198,7 @@ void setup() {
     Serial.printf("  Voltage:   %.0fV | Interval: %ds\n", getGridVoltage(), getSendInterval());
     Serial.println("---------------------");
     Serial.println("Commands: status | setslope | slopes | calpoint | debug | reset | update");
-    Serial.println("DC cal:   raw | dcpoint <ch> <kW> | dcfit <ch> | dcadopt <ch> | dcclear <ch> | dcset <ch> <s> <o> | dcshow");
+    Serial.println("DC cal:   raw | dcpoint <ch> <kW> | dcfit <ch> | dcadopt <ch> | dcclear <ch> | dcset/dchset <ch> <s> <o> | dcshow");
     Serial.println("Monitoring started...\n");
 }
 
@@ -288,11 +288,21 @@ void loop() {
         } else if (cmd == "raw") {
             _rawPrint = !_rawPrint;
             Serial.printf("[CMD] raw ADC print: %s\n", _rawPrint ? "ON" : "OFF");
+        } else if (cmd.startsWith("dchset ")) {
+            int ch = 0; float sl = -1, o = 0;
+            if (sscanf(cmd.c_str(), "dchset %d %f %f", &ch, &sl, &o) == 3 &&
+                setDcHiCal(ch - 1, sl, o)) {
+                // setDcHiCal prints the confirmation
+            } else {
+                Serial.println("Usage: dchset <ch 1-6> <kW/count> <kW offset>   (HIGH/11dB range; 0 0 clears)");
+            }
         } else if (cmd == "dcshow") {
             Serial.println("Per-channel DC kW calibration (off = stock AC path):");
             for (int i = 0; i < NUM_CT_CHANNELS; i++) {
                 if (dcModeEnabled(i))
-                    Serial.printf("  CH%d: kW = %.6f*count %+.3f\n", i + 1, getDcSlope(i), getDcOffset(i));
+                    Serial.printf("  CH%d: LOW(0dB) kW = %.6f*count %+.3f | HIGH(11dB) kW = %.6f*count %+.3f | last=%s\n",
+                        i + 1, getDcSlope(i), getDcOffset(i), getDcHiSlope(i), getDcHiOffset(i),
+                        getDcLastRange(i) ? "HIGH" : "LOW");
                 else
                     Serial.printf("  CH%d: off\n", i + 1);
             }
