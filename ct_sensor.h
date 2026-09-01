@@ -397,17 +397,18 @@ void dcClearPoints(int ch) {
 // always wins and is never clobbered. This is how a fresh flash knows "this
 // board needs the DC path": the table below is keyed by provisioned device id.
 //
-// pcs_21 CH1 provisional: two-point fit from the 2026-08-31 bench sync
-// (count 1487 <-> 440 kW, count 1805 <-> ~500 kW). Good to ~±7 kW inside the
-// 400-500 kW band; OVERREADS at low load (+159 kW at zero count) — replace
-// with a real multi-point dcfit/dcadopt (incl. a low-load point) or a server
-// set_dc_cal at the first opportunity.
+// pcs_21 CH1: through-origin LSQ over three points — (0,0) MEASURED on-site
+// 2026-09-01 (count reads exactly 0 at 0 kW, so no offset term), plus the
+// 2026-08-31 bench syncs (1487 <-> 440 kW, 1805 <-> ~500 kW). Within ~4% at
+// load, exact at idle. An earlier two-point provisional (+159.43 kW offset)
+// phantom-reported ~162 kW at idle — never resurrect an offset here without a
+// measured low-load point to back it.
 // ---------------------------------------------------------------------------
 void applyDcDefaultsFor(const String& deviceId) {
     if (deviceId == "pcs_21" && _dcKwSlope[0] == 0.0f) {
-        if (setDcCal(0, 0.18868f, 159.43f))
-            Serial.println("[DC] CH1 PROVISIONAL cal applied (pcs_21 factory default)"
-                           " — refine with dcpoint/dcfit/dcadopt");
+        if (setDcCal(0, 0.28472f, 0.0f))
+            Serial.println("[DC] CH1 factory cal applied (pcs_21, field-verified 2026-09-01)"
+                           " — refine anytime via dcpoint/dcfit/dcadopt or set_dc_cal");
     }
 }
 
