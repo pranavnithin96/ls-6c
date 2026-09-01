@@ -141,8 +141,8 @@ Firmware (commit f186ca0): DC channels take a 100-sample **0 dB burst** each
 window and use it with a LOW-range line; when it saturates (~1 V at the pin), the
 11 dB window count drives a HIGH-range line.
 
-- LOW (0 dB): `kW = 0.046992 * count + 42.716` — field points 155↔50 kW, 687↔75 kW.
-  The 0 dB range has its own dead zone: **floor ~43 kW** (0 counts → reports 0 kW).
+- LOW (0 dB): `kW = 0.093985 * count + 35.432` — field points 155↔50 kW, 687↔100 kW.
+  The 0 dB range has its own dead zone: **floor ~35 kW** (0 counts → reports 0 kW).
   Lining preheat at 25 kW still reads 0; going lower needs a gain stage (hardware).
 - HIGH (11 dB): `kW = 0.18868 * count + 159.43` — from 1487↔440 kW, 1805↔~500 kW
   (old test sketch); **pending confirmation** with a `dcpoint` during a melt.
