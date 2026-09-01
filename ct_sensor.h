@@ -259,7 +259,7 @@ static float _dcHiOffset[NUM_CT_CHANNELS] = {0};   // HIGH range offset, kW
 static uint8_t _dcLastRange[NUM_CT_CHANNELS] = {0}; // 0 = low (0dB) used last window, 1 = high (11dB)
 static bool    _dcEnabled[NUM_CT_CHANNELS]   = {0}; // DC mode on (persisted "e%d"); reports 0 kW until a line is set
 static float   _dcLastCount[NUM_CT_CHANNELS] = {0}; // count that produced the last reported kW (remote dc_point uses it)
-#define DC_LOW_SATURATE 3900.0f   // 0dB count above which the low range is clipping -> use high
+#define DC_LOW_SATURATE 1000.0f   // LOW range is calibrated mV at 0dB (~1.1V full scale); above this -> use HIGH (11dB count)
 static DcPoint _dcPts[NUM_CT_CHANNELS][DC_MAX_POINTS];
 static int  _nDcPts[NUM_CT_CHANNELS] = {0};
 
@@ -353,20 +353,23 @@ float getDcHiSlope(int ch)  { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcHiSl
 float getDcHiOffset(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcHiOffset[ch] : 0.0f; }
 int   getDcLastRange(int ch){ return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcLastRange[ch] : 0; }
 
-// Low-range burst: 100 samples at 0dB attenuation (~0-1.1V full scale, ~3x the
-// resolution of 11dB and no 11dB dead zone), 1kHz cadence, then restore 11dB so
-// the next interleaved AC window is unaffected. ~100ms per DC channel per second.
+// Low-range burst: 100 samples at 0dB attenuation through the ESP-IDF
+// CALIBRATED path (analogReadMilliVolts) — it applies the chip's eFuse
+// characterization and linearizes the ADC, so the LOW-range value is pin
+// millivolts, not raw counts. (Raw 0dB counts bent visibly: a 3-point fit on
+// pcs_21 left +4/-6.6/+2.6 kW residuals at 50/100/150 kW.) 1kHz cadence,
+// then restore 11dB so the next interleaved AC window is unaffected.
 static float dcLowRangeCount(int ch) {
     analogSetPinAttenuation(CT_PINS[ch], ADC_0db);
     uint32_t sum = 0;
     unsigned long t0 = micros();
     for (int i = 0; i < 100; i++) {
-        sum += (uint16_t)analogRead(CT_PINS[ch]);
+        sum += analogReadMilliVolts(CT_PINS[ch]);
         while (micros() < t0 + (unsigned long)((i + 1) * 1000)) {}
     }
     analogSetPinAttenuation(CT_PINS[ch], ADC_11db);
     feedWatchdog();
-    return (float)sum / 100.0f;
+    return (float)sum / 100.0f;     // pin mV
 }
 float getDcSlope(int ch)  { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcKwSlope[ch]  : 0.0f; }
 float getDcOffset(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcKwOffset[ch] : 0.0f; }
@@ -480,20 +483,20 @@ void dcClearPoints(int ch) {
 // to the panel's analog kW meter: 4.8 mV/kW at the terminal (675 kW FS = 3.24 V),
 // ~0.15 V at the pin for 50 kW. The 11 dB ADC range reads that as 0 (dead
 // zone); the 0 dB range reads 155 counts — hence the dual-range path above.
-// LOW (0 dB): 155 <-> 50 kW, 687 <-> 100 kW (field, 2026-09-02); floor ~35 kW (0dB dead zone).
+// LOW (0 dB, calibrated pin mV since this build): calibrate in the field with 2-3 dc_points.
 // HIGH (11 dB): 1487 <-> 440 kW, 1805 <-> ~500 kW (old test sketch) — the
 // positive intercept is the 11 dB range's nonlinearity at the low end, not a
 // diode; confirm with a dcpoint during a melt.
 // ---------------------------------------------------------------------------
 void applyDcDefaultsFor(const String& deviceId) {
-    if (deviceId == "pcs_21" && _dcKwSlope[0] == 0.0f) {
+    if (deviceId == "pcs_21" && !_dcEnabled[0] && _dcKwSlope[0] == 0.0f) {
+        setDcEnabled(0, true);          // DC path on; reports 0 until the LOW line is set
         // LOW (0dB): field 2026-09-02, 155 counts <-> 50 kW, 687 <-> 100 kW; the 0dB range's own
         // dead zone puts the floor at ~35 kW (0 counts below it -> reports 0 kW).
         // HIGH (11dB): above-knee model from 1487<->440 kW, 1805<->~500 kW.
         setDcHiCal(0, 0.18868f, 159.43f);
-        if (setDcCal(0, 0.093985f, 35.432f))
-            Serial.println("[DC] CH1 factory cal applied (pcs_21 meter tap: LOW 0dB line + HIGH 11dB line)"
-                           " — refine anytime via dcpoint/dcfit/dcadopt or set_dc_cal");
+        Serial.println("[DC] CH1 factory defaults applied (pcs_21: DC on, HIGH 11dB line;"
+                       " LOW line comes from dc_point/dcpoint in pin-mV units)");
     }
 }
 
