@@ -180,3 +180,16 @@ Ranges: the board reads DC channels at the 0 dB ADC range (LOW line) and falls
 back to 11 dB (HIGH line) when that saturates (~1 V at the pin). Points are tagged
 by the range that produced them, so gather LOW points at low/mid loads and HIGH
 points during melts; each range fits and adopts independently.
+
+## Version bump → 2.17.5 (OTA-deliverable)
+
+The DC work shipped as "2.17.4.1" on the bench board, but the updater parses only
+three components, so fleet boards on 2.17.4 (and pcs_21 itself) refuse it as
+not-newer. The final build is versioned **2.17.5** so it can go out over OTA.
+
+Server: publish `Line_Sight.ino.bin` from this branch as version `2.17.5`. The
+check endpoint receives `device_id`, so **offer it only to the furnace boards**
+(pcs_21 + the three new ones) rather than the whole fleet — the DC code is inert
+unless a channel is enabled, but there is no reason to touch non-furnace units.
+Boards check hourly (first check 5 min after boot); `{"action":"update_firmware"}`
+forces an immediate check. Crash-rollback protects against a bad image.
