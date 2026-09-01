@@ -445,17 +445,18 @@ void dcClearPoints(int ch) {
 // to the panel's analog kW meter: 4.8 mV/kW at the terminal (675 kW FS = 3.24 V),
 // ~0.15 V at the pin for 50 kW. The 11 dB ADC range reads that as 0 (dead
 // zone); the 0 dB range reads 155 counts — hence the dual-range path above.
-// LOW (0 dB): 0 <-> 0 kW, 155 <-> 50 kW (field, 2026-09-02, bare-probe verified).
+// LOW (0 dB): 155 <-> 50 kW, 687 <-> 75 kW (field, 2026-09-02); floor ~43 kW (0dB dead zone).
 // HIGH (11 dB): 1487 <-> 440 kW, 1805 <-> ~500 kW (old test sketch) — the
 // positive intercept is the 11 dB range's nonlinearity at the low end, not a
 // diode; confirm with a dcpoint during a melt.
 // ---------------------------------------------------------------------------
 void applyDcDefaultsFor(const String& deviceId) {
     if (deviceId == "pcs_21" && _dcKwSlope[0] == 0.0f) {
-        // LOW (0dB): field 2026-09-02, wire-in furnace-off = 0 counts, 50 kW = 155 counts.
+        // LOW (0dB): field 2026-09-02, 155 counts <-> 50 kW, 687 <-> 75 kW; the 0dB range's own
+        // dead zone puts the floor at ~43 kW (0 counts below it -> reports 0 kW).
         // HIGH (11dB): above-knee model from 1487<->440 kW, 1805<->~500 kW.
         setDcHiCal(0, 0.18868f, 159.43f);
-        if (setDcCal(0, 0.32258f, 0.0f))
+        if (setDcCal(0, 0.046992f, 42.716f))
             Serial.println("[DC] CH1 factory cal applied (pcs_21 meter tap: LOW 0dB line + HIGH 11dB line)"
                            " — refine anytime via dcpoint/dcfit/dcadopt or set_dc_cal");
     }
