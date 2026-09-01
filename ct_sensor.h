@@ -389,19 +389,19 @@ void dcClearPoints(int ch) {
 // always wins and is never clobbered. This is how a fresh flash knows "this
 // board needs the DC path": the table below is keyed by provisioned device id.
 //
-// pcs_21 CH1 taps the DC drive signal that Inductotherm's own kW-metering
-// circuit feeds to the panel's analog kW meter — i.e. a voltage already
-// proportional to kW, zero at zero, linear by design. Field points on this
-// firmware (2026-09-02, meter read at the same instant, counts as reported
-// by readAllCT): count 0 <-> 0 kW, count 13 <-> 25 kW. Through-origin.
-// Resolution ~1.9 kW/count; ADC noise +/-0.5 count = +/-1 kW.
-// (Earlier 1487/1805-count data came from a different test sketch/pin and
-// does NOT belong to this signal — do not mix it in.)
+// pcs_21 CH1 taps the DC drive signal Inductotherm's kW-metering circuit sends
+// to the panel's analog kW meter: 4.8 mV/kW, 675 kW full scale = 3.24 V.
+// This board's CT input is half-wave rectified, so the DC signal only reaches
+// the ADC above the diode knee (~0.75 V, ~160 kW). Above it, the response is
+// linear: (1487 counts <-> 440 kW), (1805 <-> ~500 kW), zero-crossing at the
+// knee. Model: kW = 0.18868*count + 159.43 for count >= 1; 0 counts = 0 kW
+// (dead-zone rule in readAllCT). 0-160 kW is unmeasurable until the diode is
+// bypassed — after that, recalibrate through-origin with a 2:1 divider.
 // ---------------------------------------------------------------------------
 void applyDcDefaultsFor(const String& deviceId) {
     if (deviceId == "pcs_21" && _dcKwSlope[0] == 0.0f) {
-        if (setDcCal(0, 1.923077f, 0.0f))
-            Serial.println("[DC] CH1 factory cal applied (pcs_21 meter-drive tap, 2026-09-02)"
+        if (setDcCal(0, 0.18868f, 159.43f))
+            Serial.println("[DC] CH1 factory cal applied (pcs_21 meter tap, above-knee model; 0 counts = 0 kW)"
                            " — refine anytime via dcpoint/dcfit/dcadopt or set_dc_cal");
     }
 }
@@ -606,7 +606,15 @@ AllCTReadings readAllCT(float grid_voltage) {
             // DC special case (2.17.4.1): count -> kW fitted directly against
             // the external meter. Clamp below zero — the fitted offset can dip
             // a hair negative at true no-load, and negative power is noise here.
-            float kw = _dcKwSlope[ch] * avgCount + _dcKwOffset[ch];
+            // Dead-zone rule (2.17.4.1, pcs_21 field finding 2026-09-02): the
+            // CT front end is half-wave rectified, so a DC signal below the
+            // diode knee (~0.75 V, ~160 kW on the Inductotherm meter tap) never
+            // reaches the ADC and reads exactly 0 counts. A positive fitted
+            // offset is that knee, NOT power at zero signal — so 0 counts must
+            // report 0 kW, not the intercept. Below-knee loads are unmeasurable
+            // on this input until the diode is bypassed.
+            float kw = (avgCount < 1.0f) ? 0.0f
+                     : _dcKwSlope[ch] * avgCount + _dcKwOffset[ch];
             if (kw < 0.0f || isnan(kw) || isinf(kw)) kw = 0.0f;
             power = kw * 1000.0f;
             // amps back-derived for payload consistency; meter kW is the truth.
