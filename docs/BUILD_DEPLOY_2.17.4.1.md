@@ -123,3 +123,22 @@ prefer Rosetta, or move the sketch body into a `.cpp` to skip prototype
 generation). `esptool` shims cleanly to any arm64 esptool ≥5.x.
 Also: libraries under `~/Documents` may be iCloud-evicted (`dataless`) — reads
 hang the build; keep build libraries outside iCloud.
+
+## pcs_21 — measurement model and known blind spot (2026-09-02)
+
+The tap is the DC drive signal from Inductotherm's kW-metering circuit to the
+panel's analog kW meter: **4.8 mV/kW, 675 kW full scale = 3.24 V.**
+
+This board's CT input is half-wave rectified. The DC signal reaches the ADC only
+above the input diode's knee (~0.75 V ≈ **160 kW**). Measured: 0.237 V present at
+the CT1 terminal at 50 kW while the ADC reads 0 (no loading — the drop is inside
+the input path); a bench 0.5 V source passes.
+
+- Live model (persisted, factory default): `kW = 0.18868 * count + 159.43`,
+  with the firmware dead-zone rule **0 counts = 0 kW**.
+- Above ~160 kW: linear, anchored by (1487 counts <-> 440 kW), (1805 <-> ~500 kW).
+- **Below ~160 kW reads exactly 0.** Lining preheat (25–50 kW) is absent from
+  kWh. Decision: the input diode will NOT be bypassed. Server side should treat
+  `pcs_21` readings of exactly 0 W as "below measurement floor", not "off".
+- Remaining calibration: one synced `dcpoint 1 <kW>` during a melt to tighten
+  the ±4% between the 440 and 500 points.
