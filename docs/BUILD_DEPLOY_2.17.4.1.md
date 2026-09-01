@@ -124,21 +124,28 @@ generation). `esptool` shims cleanly to any arm64 esptool ≥5.x.
 Also: libraries under `~/Documents` may be iCloud-evicted (`dataless`) — reads
 hang the build; keep build libraries outside iCloud.
 
-## pcs_21 — measurement model and known blind spot (2026-09-02)
+## pcs_21 — measurement model (2026-09-02, final)
 
 The tap is the DC drive signal from Inductotherm's kW-metering circuit to the
-panel's analog kW meter: **4.8 mV/kW, 675 kW full scale = 3.24 V.**
+panel's analog kW meter: **4.8 mV/kW at the terminal, 675 kW full scale = 3.24 V.**
+At the ESP32 pin it is ~0.15 V at 50 kW (some drop in the input network).
 
-This board's CT input is half-wave rectified. The DC signal reaches the ADC only
-above the input diode's knee (~0.75 V ≈ **160 kW**). Measured: 0.237 V present at
-the CT1 terminal at 50 kW while the ADC reads 0 (no loading — the drop is inside
-the input path); a bench 0.5 V source passes.
+**Root cause of the low-load blindness: the ADC range, not hardware.** The ESP32's
+11 dB range reads 0 below ~0.15 V (its dead zone); the 0 dB range reads the same
+pin at 155 counts for 50 kW. Proven with a bare no-WiFi probe sketch: 0 dB=155
+with the furnace on, 0 with it off or the wire unplugged. (An earlier "input
+diode knee" theory in this doc's history was wrong.) CT2/CT5/CT6 read ~447/270/200
+counts regardless of the tap — internal offsets, not signals.
 
-- Live model (persisted, factory default): `kW = 0.18868 * count + 159.43`,
-  with the firmware dead-zone rule **0 counts = 0 kW**.
-- Above ~160 kW: linear, anchored by (1487 counts <-> 440 kW), (1805 <-> ~500 kW).
-- **Below ~160 kW reads exactly 0.** Lining preheat (25–50 kW) is absent from
-  kWh. Decision: the input diode will NOT be bypassed. Server side should treat
-  `pcs_21` readings of exactly 0 W as "below measurement floor", not "off".
-- Remaining calibration: one synced `dcpoint 1 <kW>` during a melt to tighten
-  the ±4% between the 440 and 500 points.
+Firmware (commit f186ca0): DC channels take a 100-sample **0 dB burst** each
+window and use it with a LOW-range line; when it saturates (~1 V at the pin), the
+11 dB window count drives a HIGH-range line.
+
+- LOW (0 dB): `kW = 0.32258 * count` — field points 0↔0 kW, 155↔50 kW. ~0.3 kW/count.
+- HIGH (11 dB): `kW = 0.18868 * count + 159.43` — from 1487↔440 kW, 1805↔~500 kW
+  (old test sketch); **pending confirmation** with a `dcpoint` during a melt.
+- Commands: `dcset` (low line), `dchset` (high line), `dcpoint` tags points by the
+  range that produced the reported count, `dcfit`/`dcadopt` per range,
+  `set_dc_cal` heartbeat accepts `"range":"high"`.
+- NVS on pcs_21 already holds a cal, so the factory default does not auto-apply
+  there; both lines were set over serial on 2026-09-02.

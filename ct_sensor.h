@@ -442,13 +442,13 @@ void dcClearPoints(int ch) {
 // board needs the DC path": the table below is keyed by provisioned device id.
 //
 // pcs_21 CH1 taps the DC drive signal Inductotherm's kW-metering circuit sends
-// to the panel's analog kW meter: 4.8 mV/kW, 675 kW full scale = 3.24 V.
-// This board's CT input is half-wave rectified, so the DC signal only reaches
-// the ADC above the diode knee (~0.75 V, ~160 kW). Above it, the response is
-// linear: (1487 counts <-> 440 kW), (1805 <-> ~500 kW), zero-crossing at the
-// knee. Model: kW = 0.18868*count + 159.43 for count >= 1; 0 counts = 0 kW
-// (dead-zone rule in readAllCT). 0-160 kW is unmeasurable until the diode is
-// bypassed — after that, recalibrate through-origin with a 2:1 divider.
+// to the panel's analog kW meter: 4.8 mV/kW at the terminal (675 kW FS = 3.24 V),
+// ~0.15 V at the pin for 50 kW. The 11 dB ADC range reads that as 0 (dead
+// zone); the 0 dB range reads 155 counts — hence the dual-range path above.
+// LOW (0 dB): 0 <-> 0 kW, 155 <-> 50 kW (field, 2026-09-02, bare-probe verified).
+// HIGH (11 dB): 1487 <-> 440 kW, 1805 <-> ~500 kW (old test sketch) — the
+// positive intercept is the 11 dB range's nonlinearity at the low end, not a
+// diode; confirm with a dcpoint during a melt.
 // ---------------------------------------------------------------------------
 void applyDcDefaultsFor(const String& deviceId) {
     if (deviceId == "pcs_21" && _dcKwSlope[0] == 0.0f) {
