@@ -389,17 +389,19 @@ void dcClearPoints(int ch) {
 // always wins and is never clobbered. This is how a fresh flash knows "this
 // board needs the DC path": the table below is keyed by provisioned device id.
 //
-// pcs_21 CH1: through-origin LSQ over three points — (0,0) MEASURED on-site
-// 2026-09-01 (count reads exactly 0 at 0 kW, so no offset term), plus the
-// 2026-08-31 bench syncs (1487 <-> 440 kW, 1805 <-> ~500 kW). Within ~4% at
-// load, exact at idle. An earlier two-point provisional (+159.43 kW offset)
-// phantom-reported ~162 kW at idle — never resurrect an offset here without a
-// measured low-load point to back it.
+// pcs_21 CH1 taps the DC drive signal that Inductotherm's own kW-metering
+// circuit feeds to the panel's analog kW meter — i.e. a voltage already
+// proportional to kW, zero at zero, linear by design. Field points on this
+// firmware (2026-09-02, meter read at the same instant, counts as reported
+// by readAllCT): count 0 <-> 0 kW, count 13 <-> 25 kW. Through-origin.
+// Resolution ~1.9 kW/count; ADC noise +/-0.5 count = +/-1 kW.
+// (Earlier 1487/1805-count data came from a different test sketch/pin and
+// does NOT belong to this signal — do not mix it in.)
 // ---------------------------------------------------------------------------
 void applyDcDefaultsFor(const String& deviceId) {
     if (deviceId == "pcs_21" && _dcKwSlope[0] == 0.0f) {
-        if (setDcCal(0, 0.28472f, 0.0f))
-            Serial.println("[DC] CH1 factory cal applied (pcs_21, field-verified 2026-09-01)"
+        if (setDcCal(0, 1.923077f, 0.0f))
+            Serial.println("[DC] CH1 factory cal applied (pcs_21 meter-drive tap, 2026-09-02)"
                            " — refine anytime via dcpoint/dcfit/dcadopt or set_dc_cal");
     }
 }
