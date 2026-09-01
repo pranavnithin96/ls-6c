@@ -42,6 +42,7 @@ static volatile bool wifiConnected = false;  // Updated ONLY by Core 0
 static unsigned long lastReadingTime = 0;
 static unsigned long bootButtonPressStart = 0;
 static AllCTReadings lastReadings = {};
+static bool _rawPrint = false;   // 'raw' serial cmd: print all 6 raw ADC counts each second
 
 // ============================================================================
 // Network Task — Core 0, serialized operations, vTaskDelayUntil
@@ -197,7 +198,7 @@ void setup() {
     Serial.printf("  Voltage:   %.0fV | Interval: %ds\n", getGridVoltage(), getSendInterval());
     Serial.println("---------------------");
     Serial.println("Commands: status | setslope | slopes | calpoint | debug | reset | update");
-    Serial.println("DC cal:   dcpoint <ch> <kW> | dcfit <ch> | dcadopt <ch> | dcclear <ch> | dcset <ch> <s> <o> | dcshow");
+    Serial.println("DC cal:   raw | dcpoint <ch> <kW> | dcfit <ch> | dcadopt <ch> | dcclear <ch> | dcset <ch> <s> <o> | dcshow");
     Serial.println("Monitoring started...\n");
 }
 
@@ -259,7 +260,8 @@ void loop() {
             int ch = 0; float kw = -1;
             if (sscanf(cmd.c_str(), "dcpoint %d %f", &ch, &kw) == 2 &&
                 ch >= 1 && ch <= NUM_CT_CHANNELS && kw >= 0) {
-                dcRecordPoint(ch - 1, kw);   // samples a fresh window NOW
+                // pair the meter reading with the count the loop just reported
+                dcRecordPoint(ch - 1, kw, (float)lastReadings.ct[ch - 1].avg_mv);
             } else {
                 Serial.println("Usage: dcpoint <ch 1-6> <meter kW right now>  e.g. dcpoint 1 440");
             }
@@ -283,6 +285,9 @@ void loop() {
             } else {
                 Serial.println("Usage: dcset <ch 1-6> <kW/count> <kW offset>   (0 0 clears)");
             }
+        } else if (cmd == "raw") {
+            _rawPrint = !_rawPrint;
+            Serial.printf("[CMD] raw ADC print: %s\n", _rawPrint ? "ON" : "OFF");
         } else if (cmd == "dcshow") {
             Serial.println("Per-channel DC kW calibration (off = stock AC path):");
             for (int i = 0; i < NUM_CT_CHANNELS; i++) {
@@ -416,6 +421,10 @@ void loop() {
         }
 
         lastReadings = readAllCT(getGridVoltage());
+        if (_rawPrint)
+            Serial.printf("[RAW] %d %d %d %d %d %d\n",
+                lastReadings.ct[0].avg_mv, lastReadings.ct[1].avg_mv, lastReadings.ct[2].avg_mv,
+                lastReadings.ct[3].avg_mv, lastReadings.ct[4].avg_mv, lastReadings.ct[5].avg_mv);
         updateLastReadings(lastReadings);
         // Black-box capture request (if any) is honored HERE, between sampling
         // windows, so its flash write can't distort a window in progress.

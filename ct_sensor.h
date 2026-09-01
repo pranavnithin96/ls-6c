@@ -302,19 +302,6 @@ bool setDcCal(int ch, float kwPerCount, float offsetKw) {
 float getDcSlope(int ch)  { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcKwSlope[ch]  : 0.0f; }
 float getDcOffset(int ch) { return (ch >= 0 && ch < NUM_CT_CHANNELS) ? _dcKwOffset[ch] : 0.0f; }
 
-// Average RAW counts over one full window, same cadence as readAllCT — raw
-// analogRead, never analogReadMilliVolts (the fit must live in count space).
-static float dcSampleAvgCount(int ch) {
-    uint32_t sum = 0;
-    unsigned long t0 = micros();
-    for (int i = 0; i < ADC_SAMPLES_PER_CH; i++) {
-        sum += (uint16_t)analogRead(CT_PINS[ch]);
-        while (micros() < t0 + (unsigned long)((i + 1) * SAMPLE_INTERVAL_US)) {}
-        if (i % 100 == 0) feedWatchdog();
-    }
-    return (float)sum / ADC_SAMPLES_PER_CH;
-}
-
 static bool dcFitPoints(int ch, float& A, float& B, float& r2) {
     int n = _nDcPts[ch];
     if (n < 2) return false;
@@ -355,9 +342,14 @@ void dcPrintFit(int ch) {
     Serial.printf("  'dcadopt %d' to make this live\n", ch + 1);
 }
 
-// Record a synchronized (count, kW) pair: samples a fresh window RIGHT NOW, so
-// call it while reading the meter — the pairing is only as good as that moment.
-void dcRecordPoint(int ch, float kw) {
+// Record a synchronized (count, kW) pair. countNow is the LAST readAllCT()
+// average for this channel — the exact number the firmware reports and sends —
+// passed in by the caller. (2.17.4.1 field lesson: a private re-sample of the
+// pin read ~6x lower than readAllCT on a high-impedance DC tap; calibrating
+// against anything other than the reported count is calibrating the wrong
+// quantity.) Call it while reading the meter — the pairing is only as good as
+// that moment.
+void dcRecordPoint(int ch, float kw, float countNow) {
     if (ch < 0 || ch >= NUM_CT_CHANNELS || kw < 0.0f) {
         Serial.println("[DC] invalid channel/kW");
         return;
@@ -366,7 +358,7 @@ void dcRecordPoint(int ch, float kw) {
         Serial.printf("[DC] CH%d point buffer full — 'dcclear %d' first\n", ch + 1, ch + 1);
         return;
     }
-    float c = dcSampleAvgCount(ch);
+    float c = countNow;
     _dcPts[ch][_nDcPts[ch]++] = {c, kw};
     Serial.printf("[DC] CH%d point %d: count=%.1f  meter=%.2f kW\n", ch + 1, _nDcPts[ch], c, kw);
     if (_nDcPts[ch] >= 2) dcPrintFit(ch);
